@@ -12,62 +12,57 @@ class Prenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino operativo e pronto!"}
+    return {"status": "Centralino operativo!"}
 
 @app.post("/check_availability")
 async def check_availability(dati: Prenotazione):
     print(f"Richiesta ricevuta: {dati.data} per {dati.persone} persone")
     
     async with async_playwright() as p:
-        # headless=True è OBBLIGATORIO su Railway
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         
         try:
-            # 1. Caricamento - USO IL LINK SPECIFICO DEL FORM
-            print("Apro il sito corretto...")
-            # Usiamo il link preciso che porta dritto al form
+            print("1. Apro il sito...")
+            # Usiamo il link specifico che funziona meglio per i bot
             await page.goto("https://rione.fidy.app/prenew.php?referer=AI", timeout=60000)
             await page.wait_for_load_state("networkidle")
             
-            # 2. Compilazione "Intelligente" (Attende che i campi appaiano)
-            print("Cerco i campi da compilare...")
-
-            # Cerchiamo il campo DATA (proviamo più strategie se il sito è vecchio)
-            # Strategia A: Cerca input di tipo date
-            # Strategia B: Cerca input che si chiama 'date' o 'data'
-            input_data = page.locator("input[type='date'], input[name='date'], input[name='data']").first
-            await input_data.fill(dati.data)
+            print("2. Cerco i campi...")
             
-            # Cerchiamo il campo PERSONE (pax)
-            input_persone = page.locator("input[type='number'], input[name='pax'], input[name='persone']").first
-            await input_persone.fill(dati.persone)
+            # STRATEGIA INTELLIGENTE PER LA DATA
+            # Cerchiamo un campo che sia di tipo 'date' OPPURE che si chiami 'data'
+            # .first serve a prendere il primo che trova
+            campo_data = page.locator("input[type='date'], input[name='data']").first
+            # fill scrive dentro al campo in modo umano (non usa evaluate)
+            await campo_data.fill(dati.data)
             
-            # 3. Click sul tasto Cerca
-            print("Clicco cerca...")
-            btn_cerca = page.locator("button[type='submit'], input[type='submit'], button:has-text('Cerca')").first
-            await btn_cerca.click()
+            # STRATEGIA PER LE PERSONE
+            # Cerchiamo input numerico o che si chiama 'pax'/'coperti'
+            campo_persone = page.locator("input[type='number'], input[name='pax'], input[name='coperti']").first
+            await campo_persone.fill(dati.persone)
             
-            # 4. Lettura Risultati
-            print("Leggo i risultati...")
-            await page.wait_for_timeout(4000) # Aspettiamo 4 secondi per sicurezza
+            print("3. Clicco Cerca...")
+            # Clicchiamo il bottone Submit
+            await page.click("button[type='submit'], input[type='submit']")
             
-            testo_pagina = await page.inner_text("body")
+            # Aspettiamo che la pagina risponda
+            await page.wait_for_timeout(4000)
+            
+            print("4. Leggo risultato...")
+            testo = await page.inner_text("body")
             await browser.close()
             
-            # Analisi semplice del testo
-            testo_lower = testo_pagina.lower()
-            if "non ci sono" in testo_lower or "completo" in testo_lower or "nessuna disponibilità" in testo_lower:
+            # Controllo parole chiave
+            if "non ci sono" in testo.lower() or "nessuna disponibilità" in testo.lower():
                 return {"result": f"Ho controllato: per il {dati.data} è tutto pieno."}
             
-            # Se non c'è scritto 'pieno', probabilmente ci sono gli orari
             return {"result": f"Ho controllato il sito: ci sono posti disponibili per il {dati.data}. Chiedi all'utente che orario preferisce."}
 
         except Exception as e:
             await browser.close()
-            print(f"Errore critico: {e}")
-            # Restituiamo l'errore all'AI così capiamo cosa succede
-            return {"result": f"Non riesco a leggere il sito. Errore tecnico: {str(e)}"}
+            print(f"ERRORE: {e}")
+            return {"result": "Ho avuto un problema tecnico a leggere il sito. Riprova."}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
