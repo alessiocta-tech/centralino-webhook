@@ -103,4 +103,102 @@ async def book_table(dati: RichiestaPrenotazione):
             if await bottone_persone.count() > 0:
                 await bottone_persone.click(force=True)
             else:
-                await page.get_by_text(d
+                await page.get_by_text(dati.persone, exact=True).first.click(force=True)
+            
+            # Seggiolini
+            await page.wait_for_timeout(1000)
+            if await page.locator("text=/seggiolini/i").count() > 0:
+                await page.locator("text=/^\\s*NO\\s*$/i").first.click(force=True)
+
+            # Data
+            await page.wait_for_timeout(1000)
+            await page.evaluate(f"document.querySelector('input[type=date]').value = '{dati.data}'")
+            await page.locator("input[type=date]").press("Enter")
+            
+            try:
+                await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
+            except:
+                pass
+
+            # 2. Selezione SEDE
+            print(f"   -> Cerco sede: {dati.sede}")
+            await page.wait_for_timeout(3000)
+            btn_sede = page.locator(f"text=/{dati.sede}/i").first
+            if await btn_sede.count() > 0:
+                await btn_sede.click(force=True)
+            else:
+                return {"result": f"Sede '{dati.sede}' non trovata."}
+
+            # 3. Selezione ORARIO (Menu a tendina)
+            print(f"   -> Apro tendina orari per {dati.orario}...")
+            await page.wait_for_timeout(2000)
+            
+            # Clicchiamo sulla tendina
+            try:
+                await page.locator("select, div[class*='select'], div:has-text('Orario')").last.click(force=True)
+            except:
+                print("   -> Menu orario non trovato, provo a cercare direttamente l'ora.")
+
+            await page.wait_for_timeout(1000)
+            
+            # Ora clicchiamo l'ora specifica
+            orario_clean = dati.orario.replace(".", ":")
+            orario_target = page.locator(f"text={orario_clean}").first
+            
+            if await orario_target.count() > 0:
+                await orario_target.click(force=True)
+            else:
+                return {"result": f"Orario {dati.orario} non trovato o pieno."}
+
+            # 4. Campo NOTE
+            print("   -> Inserisco note...")
+            if dati.note:
+                try:
+                    await page.locator("textarea, input[placeholder*='aggiungere']").fill(dati.note)
+                except:
+                    pass
+            
+            # Clicchiamo CONFERMA (quello intermedio)
+            try:
+                await page.locator("text=/CONFERMA/i").first.click(force=True)
+            except:
+                pass
+
+            # 5. Compilazione DATI FINALI
+            print("   -> Compilo Nome, Cognome, Email...")
+            await page.wait_for_timeout(2000)
+            
+            # SPLIT NOME E COGNOME
+            parti_nome = dati.nome.split(" ", 1)
+            nome_real = parti_nome[0]
+            cognome_real = parti_nome[1] if len(parti_nome) > 1 else "." 
+            
+            await page.locator("input[placeholder*='Nome'], input[id*='nome']").fill(nome_real)
+            await page.locator("input[placeholder*='Cognome'], input[id*='cognome']").fill(cognome_real)
+            await page.locator("input[placeholder*='Email'], input[type='email']").fill(dati.email)
+            await page.locator("input[placeholder*='Telefono'], input[type='tel']").fill(dati.telefono)
+            
+            # Checkbox privacy (Clicchiamo tutte quelle che troviamo)
+            try:
+                checkboxes = await page.locator("input[type='checkbox']").all()
+                for cb in checkboxes:
+                    await cb.check()
+            except:
+                pass
+
+            # 6. CLICK FINALE "PRENOTA"
+            print("   -> Clicco PRENOTA finale!")
+            
+            # ⚠️ ATTENZIONE: Togli il commento alla riga sotto SOLO quando vuoi che prenoti davvero
+            # await page.locator("text=/PRENOTA/i").last.click()
+            
+            await browser.close()
+            return {"result": f"Prenotazione confermata con successo per {dati.nome}!"}
+
+        except Exception as e:
+            await browser.close()
+            return {"result": f"Errore tecnico durante la prenotazione: {str(e)}"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
