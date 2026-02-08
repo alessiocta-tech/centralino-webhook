@@ -12,57 +12,68 @@ class Prenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino operativo!"}
+    return {"status": "Centralino Debugger Attivo!"}
 
 @app.post("/check_availability")
 async def check_availability(dati: Prenotazione):
-    print(f"Richiesta ricevuta: {dati.data} per {dati.persone} persone")
+    print(f"Richiesta: {dati.data}, Persone: {dati.persone}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         
         try:
-            print("1. Apro il sito...")
-            # Usiamo il link specifico che funziona meglio per i bot
+            print("1. Carico pagina...")
             await page.goto("https://rione.fidy.app/prenew.php?referer=AI", timeout=60000)
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("domcontentloaded")
             
-            print("2. Cerco i campi...")
+            # --- DEBUG: STAMPA COSA VEDE IL ROBOT ---
+            print("2. Analisi della pagina:")
+            title = await page.title()
+            print(f"   Titolo Pagina: {title}")
             
-            # STRATEGIA INTELLIGENTE PER LA DATA
-            # Cerchiamo un campo che sia di tipo 'date' OPPURE che si chiami 'data'
-            # .first serve a prendere il primo che trova
-            campo_data = page.locator("input[type='date'], input[name='data']").first
-            # fill scrive dentro al campo in modo umano (non usa evaluate)
-            await campo_data.fill(dati.data)
+            # Cerchiamo tutti gli input presenti e li stampiamo nei log
+            inputs = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('input')).map(i => 
+                    `Type: ${i.type}, Name: ${i.name}, ID: ${i.id}, Visible: ${i.offsetParent !== null}`
+                )
+            }""")
+            print(f"   Campi trovati: {inputs}")
+            # ----------------------------------------
+
+            print("3. Provo inserimento forzato (Javascript)...")
             
-            # STRATEGIA PER LE PERSONE
-            # Cerchiamo input numerico o che si chiama 'pax'/'coperti'
-            campo_persone = page.locator("input[type='number'], input[name='pax'], input[name='coperti']").first
-            await campo_persone.fill(dati.persone)
-            
-            print("3. Clicco Cerca...")
-            # Clicchiamo il bottone Submit
+            # TENTATIVO 1: Inserimento diretto via JS (Bypassa i calendari grafici)
+            # Cerchiamo di riempire qualsiasi campo che sembri una data
+            await page.evaluate(f"""() => {{
+                // Cerca campi data
+                const dateInputs = document.querySelectorAll('input[type="date"], input[name*="date"], input[name*="data"]');
+                dateInputs.forEach(input => {{ input.value = '{dati.data}'; }});
+                
+                // Cerca campi persone (pax, coperti, number)
+                const paxInputs = document.querySelectorAll('input[type="number"], input[name*="pax"], input[name*="persone"]');
+                paxInputs.forEach(input => {{ input.value = '{dati.persone}'; }});
+            }}""")
+
+            print("4. Clicco Cerca...")
+            # Clicchiamo qualsiasi bottone di submit
             await page.click("button[type='submit'], input[type='submit']")
             
-            # Aspettiamo che la pagina risponda
+            # Attesa risultati
             await page.wait_for_timeout(4000)
-            
-            print("4. Leggo risultato...")
             testo = await page.inner_text("body")
             await browser.close()
             
-            # Controllo parole chiave
-            if "non ci sono" in testo.lower() or "nessuna disponibilità" in testo.lower():
-                return {"result": f"Ho controllato: per il {dati.data} è tutto pieno."}
+            if "non ci sono" in testo.lower() or "nessuna disp" in testo.lower():
+                return {"result": "Tutto pieno."}
             
-            return {"result": f"Ho controllato il sito: ci sono posti disponibili per il {dati.data}. Chiedi all'utente che orario preferisce."}
+            return {"result": f"Ho controllato. Disponibilità trovata per il {dati.data}. Chiedi l'orario."}
 
         except Exception as e:
             await browser.close()
-            print(f"ERRORE: {e}")
-            return {"result": "Ho avuto un problema tecnico a leggere il sito. Riprova."}
+            print(f"ERRORE CRITICO: {e}")
+            # Importante: ora l'AI ti leggerà l'errore se fallisce ancora
+            return {"result": f"Errore tecnico nel form: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
