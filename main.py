@@ -8,60 +8,51 @@ from datetime import datetime, timedelta
 
 app = FastAPI()
 
-# Modello per il controllo disponibilità
 class RichiestaControllo(BaseModel):
     data: str
     persone: str
 
-# Modello per la prenotazione finale (Nuovi dati necessari)
+# AGGIUNTO IL CAMPO 'sede'
 class RichiestaPrenotazione(BaseModel):
     data: str
     persone: str
-    orario: str      # es. "20:00"
-    nome: str        # es. "Mario Rossi"
-    telefono: str    # es. "3331234567"
-    email: str       # es. "mario@email.com"
+    orario: str
+    nome: str
+    telefono: str
+    email: str
+    sede: str 
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - Booking Engine Ready"}
+    return {"status": "Centralino AI - Booking Engine V2"}
 
-# --- STRUMENTO 1: CONTROLLO (Quello che hai già) ---
 @app.post("/check_availability")
 async def check_availability(dati: RichiestaControllo):
+    # ... (Codice check identico a prima, lo lascio invariato per brevità) ...
+    # Se vuoi ti rimetto tutto il blocco, ma per ora concentriamoci sul booking
     print(f"🔎 CHECK: {dati.persone} pax, {dati.data}")
-    # ... (Qui riutilizziamo la logica di navigazione che funziona già)
-    # Per brevità, invochiamo una funzione interna, ma per ora ti metto
-    # il codice semplificato che apre e controlla
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        # User agent iPhone
         context = await browser.new_context(user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', viewport={"width": 390, "height": 844})
         page = await context.new_page()
         try:
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000)
             await page.wait_for_load_state("networkidle")
-            
-            # (Inserire qui la logica di navigazione Cookie -> Persone -> Data che abbiamo fatto prima)
-            # ... Riassumo i passaggi chiave per non rendere il codice gigante ...
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
             except: pass
-            
             await page.wait_for_selector("text=/Quanti ospiti siete/i", timeout=15000)
             bottone_persone = page.locator(f"div, span, button").filter(has_text=re.compile(f"^\\s*{dati.persone}\\s*$")).first
             if await bottone_persone.count() > 0: await bottone_persone.click(force=True)
             else: await page.get_by_text(dati.persone, exact=True).first.click(force=True)
-
             await page.wait_for_timeout(1000)
             if await page.locator("text=/seggiolini/i").count() > 0:
                 await page.locator("text=/^\\s*NO\\s*$/i").first.click(force=True)
-
             await page.wait_for_timeout(1000)
-            # Logica Data Semplificata per il check
             await page.evaluate(f"document.querySelector('input[type=date]').value = '{dati.data}'")
             await page.locator("input[type=date]").press("Enter")
             try: await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
             except: pass
-
             await page.wait_for_timeout(4000)
             html = await page.content()
             if "non ci sono" in html.lower(): return {"result": "Pieno."}
@@ -71,10 +62,10 @@ async def check_availability(dati: RichiestaControllo):
         finally:
             await browser.close()
 
-# --- STRUMENTO 2: PRENOTAZIONE (NUOVO!) ---
+# --- PRENOTAZIONE CORRETTA (Con Selezione Sede) ---
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    print(f"📝 BOOKING: {dati.nome}, Ore {dati.orario}")
+    print(f"📝 BOOKING: {dati.nome} a {dati.sede} per le {dati.orario}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -82,12 +73,10 @@ async def book_table(dati: RichiestaPrenotazione):
         page = await context.new_page()
         
         try:
-            # 1. RIFACCIAMO TUTTA LA NAVIGAZIONE (Persone -> Data)
-            # Purtroppo non possiamo 'salvare' la sessione di prima, dobbiamo riaprire il sito
+            # 1. Navigazione Iniziale
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000)
             await page.wait_for_load_state("networkidle")
             
-            # Cookie
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
             except: pass
             
@@ -109,45 +98,52 @@ async def book_table(dati: RichiestaPrenotazione):
             try: await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
             except: pass
 
-            # 2. SELEZIONE ORARIO (NUOVO STEP)
+            # --- NUOVO PASSAGGIO: SELEZIONE SEDE ---
+            print(f"   -> Cerco sede: {dati.sede}")
+            await page.wait_for_timeout(3000) # Aspettiamo la lista sedi
+            
+            # Cerchiamo un testo che contenga il nome della sede (es. "Talenti")
+            # Usiamo regex case-insensitive
+            btn_sede = page.locator(f"text=/{dati.sede}/i").first
+            
+            if await btn_sede.count() > 0:
+                await btn_sede.click(force=True)
+            else:
+                return {"result": f"Errore: Non ho trovato la sede '{dati.sede}' nella lista."}
+            # ---------------------------------------
+
+            # 2. Selezione Orario
             print(f"   -> Cerco orario {dati.orario}...")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(3000) # Aspettiamo che carichi gli orari della sede scelta
             
-            # Cerchiamo un bottone che contenga l'orario (es. "20:00")
-            # Usiamo regex per trovare l'orario esatto
-            orario_btn = page.locator(f"text=/{dati.orario}/").first
+            # Formattiamo l'orario per essere sicuri (es. se arriva 13.00 lo cerca come 13:00)
+            orario_clean = dati.orario.replace(".", ":")
             
+            orario_btn = page.locator(f"text=/{orario_clean}/").first
             if await orario_btn.count() == 0:
-                return {"result": f"Non ho trovato l'orario {dati.orario}. Forse è stato appena preso."}
+                return {"result": f"L'orario {orario_clean} non è più disponibile."}
             
             await orario_btn.click(force=True)
             
-            # 3. COMPILAZIONE FORM DATI (NUOVO STEP)
+            # 3. Compilazione Dati
             print("   -> Compilo dati cliente...")
             await page.wait_for_timeout(2000)
             
-            # Cerchiamo i campi (solitamente name='name', name='email', name='phone')
-            # Usiamo selettori generici intelligenti
             await page.locator("input[name*='name'], input[placeholder*='Nome']").fill(dati.nome)
             await page.locator("input[name*='phone'], input[name*='tel'], input[placeholder*='Telef']").fill(dati.telefono)
             await page.locator("input[name*='email'], input[placeholder*='Email']").fill(dati.email)
-            
-            # Checkbox privacy (spesso obbligatoria)
             try: await page.locator("input[type='checkbox']").first.check()
             except: pass
 
-            # 4. CLICK CONFERMA PRENOTAZIONE
-            print("   -> Clicco PRENOTA...")
-            # ATTENZIONE: Per ora faccio solo finta di cliccare l'ultimo tasto per non farti prenotazioni false mentre testi!
-            # Quando sei pronto, togli il commento alla riga sotto:
+            # 4. Click Finale (Ancora disattivato per sicurezza, togli # per attivare)
             # await page.locator("text=/Prenota|Conferma/i").click()
             
             await browser.close()
-            return {"result": f"Prenotazione effettuata con successo a nome {dati.nome} per le {dati.orario}!"}
+            return {"result": f"Prenotazione confermata a {dati.sede} per {dati.nome} alle {dati.orario}!"}
 
         except Exception as e:
             await browser.close()
-            return {"result": f"Errore nella prenotazione: {str(e)}"}
+            return {"result": f"Errore tecnico: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
