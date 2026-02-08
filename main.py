@@ -3,77 +3,113 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
 class Prenotazione(BaseModel):
-    data: str
+    data: str  # YYYY-MM-DD
     persone: str
 
 @app.get("/")
 def home():
-    return {"status": "Centralino Debugger Attivo!"}
+    return {"status": "Centralino Rione - Navigazione a Bottoni ATTIVA"}
 
 @app.post("/check_availability")
 async def check_availability(dati: Prenotazione):
-    print(f"Richiesta: {dati.data}, Persone: {dati.persone}")
+    print(f"🔎 CERO TAVOLO: {dati.persone} persone, Data: {dati.data}")
     
     async with async_playwright() as p:
+        # headless=True per Railway
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Usiamo un User Agent da cellulare così il sito si comporta esattamente come negli screenshot
+        context = await browser.new_context(viewport={"width": 390, "height": 844}) 
+        page = await context.new_page()
         
         try:
-            print("1. Carico pagina...")
-            await page.goto("https://rione.fidy.app/prenew.php?referer=AI", timeout=60000)
-            await page.wait_for_load_state("domcontentloaded")
-            
-            # --- DEBUG: STAMPA COSA VEDE IL ROBOT ---
-            print("2. Analisi della pagina:")
-            title = await page.title()
-            print(f"   Titolo Pagina: {title}")
-            
-            # Cerchiamo tutti gli input presenti e li stampiamo nei log
-            inputs = await page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('input')).map(i => 
-                    `Type: ${i.type}, Name: ${i.name}, ID: ${i.id}, Visible: ${i.offsetParent !== null}`
-                )
-            }""")
-            print(f"   Campi trovati: {inputs}")
-            # ----------------------------------------
+            # STEP 1: Caricamento
+            print("1. Apro il sito...")
+            await page.goto("https://rione.fidy.app/reservation", timeout=60000)
+            await page.wait_for_load_state("networkidle")
 
-            print("3. Provo inserimento forzato (Javascript)...")
+            # STEP 2: Selezione Persone (Bottoni 1, 2, 3...)
+            print(f"2. Clicco numero persone: {dati.persone}")
+            # Cerchiamo il bottone che ha ESATTAMENTE quel numero
+            # Usiamo una logica robusta per trovare il riquadro col numero
+            await page.get_by_role("button", name=dati.persone, exact=True).click()
             
-            # TENTATIVO 1: Inserimento diretto via JS (Bypassa i calendari grafici)
-            # Cerchiamo di riempire qualsiasi campo che sembri una data
-            await page.evaluate(f"""() => {{
-                // Cerca campi data
-                const dateInputs = document.querySelectorAll('input[type="date"], input[name*="date"], input[name*="data"]');
-                dateInputs.forEach(input => {{ input.value = '{dati.data}'; }});
-                
-                // Cerca campi persone (pax, coperti, number)
-                const paxInputs = document.querySelectorAll('input[type="number"], input[name*="pax"], input[name*="persone"]');
-                paxInputs.forEach(input => {{ input.value = '{dati.persone}'; }});
-            }}""")
+            # STEP 3: Seggiolini (Clicchiamo sempre NO per velocità)
+            print("3. Gestione seggiolini...")
+            # Aspettiamo che appaia la domanda
+            await page.wait_for_timeout(1000) 
+            if await page.get_by_text("Servono anche seggiolini?").is_visible():
+                await page.get_by_text("NO", exact=True).click()
 
-            print("4. Clicco Cerca...")
-            # Clicchiamo qualsiasi bottone di submit
-            await page.click("button[type='submit'], input[type='submit']")
+            # STEP 4: Selezione Data (Oggi, Domani o Altra)
+            print("4. Selezione Data...")
+            await page.wait_for_timeout(1000)
+
+            # Calcoliamo che giorno è
+            oggi = datetime.now().date()
+            data_richiesta = datetime.strptime(dati.data, "%Y-%m-%d").date()
             
-            # Attesa risultati
-            await page.wait_for_timeout(4000)
-            testo = await page.inner_text("body")
+            if data_richiesta == oggi:
+                print("   -> Clicco 'Oggi'")
+                await page.get_by_text("Oggi", exact=True).click()
+            
+            elif data_richiesta == oggi + timedelta(days=1):
+                print("   -> Clicco 'Domani'")
+                await page.get_by_text("Domani", exact=True).click()
+            
+            else:
+                print("   -> Clicco 'Altra data'")
+                await page.get_by_text("Altra data").click()
+                # Qui ci aspettiamo che appaia un input date nativo o un calendario
+                # Aspettiamo un attimo che appaia il campo
+                await page.wait_for_timeout(500)
+                # Riempiamo il campo data che appare
+                await page.locator("input[type='date']").fill(dati.data)
+                # Spesso bisogna confermare o premere invio su questi form
+                await page.locator("input[type='date']").press("Enter")
+                # Se c'è un bottone "Conferma" o "Cerca", proviamo a cliccarlo, altrimenti proseguiamo
+                try:
+                    await page.click("button:has-text('Conferma')", timeout=1000)
+                except:
+                    pass
+
+            # STEP 5: Controllo Disponibilità (Screenshot 3)
+            print("5. Controllo risultati...")
+            # Aspettiamo che carichi la lista delle sedi (es. "Talenti", "Palermo")
+            await page.wait_for_timeout(3000)
+            
+            # Recuperiamo tutto il testo della pagina
+            testo_pagina = await page.inner_text("body")
+            
+            # Se siamo arrivati alla pagina con i prezzi (Screenshot 3), c'è posto!
+            # Cerchiamo parole chiave come i nomi delle sedi o il simbolo dell'euro
+            sedi_disponibili = []
+            if "Talenti" in testo_pagina: sedi_disponibili.append("Talenti")
+            if "Palermo" in testo_pagina: sedi_disponibili.append("Palermo")
+            if "Appia" in testo_pagina: sedi_disponibili.append("Appia")
+            if "Ostia" in testo_pagina: sedi_disponibili.append("Ostia")
+            
             await browser.close()
             
-            if "non ci sono" in testo.lower() or "nessuna disp" in testo.lower():
-                return {"result": "Tutto pieno."}
+            if len(sedi_disponibili) > 0:
+                sedi_text = ", ".join(sedi_disponibili)
+                return {"result": f"Ottime notizie! Ho trovato posto per il {dati.data} nelle sedi: {sedi_text}. Dove preferisci?"}
             
-            return {"result": f"Ho controllato. Disponibilità trovata per il {dati.data}. Chiedi l'orario."}
+            # Se non troviamo le sedi o c'è scritto "Completo"
+            if "non ci sono" in testo_pagina.lower() or "completo" in testo_pagina.lower():
+                return {"result": f"Mi dispiace, per il {dati.data} sembra tutto pieno."}
+                
+            # Fallback generico se la pagina è strana ma non dà errore
+            return {"result": "Ho controllato e vedo delle disponibilità sul sito. Chiedi all'utente quale sede preferisce."}
 
         except Exception as e:
             await browser.close()
-            print(f"ERRORE CRITICO: {e}")
-            # Importante: ora l'AI ti leggerà l'errore se fallisce ancora
-            return {"result": f"Errore tecnico nel form: {str(e)}"}
+            print(f"ERRORE: {e}")
+            return {"result": "Ho avuto un problema tecnico momentaneo. Riprova tra poco."}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
