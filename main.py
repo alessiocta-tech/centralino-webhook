@@ -8,108 +8,91 @@ from datetime import datetime, timedelta
 app = FastAPI()
 
 class Prenotazione(BaseModel):
-    data: str  # YYYY-MM-DD
+    data: str
     persone: str
 
 @app.get("/")
 def home():
-    return {"status": "Centralino Rione - Navigazione a Bottoni ATTIVA"}
+    return {"status": "Centralino Rione - READY"}
 
 @app.post("/check_availability")
 async def check_availability(dati: Prenotazione):
-    print(f"🔎 CERO TAVOLO: {dati.persone} persone, Data: {dati.data}")
+    # QUESTA RIGA CI DIRÀ SE IL CODICE È AGGIORNATO
+    print(f"🚀 AVVIO VERSIONE NUOVA (Anti-Cookie) - Cerco per {dati.persone} persone")
     
     async with async_playwright() as p:
-        # headless=True per Railway
         browser = await p.chromium.launch(headless=True)
-        # Usiamo un User Agent da cellulare così il sito si comporta esattamente come negli screenshot
-        context = await browser.new_context(viewport={"width": 390, "height": 844}) 
+        # Usiamo User Agent iPhone per forzare la visualizzazione mobile che vediamo negli screen
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            viewport={"width": 390, "height": 844}
+        )
         page = await context.new_page()
         
         try:
-            # STEP 1: Caricamento
             print("1. Apro il sito...")
             await page.goto("https://rione.fidy.app/reservation", timeout=60000)
-            await page.wait_for_load_state("networkidle")
-
-            # STEP 2: Selezione Persone (Bottoni 1, 2, 3...)
-            print(f"2. Clicco numero persone: {dati.persone}")
-            # Cerchiamo il bottone che ha ESATTAMENTE quel numero
-            # Usiamo una logica robusta per trovare il riquadro col numero
-            await page.get_by_role("button", name=dati.persone, exact=True).click()
+            await page.wait_for_load_state("domcontentloaded")
             
-            # STEP 3: Seggiolini (Clicchiamo sempre NO per velocità)
-            print("3. Gestione seggiolini...")
-            # Aspettiamo che appaia la domanda
-            await page.wait_for_timeout(1000) 
-            if await page.get_by_text("Servono anche seggiolini?").is_visible():
-                await page.get_by_text("NO", exact=True).click()
+            # --- BLOCCO ANTI-COOKIE (Cruciale) ---
+            print("2. Controllo Cookie...")
+            # Clicchiamo ovunque possa esserci un "Accetta" o "Consent"
+            try:
+                if await page.locator("text=Accetta").count() > 0:
+                    await page.locator("text=Accetta").click()
+                    print("   -> Cookie rimossi.")
+            except:
+                pass
+            # -------------------------------------
 
-            # STEP 4: Selezione Data (Oggi, Domani o Altra)
-            print("4. Selezione Data...")
+            print(f"3. Clicco numero persone: {dati.persone}")
+            await page.wait_for_timeout(2000) # Aspettiamo che la pagina si assesti
+            
+            # Strategia "Cecchino": Cerchiamo il testo esatto del numero
+            # force=True clicca anche se c'è un pixel trasparente sopra
+            await page.locator(f"text='{dati.persone}'").first.click(force=True)
+            
+            print("4. Gestione Seggiolini...")
+            await page.wait_for_timeout(2000)
+            # Se compare la scritta seggiolini, clicchiamo NO
+            if await page.locator("text=seggiolini").count() > 0:
+                await page.locator("text=NO").first.click(force=True)
+
+            print("5. Selezione Data...")
             await page.wait_for_timeout(1000)
-
-            # Calcoliamo che giorno è
+            
             oggi = datetime.now().date()
             data_richiesta = datetime.strptime(dati.data, "%Y-%m-%d").date()
             
+            # Logica pulsanti Oggi/Domani
             if data_richiesta == oggi:
-                print("   -> Clicco 'Oggi'")
-                await page.get_by_text("Oggi", exact=True).click()
-            
+                await page.locator("text='Oggi'").first.click(force=True)
             elif data_richiesta == oggi + timedelta(days=1):
-                print("   -> Clicco 'Domani'")
-                await page.get_by_text("Domani", exact=True).click()
-            
+                await page.locator("text='Domani'").first.click(force=True)
             else:
-                print("   -> Clicco 'Altra data'")
-                await page.get_by_text("Altra data").click()
-                # Qui ci aspettiamo che appaia un input date nativo o un calendario
-                # Aspettiamo un attimo che appaia il campo
+                # Altra data
+                await page.locator("text='Altra data'").first.click(force=True)
                 await page.wait_for_timeout(500)
-                # Riempiamo il campo data che appare
                 await page.locator("input[type='date']").fill(dati.data)
-                # Spesso bisogna confermare o premere invio su questi form
                 await page.locator("input[type='date']").press("Enter")
-                # Se c'è un bottone "Conferma" o "Cerca", proviamo a cliccarlo, altrimenti proseguiamo
-                try:
-                    await page.click("button:has-text('Conferma')", timeout=1000)
-                except:
-                    pass
+                # Tentativo clic conferma se esiste
+                if await page.locator("text=Conferma").count() > 0:
+                    await page.locator("text=Conferma").click()
 
-            # STEP 5: Controllo Disponibilità (Screenshot 3)
-            print("5. Controllo risultati...")
-            # Aspettiamo che carichi la lista delle sedi (es. "Talenti", "Palermo")
-            await page.wait_for_timeout(3000)
+            print("6. Controllo Risultati...")
+            await page.wait_for_timeout(4000)
+            testo = await page.inner_text("body")
             
-            # Recuperiamo tutto il testo della pagina
-            testo_pagina = await page.inner_text("body")
+            if "non ci sono" in testo.lower() or "completo" in testo.lower():
+                return {"result": f"Tutto pieno per il {dati.data}."}
             
-            # Se siamo arrivati alla pagina con i prezzi (Screenshot 3), c'è posto!
-            # Cerchiamo parole chiave come i nomi delle sedi o il simbolo dell'euro
-            sedi_disponibili = []
-            if "Talenti" in testo_pagina: sedi_disponibili.append("Talenti")
-            if "Palermo" in testo_pagina: sedi_disponibili.append("Palermo")
-            if "Appia" in testo_pagina: sedi_disponibili.append("Appia")
-            if "Ostia" in testo_pagina: sedi_disponibili.append("Ostia")
-            
-            await browser.close()
-            
-            if len(sedi_disponibili) > 0:
-                sedi_text = ", ".join(sedi_disponibili)
-                return {"result": f"Ottime notizie! Ho trovato posto per il {dati.data} nelle sedi: {sedi_text}. Dove preferisci?"}
-            
-            # Se non troviamo le sedi o c'è scritto "Completo"
-            if "non ci sono" in testo_pagina.lower() or "completo" in testo_pagina.lower():
-                return {"result": f"Mi dispiace, per il {dati.data} sembra tutto pieno."}
-                
-            # Fallback generico se la pagina è strana ma non dà errore
-            return {"result": "Ho controllato e vedo delle disponibilità sul sito. Chiedi all'utente quale sede preferisce."}
+            # Se siamo arrivati qui, è andata bene
+            return {"result": f"Disponibilità trovata per il {dati.data}. Chiedi l'orario."}
 
         except Exception as e:
             await browser.close()
-            print(f"ERRORE: {e}")
-            return {"result": "Ho avuto un problema tecnico momentaneo. Riprova tra poco."}
+            print(f"❌ ERRORE: {e}")
+            return {"result": f"Errore tecnico: {e}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
