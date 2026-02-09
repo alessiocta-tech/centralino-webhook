@@ -24,7 +24,7 @@ class RichiestaPrenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - V20 (Tree Climber)"}
+    return {"status": "Centralino AI - V22 (Camaleonte Hybrid)"}
 
 # --- HELPER ---
 def get_pasto(orario):
@@ -81,16 +81,16 @@ async def check_availability(dati: RichiestaControllo):
 # --- TOOL 2: BOOKING ---
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    print(f"📝 START BOOKING V20: {dati.sede} - {dati.orario}")
+    print(f"📝 START BOOKING V22: {dati.sede} - {dati.orario}")
     
     mappa = {
-        "talenti": "Talenti - Roma", 
-        "ostia": "Ostia Lido", 
+        "talenti": "Talenti", 
+        "ostia": "Ostia", 
         "appia": "Appia", 
-        "reggio": "Reggio Calabria", 
+        "reggio": "Reggio", 
         "palermo": "Palermo"
     }
-    sede_target = mappa.get(dati.sede.lower().strip(), dati.sede)
+    sede_keyword = mappa.get(dati.sede.lower().strip(), dati.sede)
     pasto = get_pasto(dati.orario)
 
     async with async_playwright() as p:
@@ -135,85 +135,68 @@ async def book_table(dati: RichiestaPrenotazione):
                 btn_pasto = page.locator(f"text=/{pasto}/i").first
                 if await btn_pasto.count() > 0 and await btn_pasto.is_visible():
                     await btn_pasto.click(timeout=3000)
-            except: 
-                print("      (Pasto skip)")
+            except: pass
 
-            # --- 5. SEDE & TURNO (TREE CLIMBER) ---
-            print(f"   -> 5. Cerca Sede: '{sede_target}' (Scalatore)...")
+            # --- 5. SEDE (LOGICA IBRIDA CAMALEONTE) ---
+            print(f"   -> 5. Cerca Sede: '{sede_keyword}'...")
             await page.wait_for_timeout(3000)
             
             cliccato = False
             
-            # Cerca l'elemento che contiene esattamente il nome della sede
-            target_text = page.locator(f"text={sede_target}").first
+            # Troviamo la card della sede (il riquadro intero)
+            # Cerchiamo un div che contenga il nome, e prendiamo l'ultimo (spesso il più specifico)
+            cards = page.locator("div").filter(has_text=sede_keyword).all()
             
-            if await target_text.count() > 0:
-                # Inizia a scalare verso l'alto (Padre -> Nonno -> Bisnonno)
-                elemento_corrente = target_text
-                found_card = None
-                
-                # Prova a risalire per 5 livelli
-                for i in range(5):
-                    # Cerca bottone turno dentro l'elemento corrente
-                    btn_turno = elemento_corrente.locator("text=/TURNO/i").first
-                    if await btn_turno.count() > 0:
-                        print(f"      -> Trovato TURNO al livello {i}! Clicco 'I TURNO'...")
-                        # Se ci sono più turni, clicchiamo il primo (I TURNO) che di solito è per le 12:00-13:00
-                        # Se l'utente volesse il II turno, servirebbe logica extra, ma per ora priorità al click.
+            # Scorre le card possibili (partendo dall'ultima che di solito è quella giusta)
+            for card in reversed(await cards):
+                if await card.is_visible():
+                    # CASO A: Ci sono i turni?
+                    btn_turno = card.locator("text=/TURNO/i").first
+                    if await btn_turno.count() > 0 and await btn_turno.is_visible():
+                        print("      -> Trovati turni! Clicco 'I TURNO'.")
                         await btn_turno.click(force=True)
                         cliccato = True
                         break
                     
-                    # Sali di un livello
-                    elemento_corrente = elemento_corrente.locator("..")
+                    # CASO B: Non ci sono turni? Clicca la card intera
+                    print("      -> Nessun turno visibile. Clicco la card intera (Standard).")
+                    await card.click(force=True)
+                    cliccato = True
+                    break
             
             if not cliccato:
-                print("      -> Fallback: Cerco 'I TURNO' globale vicino alla sede.")
-                # Prova generica
-                await page.locator("div").filter(has_text=sede_target).filter(has_text="TURNO").locator("text=/TURNO/i").first.click(force=True, timeout=5000)
+                print("      -> Fallback: Clicco testo sede.")
+                await page.get_by_text(sede_keyword, exact=False).last.click(force=True)
 
-            # 6. ORARIO
+            # --- 6. ORARIO (Gestione Tendina) ---
             print("   -> 6. Orario...")
             await page.wait_for_timeout(3000)
-            try: await page.locator("select").first.click(timeout=2000)
+            
+            # Apre la tendina se c'è
+            try: 
+                await page.locator("select, div[class*='select'], div:has-text('Orario')").last.click(timeout=2000)
             except: pass
             
             orario_clean = dati.orario.replace(".", ":")
-            try: await page.locator(f"text=/{orario_clean}/").first.click(timeout=3000)
-            except: await page.locator("select option").nth(1).click()
+            print(f"      -> Cerco '{orario_clean}'...")
+            
+            # Cerca l'orario specifico nel menu aperto
+            btn_ora = page.locator(f"li, div, option").filter(has_text=re.compile(f"^{orario_clean}")).first
+            
+            if await btn_ora.count() > 0:
+                 await btn_ora.click(force=True)
+            else:
+                print("      -> Orario non trovato, provo fallback generico.")
+                # Clicca qualsiasi cosa contenga l'ora (es "13:00")
+                try: await page.locator(f"text=/{orario_clean}/").first.click(timeout=2000)
+                except: 
+                     # Extrema ratio: seleziona il secondo elemento della lista (spesso il primo orario disponibile)
+                     await page.locator("li, option").nth(1).click()
 
             # 7. DATI
-            print("   -> 7. Conferma...")
+            print("   -> 7. Dati e Conferma...")
             if dati.note:
                 try: await page.locator("textarea").fill(dati.note)
                 except: pass
             
-            try: await page.locator("text=/CONFERMA/i").first.click(force=True)
-            except: pass
-            
-            await page.wait_for_timeout(2000)
-            p = dati.nome.split(" ", 1)
-            await page.locator("input[placeholder*='Nome'], input[id*='nome']").fill(p[0])
-            await page.locator("input[placeholder*='Cognome'], input[id*='cognome']").fill(p[1] if len(p)>1 else ".")
-            await page.locator("input[placeholder*='Email'], input[type='email']").fill(dati.email)
-            await page.locator("input[placeholder*='Telefono'], input[type='tel']").fill(dati.telefono)
-            
-            try: 
-                for cb in await page.locator("input[type='checkbox']").all(): await cb.check()
-            except: pass
-
-            print("   -> ✅ OK!")
-            # ATTIVA PER PRENOTARE REALE:
-            # await page.locator("text=/PRENOTA/i").last.click() 
-
-            return {"result": f"Prenotazione confermata per {dati.nome}!"}
-
-        except Exception as e:
-            print(f"❌ ERRORE: {e}")
-            return {"result": f"Errore: {str(e)}"}
-        finally:
-            await browser.close()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+            try: await page.locator("text=/CONFERMA/i").first.click(
