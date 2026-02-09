@@ -24,9 +24,9 @@ class RichiestaPrenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - V17 Enterprise (High Performance)"}
+    return {"status": "Centralino AI - V18 (Turni Fix + 8GB)"}
 
-# --- HELPER LOGICI ---
+# --- HELPER ---
 def get_pasto(orario):
     try: return "PRANZO" if int(orario.split(":")[0]) < 17 else "CENA"
     except: return "CENA"
@@ -45,29 +45,27 @@ def get_tipo_data(data_str):
 async def check_availability(dati: RichiestaControllo):
     print(f"🔎 CHECK: {dati.persone} pax, {dati.data}")
     async with async_playwright() as p:
-        # Ora usiamo il browser normale, abbiamo 8GB di RAM!
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"]) 
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
         context = await browser.new_context(viewport={"width": 390, "height": 844})
         page = await context.new_page()
 
         try:
-            # Timeout aumentato a 60 secondi per siti lenti
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000, wait_until="domcontentloaded")
             
-            # 1. Cookie
+            # Cookie e Popups
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
             except: pass
             
-            # 2. Persone
+            # Persone
             try: await page.locator(f"button:text-is('{dati.persone}'), div:text-is('{dati.persone}')").first.click(timeout=3000)
             except: await page.get_by_text(dati.persone, exact=True).first.click(force=True)
 
-            # 3. Seggiolini NO
+            # Seggiolini
             await page.wait_for_timeout(500)
             if await page.locator("text=/seggiolini/i").count() > 0:
                 await page.locator("text=/^\\s*NO\\s*$/i").first.click(force=True)
 
-            # 4. Data
+            # Data
             tipo = get_tipo_data(dati.data)
             if tipo in ["Oggi", "Domani"]:
                 await page.locator(f"text=/{tipo}/i").first.click()
@@ -88,32 +86,38 @@ async def check_availability(dati: RichiestaControllo):
 # --- TOOL 2: BOOKING ---
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    print(f"📝 BOOKING: {dati.sede} - {dati.orario}")
-    mappa = {"talenti": "Talenti - Roma", "ostia": "Ostia Lido", "appia": "Appia", "reggio": "Reggio Calabria", "palermo": "Palermo"}
+    print(f"📝 START BOOKING V18: {dati.sede} - {dati.orario}")
+    
+    # Mappa precisa basata sui tuoi screenshot
+    mappa = {
+        "talenti": "Talenti - Roma", 
+        "ostia": "Ostia Lido", 
+        "appia": "Appia", 
+        "reggio": "Reggio Calabria", 
+        "palermo": "Palermo"
+    }
     sede_target = mappa.get(dati.sede.lower().strip(), dati.sede)
     pasto = get_pasto(dati.orario)
 
     async with async_playwright() as p:
-        # Browser POTENTE (sfrutta la RAM che hai comprato)
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
             viewport={"width": 390, "height": 844}
         )
         page = await context.new_page()
-        # Impostiamo un timeout globale gigante (60 secondi) per sicurezza
-        page.set_default_timeout(60000)
+        page.set_default_timeout(60000) # 60 secondi di pazienza
 
         try:
-            print("   -> Apro pagina (Full Load)...")
+            print("   -> 1. Caricamento Pagina...")
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000, wait_until="domcontentloaded")
             
-            # 1. Cookie
+            # Cookie
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
             except: pass
             
-            # 2. Persone
-            print("   -> Persone...")
+            # Persone
+            print("   -> 2. Selezione Persone...")
             try: await page.locator(f"button:text-is('{dati.persone}'), div:text-is('{dati.persone}')").first.click(timeout=3000)
             except: await page.get_by_text(dati.persone, exact=True).first.click(force=True)
 
@@ -121,8 +125,8 @@ async def book_table(dati: RichiestaPrenotazione):
             if await page.locator("text=/seggiolini/i").count() > 0:
                 await page.locator("text=/^\\s*NO\\s*$/i").first.click(force=True)
 
-            # 3. Data & Pasto
-            print("   -> Data...")
+            # Data
+            print(f"   -> 3. Selezione Data ({dati.data})...")
             tipo = get_tipo_data(dati.data)
             if tipo in ["Oggi", "Domani"]:
                 await page.locator(f"text=/{tipo}/i").first.click()
@@ -134,44 +138,62 @@ async def book_table(dati: RichiestaPrenotazione):
                 try: await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
                 except: pass
             
-            await page.wait_for_timeout(1000)
-            try: await page.locator(f"text=/{pasto}/i").first.click(timeout=3000)
-            except: pass 
-
-            # 4. SEDE & TURNO
-            print(f"   -> Sede: {sede_target}")
+            # Pasto (Pranzo/Cena)
+            print(f"   -> 4. Selezione Pasto ({pasto})...")
             await page.wait_for_timeout(2000)
-            
-            # Cerca la card della sede
-            sede_card = page.locator(f"div").filter(has_text=sede_target).last
-            # Cerca bottone turno
-            btn_turno = sede_card.locator("text=/TURNO/i").first
-            
-            if await btn_turno.count() > 0:
-                print("   -> Click Turno")
-                await btn_turno.click(force=True)
-            elif await sede_card.count() > 0:
-                print("   -> Click Card")
-                await sede_card.click(force=True)
-            else:
-                print("   -> Fallback Sede")
-                await page.get_by_text(dati.sede, exact=False).first.click(force=True)
+            try: 
+                # Clicca solo se il bottone esiste ed è visibile
+                btn_pasto = page.locator(f"text=/{pasto}/i").first
+                if await btn_pasto.count() > 0 and await btn_pasto.is_visible():
+                    await btn_pasto.click(timeout=3000)
+            except: 
+                print("      (Pasto non selezionabile o già filtrato)")
 
-            # 5. ORARIO
-            print("   -> Orario...")
-            await page.wait_for_timeout(2000)
+            # --- SEDE & TURNO (IL FIX CRUCIALE) ---
+            print(f"   -> 5. Cerca Sede: '{sede_target}'...")
+            await page.wait_for_timeout(3000)
+            
+            # Strategia: Trova il contenitore che ha il testo della sede
+            # Poi cerca DENTRO quel contenitore il bottone "I TURNO" o "II TURNO"
+            
+            # Cerchiamo un div che contenga il nome della sede
+            cards = await page.locator("div").filter(has_text=sede_target).all()
+            
+            clicked = False
+            # Proviamo a scorrere le card trovate (spesso sono nidificate)
+            for card in reversed(cards): # Partiamo dall'ultima (spesso è quella più interna/specifica)
+                # Cerca bottone turno dentro questa card
+                btn_turno = card.locator("text=/TURNO/i").first
+                
+                if await btn_turno.count() > 0:
+                    print("      -> Trovato bottone TURNO! Clicco...")
+                    await btn_turno.click(force=True)
+                    clicked = True
+                    break
+            
+            if not clicked:
+                print("      -> Nessun 'Turno' trovato. Provo a cliccare la sede direttamente.")
+                # Se non ci sono turni (es. altre sedi), clicca il nome
+                await page.get_by_text(sede_target, exact=False).last.click(force=True)
+
+            # ORARIO
+            print("   -> 6. Selezione Orario...")
+            await page.wait_for_timeout(3000)
             try: await page.locator("select").first.click(timeout=2000)
             except: pass
             
             orario_clean = dati.orario.replace(".", ":")
             try: await page.locator(f"text=/{orario_clean}/").first.click(timeout=3000)
-            except: await page.locator("select option").nth(1).click()
+            except: 
+                print("      -> Orario esatto non trovato, seleziono il primo disponibile.")
+                await page.locator("select option").nth(1).click()
 
-            # 6. DATI
-            print("   -> Compilazione...")
+            # DATI E CONFERMA
+            print("   -> 7. Compilazione Finale...")
             if dati.note:
                 try: await page.locator("textarea").fill(dati.note)
                 except: pass
+            
             try: await page.locator("text=/CONFERMA/i").first.click(force=True)
             except: pass
             
@@ -186,16 +208,16 @@ async def book_table(dati: RichiestaPrenotazione):
                 for cb in await page.locator("input[type='checkbox']").all(): await cb.check()
             except: pass
 
-            print("   -> ✅ OK! PRENOTAZIONE PRONTA.")
+            print("   -> ✅ PRENOTAZIONE COMPLETATA!")
             
-            # ATTIVA QUESTA RIGA PER PRENOTARE DAVVERO
+            # SCOMMENTA PER ATTIVARE IL CLICK FINALE
             # await page.locator("text=/PRENOTA/i").last.click() 
 
             return {"result": f"Prenotazione confermata per {dati.nome}!"}
 
         except Exception as e:
             print(f"❌ ERRORE: {e}")
-            return {"result": f"Errore tecnico: {str(e)}"}
+            return {"result": f"Errore tecnico durante la prenotazione: {str(e)}"}
         finally:
             await browser.close()
 
