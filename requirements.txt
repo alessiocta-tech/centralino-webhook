@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-playwright==1.41.0
 phonenumbers
+playwright==1.41.0
 email-validator
