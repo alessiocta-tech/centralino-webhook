@@ -1,4 +1,5 @@
 fastapi
-uvicorn[standard]
-phonenumbers
+uvicorn
 playwright==1.41.0
+phonenumbers
+email-validator
