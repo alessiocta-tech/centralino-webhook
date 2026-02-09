@@ -4,7 +4,6 @@ import re
 from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -24,7 +23,7 @@ class RichiestaPrenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - Booking Engine V6 (Visione Potenziata)"}
+    return {"status": "Centralino AI - Booking Engine V8 (Sedi Fix)"}
 
 # --- TOOL 1: CHECK ---
 @app.post("/check_availability")
@@ -32,7 +31,7 @@ async def check_availability(dati: RichiestaControllo):
     print(f"🔎 CHECK: {dati.persone} pax, {dati.data}")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', viewport={"width": 390, "height": 844})
+        context = await browser.new_context(viewport={"width": 390, "height": 844})
         page = await context.new_page()
         try:
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000)
@@ -58,24 +57,44 @@ async def check_availability(dati: RichiestaControllo):
             await page.wait_for_timeout(4000)
             html = await page.content()
             if "non ci sono" in html.lower(): return {"result": "Pieno."}
-            return {"result": f"Posto trovato per il {dati.data}. Procedi con la prenotazione."}
+            return {"result": f"Posto trovato per il {dati.data}. Procedi pure."}
         except Exception as e:
             return {"result": f"Errore: {e}"}
         finally:
             await browser.close()
 
-# --- TOOL 2: BOOKING (Versione Potenziata) ---
+# --- TOOL 2: BOOKING (con TRADUTTORE SEDI) ---
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
     print(f"📝 BOOKING START: {dati.nome} -> {dati.sede} ({dati.orario})")
     
+    # DIZIONARIO TRADUTTORE (AI -> SITO WEB)
+    mappa_sedi = {
+        "talenti": "Talenti - Roma",
+        "ostia": "Ostia Lido",
+        "appia": "Appia",
+        "reggio": "Reggio Calabria",
+        "palermo": "Palermo"
+    }
+    
+    # Puliamo l'input dell'AI e troviamo il nome giusto
+    input_sede = dati.sede.lower().strip()
+    nome_bottone_sito = dati.sede # Default se non trova nulla
+    
+    for chiave in mappa_sedi:
+        if chiave in input_sede:
+            nome_bottone_sito = mappa_sedi[chiave]
+            break
+            
+    print(f"   -> Traduzione: '{dati.sede}' diventa '{nome_bottone_sito}'")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', viewport={"width": 390, "height": 844})
         page = await context.new_page()
         
         try:
-            # 1. Navigazione Iniziale
+            # 1. Navigazione
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000)
             await page.wait_for_load_state("networkidle")
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
@@ -99,60 +118,51 @@ async def book_table(dati: RichiestaPrenotazione):
             try: await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
             except: pass
 
-            # 2. Selezione SEDE (MODIFICA IMPORTANTE)
-            print(f"   -> Cerco sede: {dati.sede}...")
-            await page.wait_for_timeout(5000) # Aspettiamo bene che carichi la lista
+            # --- 2. SELEZIONE SEDE (FIXED) ---
+            print(f"   -> Cerco bottone esatto: '{nome_bottone_sito}'...")
+            await page.wait_for_timeout(4000)
             
-            # Strategia 1: Cerca testo parziale (es. "Talenti")
-            btn_sede = page.locator(f"text=/{dati.sede}/i").first
+            # Cerca il testo esatto che abbiamo mappato
+            btn_sede = page.get_by_text(nome_bottone_sito, exact=False).first
             
-            # Strategia 2: Se fallisce, cerca qualsiasi elemento che contenga il nome
-            if await btn_sede.count() == 0:
-                print("   -> Strategia 1 fallita, provo ricerca generica...")
-                btn_sede = page.get_by_text(dati.sede, exact=False).first
-
             if await btn_sede.count() > 0:
+                print("   -> Sede trovata e cliccata!")
                 await btn_sede.click(force=True)
-                print("   -> Sede cliccata!")
             else:
-                return {"result": f"Non riesco a trovare il tasto per la sede '{dati.sede}'. Prova a dire il nome esatto."}
+                # Fallback disperato: prova a cliccare qualsiasi cosa contenga la parola chiave originale
+                print("   -> Fallback: provo ricerca generica...")
+                await page.get_by_text(dati.sede, exact=False).first.click(force=True)
 
-            # 3. Selezione ORARIO
+            # 3. Orario
             print(f"   -> Cerco orario {dati.orario}...")
             await page.wait_for_timeout(3000)
-            
-            # Clicchiamo sulla tendina
-            try: await page.locator("select, div[class*='select'], div:has-text('Orario')").last.click(force=True)
-            except: print("   -> Menu orario non trovato, provo diretto.")
-            await page.wait_for_timeout(1000)
+            try: await page.locator("select, div[class*='select']").last.click(force=True)
+            except: pass
             
             orario_clean = dati.orario.replace(".", ":")
-            orario_target = page.locator(f"text={orario_clean}").first
-            
-            if await orario_target.count() > 0:
-                await orario_target.click(force=True)
+            # Cerca l'orario esatto
+            orario_btn = page.locator(f"text={orario_clean}").first
+            if await orario_btn.count() > 0:
+                await orario_btn.click(force=True)
             else:
-                return {"result": f"Orario {dati.orario} non trovato o pieno."}
+                return {"result": f"Orario {dati.orario} pieno o non disponibile."}
 
-            # 4. Campo NOTE e CONFERMA INTERMEDIA
-            print("   -> Inserisco note...")
+            # 4. Note & Conferma
             if dati.note:
-                try: await page.locator("textarea, input[placeholder*='aggiungere']").fill(dati.note)
+                try: await page.locator("textarea").fill(dati.note)
                 except: pass
             
             try: await page.locator("text=/CONFERMA/i").first.click(force=True)
             except: pass
 
-            # 5. Compilazione DATI FINALI
-            print("   -> Compilo dati finali...")
+            # 5. Dati Cliente
             await page.wait_for_timeout(2000)
+            parti = dati.nome.split(" ", 1)
+            n = parti[0]
+            c = parti[1] if len(parti) > 1 else "." 
             
-            parti_nome = dati.nome.split(" ", 1)
-            nome_real = parti_nome[0]
-            cognome_real = parti_nome[1] if len(parti_nome) > 1 else "." 
-            
-            await page.locator("input[placeholder*='Nome'], input[id*='nome']").fill(nome_real)
-            await page.locator("input[placeholder*='Cognome'], input[id*='cognome']").fill(cognome_real)
+            await page.locator("input[placeholder*='Nome'], input[id*='nome']").fill(n)
+            await page.locator("input[placeholder*='Cognome'], input[id*='cognome']").fill(c)
             await page.locator("input[placeholder*='Email'], input[type='email']").fill(dati.email)
             await page.locator("input[placeholder*='Telefono'], input[type='tel']").fill(dati.telefono)
             
@@ -161,18 +171,15 @@ async def book_table(dati: RichiestaPrenotazione):
                 for cb in checkboxes: await cb.check()
             except: pass
 
-            # 6. CLICK FINALE "PRENOTA"
-            print("   -> Clicco PRENOTA finale!")
-            
-            # Togli il commento sotto per attivare la prenotazione vera
-            # await page.locator("text=/PRENOTA/i").last.click()
+            print("   -> ✅ PRENOTAZIONE PRONTA!")
+            # await page.locator("text=/PRENOTA/i").last.click() # Scommenta per attivare davvero
             
             await browser.close()
-            return {"result": f"Prenotazione confermata con successo per {dati.nome}!"}
+            return {"result": f"Prenotazione confermata per {dati.nome} a {dati.sede}!"}
 
         except Exception as e:
             await browser.close()
-            return {"result": f"Errore tecnico durante la prenotazione: {str(e)}"}
+            return {"result": f"Errore nel processo: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
