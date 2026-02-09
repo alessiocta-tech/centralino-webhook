@@ -1,18 +1,23 @@
-# main.py
 import os
 import re
-import asyncio
-from datetime import datetime, timedelta, date as dt_date
+from datetime import datetime
 from typing import Optional, Tuple
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 import uvicorn
 
+# >>> VALIDAZIONE TELEFONO (libphonenumber)
+import phonenumbers
+from phonenumbers.phonenumberutil import NumberParseException
+from phonenumbers import number_type, PhoneNumberType
+
 app = FastAPI()
 
-FIDY_URL = os.environ.get("FIDY_URL", "https://rione.fidy.app/prenew.php?referer=butt")
+# Usa referer=AI di default (puoi cambiarlo con env var su Railway)
+FIDY_URL = os.environ.get("FIDY_URL", "https://rione.fidy.app/prenew.php?referer=AI")
+
 
 # =========================
 # MODELS
@@ -20,32 +25,74 @@ FIDY_URL = os.environ.get("FIDY_URL", "https://rione.fidy.app/prenew.php?referer
 class RichiestaControllo(BaseModel):
     data: str = Field(..., description="YYYY-MM-DD")
     persone: str = Field(..., description="Numero persone (1..9)")
-    orario: Optional[str] = Field(None, description="HH:MM (opzionale, solo per calcolo pasto)")
+    orario: Optional[str] = Field(None, description="HH:MM (opzionale)")
 
 class RichiestaPrenotazione(BaseModel):
     data: str = Field(..., description="YYYY-MM-DD")
     persone: str = Field(..., description="Numero persone (1..9)")
     orario: str = Field(..., description="HH:MM")
     nome: str = Field(..., description="Nome e Cognome")
-    telefono: str = Field(..., description="Numero (max 10 cifre, come da form)")
+    telefono: str = Field(..., description="Telefono (accetto +39 o formato nazionale)")
     email: str
     sede: str = Field(..., description="Talenti, Appia, Ostia, Reggio, Palermo")
     note: str = ""
-    seggiolini: Optional[int] = Field(None, description="Numero seggiolini. Se None: auto da note (0 o 1).")
+    seggiolini: Optional[int] = Field(None, description="Numero seggiolini (0..5). Se None: auto da note.")
+
+    # --- VALIDAZIONE TELEFONO: Italia, plausibile + valido + mobile
+    @validator("telefono")
+    def validate_telefono(cls, v: str) -> str:
+        raw = (v or "").strip()
+        if not raw:
+            raise ValueError("Telefono mancante")
+
+        # Normalizza: elimina spazi/parentesi/trattini, mantieni + se presente
+        cleaned = re.sub(r"[^\d+]", "", raw)
+
+        try:
+            # Se non inizia con +, assumiamo Italia
+            pn = phonenumbers.parse(cleaned, "IT" if not cleaned.startswith("+") else None)
+        except NumberParseException:
+            raise ValueError("Telefono non interpretabile (formato non valido)")
+
+        # Controlli robusti
+        if not phonenumbers.is_possible_number(pn):
+            raise ValueError("Telefono non plausibile (lunghezza/prefisso non compatibili)")
+        if not phonenumbers.is_valid_number(pn):
+            raise ValueError("Telefono non valido")
+
+        # Forza Italia (evita numeri esteri per errore)
+        region = phonenumbers.region_code_for_number(pn)
+        if region != "IT":
+            raise ValueError("Telefono non italiano (atteso numero IT)")
+
+        # Forza MOBILE (o FIXED_LINE_OR_MOBILE in alcuni casi)
+        t = number_type(pn)
+        if t not in (PhoneNumberType.MOBILE, PhoneNumberType.FIXED_LINE_OR_MOBILE):
+            raise ValueError("Telefono non cellulare (atteso mobile)")
+
+        # Ritorno la NSN (solo cifre, senza +39), perfetta per maxlength=10 del form
+        nsn = str(pn.national_number)
+        # Alcuni numeri storici possono essere 9 cifre; il form accetta fino a 10 → ok.
+        if len(nsn) > 10:
+            raise ValueError("Telefono troppo lungo per il form (max 10 cifre senza +39)")
+
+        return nsn
+
 
 # =========================
 # HEALTH
 # =========================
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - Fidy Booking (robusto: spans/selectors, time logic, retries)"}
+    return {"status": "Centralino AI - Fidy Booking (referer=AI, phone validation, robust selectors)"}
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "fidy_url": FIDY_URL}
+
 
 # =========================
-# HELPERS: NORMALIZZAZIONE
+# HELPERS
 # =========================
 def normalize_sede(raw: str) -> str:
     s = (raw or "").strip().lower()
@@ -78,7 +125,6 @@ def needs_seggiolone_from_note(note: str) -> bool:
     return any(k in n for k in ["seggiolon", "seggiolin", "bimbo", "bambin", "bambina", "baby"])
 
 def parse_time_hhmm(orario: str) -> int:
-    """Return minutes from midnight. Accepts HH:MM or H:MM or HH.MM"""
     o = (orario or "").strip().replace(".", ":")
     m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", o)
     if not m:
@@ -90,41 +136,38 @@ def parse_time_hhmm(orario: str) -> int:
     return hh * 60 + mm
 
 def get_pasto_strict(orario: str) -> str:
-    """
-    Fasce RIGOROSE:
-    - PRANZO: 12:00 - 14:30
-    - CENA  : 19:00 - 22:00
-    Se fuori fascia: fallback ragionato (prima delle 17 => PRANZO, altrimenti CENA),
-    ma segnaliamo in log (perché potrebbe non avere slot).
-    """
     mins = parse_time_hhmm(orario)
-    pranzo_start = 12 * 60
-    pranzo_end = 14 * 60 + 30
-    cena_start = 19 * 60
-    cena_end = 22 * 60
-
-    if pranzo_start <= mins <= pranzo_end:
+    # Fasce richieste:
+    # PRANZO 12:00-14:30 | CENA 19:00-22:00
+    if 12 * 60 <= mins <= (14 * 60 + 30):
         return "PRANZO"
-    if cena_start <= mins <= cena_end:
+    if 19 * 60 <= mins <= 22 * 60:
         return "CENA"
-
-    # fallback: non blocco, ma cerco di far funzionare il flusso
+    # fallback non bloccante
     return "PRANZO" if mins < (17 * 60) else "CENA"
 
-def safe_digits_phone(phone: str) -> str:
-    p = re.sub(r"\D+", "", phone or "")
-    return p[:10]  # il form ha maxlength=10
 
 # =========================
-# PLAYWRIGHT: UTILITIES
+# PLAYWRIGHT UTILS
 # =========================
 async def log_step(msg: str) -> None:
     print(msg, flush=True)
 
-async def wait_visible(locator, timeout_ms: int = 30000):
-    await locator.wait_for(state="visible", timeout=timeout_ms)
+async def accept_cookies_if_any(page):
+    for patt in [r"accetta", r"ok", r"consenti", r"consent", r"accept"]:
+        loc = page.locator(f"text=/{patt}/i").first
+        try:
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=3000, force=True)
+                break
+        except Exception:
+            pass
 
-async def click(locator, label: str, timeout_ms: int = 30000, force: bool = False):
+async def ensure_app_ready(page):
+    # dopo fade intro compare .stepCont
+    await page.locator(".stepCont").wait_for(state="visible", timeout=60000)
+
+async def click(locator, label: str, timeout_ms: int = 30000, force: bool = True):
     await log_step(f"      -> click: {label}")
     await locator.wait_for(state="visible", timeout=timeout_ms)
     try:
@@ -133,33 +176,16 @@ async def click(locator, label: str, timeout_ms: int = 30000, force: bool = Fals
         pass
     await locator.click(timeout=timeout_ms, force=force)
 
-async def accept_cookies_if_any(page):
-    # generico: se compare un bottone "accetta/ok/consenti" lo clicco
-    for patt in [r"accetta", r"ok", r"consenti", r"consent", r"accept"]:
-        loc = page.locator(f"text=/{patt}/i").first
-        try:
-            if await loc.count() > 0 and await loc.is_visible():
-                await click(loc, f"cookie_{patt}", timeout_ms=3000, force=True)
-                break
-        except Exception:
-            pass
-
-async def ensure_app_ready(page):
-    # L'intro fa fadeOut ~1.5s e poi mostra .stepCont
-    await wait_visible(page.locator(".stepCont"), timeout_ms=60000)
 
 # =========================
-# PLAYWRIGHT: FLOW STEPS (basati sull'HTML REALE)
+# FLOW STEPS (aderenti all'HTML reale)
 # =========================
 async def step_select_persone(page, persone: str):
-    p = (persone or "").strip()
     await log_step("-> 1. Persone")
     await ensure_app_ready(page)
-
-    # Gli elementi sono <span class="nCoperti" rel="2">2</span>
+    p = (persone or "").strip()
     loc = page.locator(f".nCoperti[rel='{p}']").first
     if await loc.count() == 0:
-        # fallback sul testo
         loc = page.locator(".nCoperti").filter(has_text=re.compile(rf"^\s*{re.escape(p)}\s*$")).first
     await click(loc, f"persone={p}")
 
@@ -167,48 +193,36 @@ async def step_select_seggiolini(page, seggiolini: int):
     await log_step("-> 2. Seggiolini")
     await ensure_app_ready(page)
 
-    # Se seggiolini == 0: lascia NO (è già selezionato di default), ma clicco per sicurezza
     if seggiolini <= 0:
-        loc = page.locator(".SeggNO").first
-        await click(loc, "seggiolini=NO")
+        await click(page.locator(".SeggNO").first, "seggiolini=NO")
         return
 
-    # Se seggiolini > 0: clicco SI (apre la lista), poi scelgo nSeggiolini[rel='X']
-    si = page.locator(".SeggSI, .seggioliniTxt").first
-    await click(si, "seggiolini=SI")
+    await click(page.locator(".SeggSI, .seggioliniTxt").first, "seggiolini=SI")
+    await page.locator(".seggioliniCont").wait_for(state="visible", timeout=20000)
 
-    # La lista appare su .seggioliniCont e items .nSeggiolini[rel='1']
-    await wait_visible(page.locator(".seggioliniCont"), timeout_ms=20000)
     item = page.locator(f".nSeggiolini[rel='{seggiolini}']").first
     if await item.count() == 0:
-        # fallback: se non esiste quel numero, prendo 1
         item = page.locator(".nSeggiolini[rel='1']").first
     await click(item, f"n_seggiolini={seggiolini}")
 
 async def step_select_data(page, data_str: str):
     await log_step("-> 3. Data")
     await ensure_app_ready(page)
+    # valida formato
+    datetime.strptime(data_str, "%Y-%m-%d")
 
-    # La data è in step2 con span.dataOggi.dataBtn rel="YYYY-MM-DD"
-    target = datetime.strptime(data_str, "%Y-%m-%d").date()
+    await page.locator(".step2").wait_for(state="visible", timeout=30000)
 
-    # Attendo che step2 sia visibile (dopo persone / seggiolini)
-    await wait_visible(page.locator(".step2"), timeout_ms=30000)
-
-    # Provo direttamente rel
     rel_loc = page.locator(f".step2 .dataBtn[rel='{data_str}']").first
     if await rel_loc.count() > 0:
         await click(rel_loc, f"data={data_str}")
         return
 
-    # Altra data: clicca e setta input#DataPren + trigger change (jQuery ascolta change)
-    altra = page.locator(".step2 .altraData").first
-    await click(altra, "data=altra_data")
-
+    await click(page.locator(".step2 .altraData").first, "data=altra_data")
     inp = page.locator("#DataPren").first
     await inp.wait_for(state="attached", timeout=15000)
     await inp.fill(data_str)
-    # Trigger change
+
     await page.evaluate(
         """(val) => {
             const i = document.querySelector('#DataPren');
@@ -222,33 +236,21 @@ async def step_select_data(page, data_str: str):
 async def step_select_pasto(page, pasto: str):
     await log_step(f"-> 4. Pasto ({pasto})")
     await ensure_app_ready(page)
-
-    # step3 contiene <span class="tipoBtn" rel="PRANZO">PRANZO</span>
-    await wait_visible(page.locator(".step3"), timeout_ms=30000)
-
+    await page.locator(".step3").wait_for(state="visible", timeout=30000)
     loc = page.locator(f".step3 .tipoBtn[rel='{pasto}']").first
     if await loc.count() == 0:
         loc = page.locator(".step3 .tipoBtn").filter(has_text=re.compile(rf"^{pasto}$", re.I)).first
     await click(loc, f"pasto={pasto}")
 
 async def step_select_sede(page, sede_label: str):
-    """
-    Dopo aver scelto PRANZO/CENA, step4 carica via:
-      $('.ristoCont').load('prenew_rist.php?l=...&d=...&t=...')
-    Quindi dobbiamo:
-    - aspettare che .ristoCont sia visibile
-    - aspettare che compaia il testo della sede
-    - cliccare sul "card" (o sul testo stesso come fallback)
-    """
     await log_step(f"-> 5. Sede ({sede_label})")
     await ensure_app_ready(page)
 
-    # step4 e ristoCont
-    await wait_visible(page.locator(".step4"), timeout_ms=30000)
+    await page.locator(".step4").wait_for(state="visible", timeout=30000)
     risto = page.locator(".ristoCont").first
-    await wait_visible(risto, timeout_ms=30000)
+    await risto.wait_for(state="visible", timeout=30000)
 
-    # Attendo che sparisca lo spinner oppure che ci sia contenuto testuale utile
+    # aspetta contenuto caricato (non solo spinner)
     try:
         await page.wait_for_function(
             """() => {
@@ -262,45 +264,36 @@ async def step_select_sede(page, sede_label: str):
     except Exception:
         pass
 
-    # Trovo la sede
     sede_text = page.locator(".ristoCont").get_by_text(re.compile(re.escape(sede_label), re.I)).first
-    await wait_visible(sede_text, timeout_ms=30000)
+    await sede_text.wait_for(state="visible", timeout=30000)
 
-    # Provo a cliccare un contenitore "card" (div) vicino al testo.
-    # Nello screenshot sembra una riga grande cliccabile.
-    # Strategia: risalgo di qualche ancestor e provo click; se fallisce, clicco il testo.
+    # click su container vicino al testo (con fallback)
     candidates = [
         sede_text.locator("xpath=ancestor::a[1]"),
         sede_text.locator("xpath=ancestor::div[contains(@class,'card')][1]"),
         sede_text.locator("xpath=ancestor::div[1]"),
         sede_text,
     ]
-
-    clicked = False
     for i, cand in enumerate(candidates):
         try:
             if await cand.count() > 0:
-                await click(cand.first, f"sede_click_candidate_{i}", timeout_ms=20000, force=True)
-                clicked = True
-                break
+                await click(cand.first, f"sede_candidate_{i}", timeout_ms=20000, force=True)
+                return
         except Exception:
             continue
 
-    if not clicked:
-        await click(sede_text, "sede_click_fallback", timeout_ms=20000, force=True)
+    await click(sede_text, "sede_fallback", timeout_ms=20000, force=True)
 
 async def step_select_orario_and_confirm(page, orario: str, note: str):
     await log_step(f"-> 6. Orario ({orario})")
     await ensure_app_ready(page)
 
-    # step5 appare dopo selezione sede
-    await wait_visible(page.locator(".step5"), timeout_ms=40000)
+    await page.locator(".step5").wait_for(state="visible", timeout=40000)
 
-    # select#OraPren popolato dinamicamente
     select = page.locator("#OraPren").first
-    await wait_visible(select, timeout_ms=20000)
+    await select.wait_for(state="visible", timeout=20000)
 
-    # attendo opzioni > 1 (c'è sempre la placeholder)
+    # opzioni caricate
     await page.wait_for_function(
         """() => {
             const s = document.querySelector('#OraPren');
@@ -310,119 +303,89 @@ async def step_select_orario_and_confirm(page, orario: str, note: str):
     )
 
     orario_clean = (orario or "").strip().replace(".", ":")
-    # Provo 3 strategie: match exact value, match prefix, match label
     selected = False
+
+    # 1) select_option value exact
     try:
         await select.select_option(value=orario_clean)
         selected = True
     except Exception:
         pass
 
+    # 2) value startswith HH:MM
     if not selected:
-        # prova a trovare un option il cui value inizia con "HH:MM"
-        try:
-            await page.evaluate(
-                """(hhmm) => {
-                    const s = document.querySelector('#OraPren');
-                    if(!s) return false;
-                    const opts = Array.from(s.options || []);
-                    const found = opts.find(o => (o.value || '').startsWith(hhmm));
-                    if(found){
-                        s.value = found.value;
-                        s.dispatchEvent(new Event('change', {bubbles:true}));
-                        return true;
-                    }
-                    return false;
-                }""",
-                orario_clean,
-            )
-            selected = True
-        except Exception:
-            pass
+        selected = await page.evaluate(
+            """(hhmm) => {
+                const s = document.querySelector('#OraPren');
+                if(!s) return false;
+                const opts = Array.from(s.options || []);
+                const found = opts.find(o => (o.value || '').startsWith(hhmm));
+                if(found){
+                    s.value = found.value;
+                    s.dispatchEvent(new Event('change', {bubbles:true}));
+                    return true;
+                }
+                return false;
+            }""",
+            orario_clean,
+        )
 
+    # 3) option text contains HH:MM
     if not selected:
-        # fallback: cerco per testo dell'option
-        try:
-            await page.evaluate(
-                """(hhmm) => {
-                    const s = document.querySelector('#OraPren');
-                    if(!s) return false;
-                    const opts = Array.from(s.options || []);
-                    const found = opts.find(o => (o.textContent || '').includes(hhmm));
-                    if(found){
-                        s.value = found.value;
-                        s.dispatchEvent(new Event('change', {bubbles:true}));
-                        return true;
-                    }
-                    return false;
-                }""",
-                orario_clean,
-            )
-            selected = True
-        except Exception:
-            pass
+        selected = await page.evaluate(
+            """(hhmm) => {
+                const s = document.querySelector('#OraPren');
+                if(!s) return false;
+                const opts = Array.from(s.options || []);
+                const found = opts.find(o => (o.textContent || '').includes(hhmm));
+                if(found){
+                    s.value = found.value;
+                    s.dispatchEvent(new Event('change', {bubbles:true}));
+                    return true;
+                }
+                return false;
+            }""",
+            orario_clean,
+        )
 
     if not selected:
         raise RuntimeError(f"Impossibile selezionare orario {orario_clean} (nessuna option compatibile)")
 
-    # note (textarea#Nota)
     if note:
         try:
             await page.locator("#Nota").fill(note)
         except Exception:
             pass
 
-    # click CONFERMA (a.confDati)
-    await log_step("-> 7. Conferma dati (vai a schermata finale)")
-    conf = page.locator("a.confDati").first
-    await click(conf, "CONFIRMA", timeout_ms=20000, force=True)
+    await log_step("-> 7. Conferma (vai ai dati finali)")
+    await click(page.locator("a.confDati").first, "CONFIRMA", timeout_ms=20000, force=True)
 
-async def step_fill_final_and_submit(page, nome: str, email: str, telefono: str, dry_run: bool):
+async def step_fill_final_and_submit(page, nome: str, email: str, telefono_nsn: str, dry_run: bool):
     await log_step("-> 8. Dati finali")
     await ensure_app_ready(page)
-
-    # stepDati contiene il form
-    await wait_visible(page.locator(".stepDati"), timeout_ms=30000)
+    await page.locator(".stepDati").wait_for(state="visible", timeout=30000)
 
     first, last = split_name(nome)
     await page.locator("#Nome").fill(first)
     await page.locator("#Cognome").fill(last)
     await page.locator("#Email").fill(email)
-    await page.locator("#Telefono").fill(safe_digits_phone(telefono))
+    await page.locator("#Telefono").fill(telefono_nsn)
 
     if dry_run:
-        await log_step("-> ✅ DRY RUN: non clicco PRENOTA (simulazione ok)")
+        await log_step("-> ✅ DRY RUN: non clicco PRENOTA")
         return
 
     await log_step("-> ✅ PRODUZIONE: click PRENOTA")
-    submit = page.locator("#prenoForm input[type='submit'][value='PRENOTA']").first
-    await click(submit, "PRENOTA", timeout_ms=30000, force=True)
+    await click(page.locator("#prenoForm input[type='submit'][value='PRENOTA']").first, "PRENOTA", timeout_ms=30000, force=True)
 
-    # Dopo submit, la pagina carica prenew_res.php dentro .stepCont
-    # Aspetto un minimo segnale di esito (testo "OK" non lo vediamo perché è ajax),
-    # ma possiamo aspettare che cambi contenuto della .stepCont oppure compaia qualche testo di conferma.
-    try:
-        await page.wait_for_function(
-            """() => {
-                const c = document.querySelector('.stepCont');
-                if(!c) return false;
-                const t = (c.innerText || '').toLowerCase();
-                return t.includes('prenot') || t.includes('conferm') || t.includes('grazie');
-            }""",
-            timeout=20000,
-        )
-    except Exception:
-        # Non sempre compare testo “classico”: non blocco.
-        pass
 
 # =========================
-# CORE RUNNER
+# CORE
 # =========================
 async def run_booking_flow(dati: RichiestaPrenotazione, dry_run: bool) -> dict:
     sede_label = normalize_sede(dati.sede)
     pasto = get_pasto_strict(dati.orario)
 
-    # seggiolini: priorità a dati.seggiolini, altrimenti auto da note
     if dati.seggiolini is not None:
         seggiolini_n = max(0, int(dati.seggiolini))
     else:
@@ -435,21 +398,14 @@ async def run_booking_flow(dati: RichiestaPrenotazione, dry_run: bool) -> dict:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
-        context = await browser.new_context(
-            viewport={"width": 390, "height": 844},
-            user_agent="Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-        )
+        context = await browser.new_context(viewport={"width": 390, "height": 844})
         page = await context.new_page()
         page.set_default_timeout(60000)
 
         try:
-            await log_step("-> GO TO FIDY")
+            await log_step(f"-> GO TO: {FIDY_URL}")
             await page.goto(FIDY_URL, wait_until="domcontentloaded", timeout=60000)
             await accept_cookies_if_any(page)
 
@@ -459,35 +415,27 @@ async def run_booking_flow(dati: RichiestaPrenotazione, dry_run: bool) -> dict:
             await step_select_pasto(page, pasto)
             await step_select_sede(page, sede_label)
             await step_select_orario_and_confirm(page, dati.orario, dati.note)
+            # telefono è già validato e normalizzato dal validator (NSN max 10)
             await step_fill_final_and_submit(page, dati.nome, dati.email, dati.telefono, dry_run=dry_run)
 
             return {
                 "ok": True,
                 "result": f"Prenotazione {'SIMULATA' if dry_run else 'INVIATA'} per {dati.nome}: {sede_label} - {pasto} - {dati.data} {dati.orario} - {dati.persone} pax",
-                "debug": {
-                    "sede": sede_label,
-                    "pasto": pasto,
-                    "seggiolini": seggiolini_n,
-                    "dry_run": dry_run,
-                    "url_finale": page.url,
-                },
+                "debug": {"sede": sede_label, "pasto": pasto, "seggiolini": seggiolini_n, "dry_run": dry_run, "url_finale": page.url},
             }
 
         except PWTimeout as e:
-            # screenshot su timeout (molto utile su Railway)
             try:
-                path = "/tmp/timeout.png"
-                await page.screenshot(path=path, full_page=True)
-                await log_step(f"📸 Screenshot timeout salvato: {path}")
+                await page.screenshot(path="/tmp/timeout.png", full_page=True)
+                await log_step("📸 Screenshot timeout: /tmp/timeout.png")
             except Exception:
                 pass
             return {"ok": False, "result": f"Timeout Playwright: {str(e)}"}
 
         except Exception as e:
             try:
-                path = "/tmp/error.png"
-                await page.screenshot(path=path, full_page=True)
-                await log_step(f"📸 Screenshot errore salvato: {path}")
+                await page.screenshot(path="/tmp/error.png", full_page=True)
+                await log_step("📸 Screenshot errore: /tmp/error.png")
             except Exception:
                 pass
             return {"ok": False, "result": f"Errore tecnico: {str(e)}"}
@@ -495,19 +443,12 @@ async def run_booking_flow(dati: RichiestaPrenotazione, dry_run: bool) -> dict:
         finally:
             await browser.close()
 
+
 # =========================
 # ENDPOINTS
 # =========================
 @app.post("/check_availability")
 async def check_availability(dati: RichiestaControllo):
-    """
-    Check leggero:
-    - seleziona persone
-    - seggiolini NO
-    - data
-    - pasto (se orario dato, altrimenti prova PRANZO come default)
-    - verifica che in .ristoCont compaia almeno una sede (non "vuoto")
-    """
     pasto = "PRANZO"
     if dati.orario:
         pasto = get_pasto_strict(dati.orario)
@@ -528,11 +469,10 @@ async def check_availability(dati: RichiestaControllo):
             await step_select_data(page, dati.data)
             await step_select_pasto(page, pasto)
 
-            # ora dovrebbe caricare ristoCont con le sedi disponibili
             risto = page.locator(".ristoCont").first
-            await wait_visible(risto, timeout_ms=30000)
-
+            await risto.wait_for(state="visible", timeout=30000)
             txt = (await risto.inner_text()).strip().lower()
+
             if not txt or "loading" in txt:
                 return {"ok": False, "result": "Non riesco a leggere le disponibilità (contenuto non pronto)."}
             if "non ci sono" in txt or "nessun" in txt:
@@ -544,17 +484,17 @@ async def check_availability(dati: RichiestaControllo):
         finally:
             await browser.close()
 
+
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione, dry_run: int = 0):
-    """
-    dry_run=0 => PRODUZIONE (clic PRENOTA)
-    dry_run=1 => SIMULAZIONE (arriva alla schermata finale e compila i campi, ma NON invia)
-    """
-    return await run_booking_flow(dati, dry_run=bool(int(dry_run)))
+    # dry_run=0 => PRODUZIONE (clic PRENOTA)
+    # dry_run=1 => SIMULAZIONE
+    try:
+        return await run_booking_flow(dati, dry_run=bool(int(dry_run)))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
-# =========================
-# LOCAL RUN
-# =========================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
