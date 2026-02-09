@@ -1,10 +1,10 @@
 import os
 import re
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI
+import uvicorn
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
@@ -14,6 +14,11 @@ app = FastAPI()
 # ----------------------------
 # MODELS
 # ----------------------------
+class RichiestaControllo(BaseModel):
+    data: str
+    persone: str
+
+
 class RichiestaPrenotazione(BaseModel):
     data: str = Field(..., description="YYYY-MM-DD")
     persone: str = Field(..., description="Numero persone")
@@ -25,13 +30,53 @@ class RichiestaPrenotazione(BaseModel):
     note: str = ""
 
 
+@app.get("/")
+def home():
+    return {"status": "Centralino AI - V26 (Strict Time Windows + Robust Selectors)"}
+
+
 # ----------------------------
 # HELPERS
 # ----------------------------
+def ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except:
+        pass
+
+
+def parse_minutes(orario: str) -> int:
+    try:
+        h, m = orario.strip().split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        raise ValueError(f"Formato orario non valido: '{orario}'. Usa HH:MM (es. 13:30).")
+
+
+def get_pasto_rigido(orario: str) -> str:
+    """
+    PRANZO: 12:00 - 14:30
+    CENA:   19:00 - 22:00
+    Se fuori fascia: errore (non scegliamo a caso).
+    """
+    t = parse_minutes(orario)
+
+    pranzo_start = 12 * 60
+    pranzo_end = 14 * 60 + 30
+    cena_start = 19 * 60
+    cena_end = 22 * 60
+
+    if pranzo_start <= t <= pranzo_end:
+        return "PRANZO"
+    if cena_start <= t <= cena_end:
+        return "CENA"
+
+    raise ValueError(
+        f"Orario non prenotabile ({orario}). Fasce: PRANZO 12:00–14:30, CENA 19:00–22:00."
+    )
+
+
 def normalize_sede(raw: str) -> str:
-    """
-    Normalizza la sede alle label reali viste nelle schermate.
-    """
     s = (raw or "").strip().lower()
     mapping = {
         "talenti": "Talenti - Roma",
@@ -44,7 +89,10 @@ def normalize_sede(raw: str) -> str:
         "reggio calabria": "Reggio Calabria",
         "palermo": "Palermo",
     }
-    return mapping.get(s, raw.strip())
+    for k, v in mapping.items():
+        if k in s:
+            return v
+    return raw.strip()
 
 
 def needs_seggiolone(note: str) -> bool:
@@ -54,14 +102,13 @@ def needs_seggiolone(note: str) -> bool:
 
 def choose_turno(orario: str) -> str:
     """
-    Regola pratica (modifica se vuoi):
-    - <= 20:30 -> I TURNO
-    - >= 21:00 -> II TURNO
+    Se ci sono I/II TURNO (scenario weekend), scegliamo in base a orario:
+    <= 20:30 => I TURNO
+    >  20:30 => II TURNO
     """
     try:
-        h, m = orario.split(":")
-        minutes = int(h) * 60 + int(m)
-        return "I TURNO" if minutes <= (20 * 60 + 30) else "II TURNO"
+        t = parse_minutes(orario)
+        return "I TURNO" if t <= (20 * 60 + 30) else "II TURNO"
     except:
         return "I TURNO"
 
@@ -75,13 +122,6 @@ def split_name(full: str) -> tuple[str, str]:
     return parts[0], " ".join(parts[1:])
 
 
-def ensure_dir(path: str) -> None:
-    try:
-        os.makedirs(path, exist_ok=True)
-    except:
-        pass
-
-
 async def screenshot(page, name: str) -> Optional[str]:
     ensure_dir("/tmp/screens")
     ts = int(datetime.now().timestamp())
@@ -93,56 +133,57 @@ async def screenshot(page, name: str) -> Optional[str]:
         return None
 
 
+async def accept_cookies_if_any(page) -> None:
+    # prova soft: non blocca mai se non trova
+    try:
+        await page.locator("text=/accetta|consent|ok/i").first.click(timeout=2500)
+    except:
+        pass
+
+
 async def safe_click(locator, label: str, timeout_ms: int = 15000) -> None:
     """
-    Click robusto: wait visible, scroll, click normale; se fallisce -> force.
+    Click serio: se fallisce -> raise (non proseguiamo “a caso”).
     """
-    await locator.wait_for(state="visible", timeout=timeout_ms)
-    await locator.scroll_into_view_if_needed()
     try:
-        await locator.click(timeout=timeout_ms)
-    except Exception:
-        await locator.click(timeout=timeout_ms, force=True)
+        await locator.wait_for(state="visible", timeout=timeout_ms)
+        await locator.scroll_into_view_if_needed()
+        try:
+            await locator.click(timeout=timeout_ms)
+        except Exception:
+            await locator.click(timeout=timeout_ms, force=True)
+    except Exception as e:
+        raise RuntimeError(f"Click fallito su '{label}': {e}")
 
 
-async def wait_for_step_orario(page, timeout_ms: int = 25000) -> None:
-    """
-    Dopo sede/turno, lo step successivo deve mostrare "Orario".
-    """
-    await page.get_by_text("Orario", exact=False).wait_for(state="visible", timeout=timeout_ms)
+async def wait_text(page, text: str, timeout_ms: int = 25000) -> None:
+    await page.get_by_text(text, exact=False).wait_for(state="visible", timeout=timeout_ms)
 
 
 # ----------------------------
 # FLOW STEPS
 # ----------------------------
 async def select_persone(page, persone: str) -> None:
-    # Nella UI ci sono bottoni 1..9. Provo role=button, poi fallback testo.
     p = persone.strip()
     btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(p)}$")).first
     if await btn.count() > 0:
         await safe_click(btn, f"persone={p}")
         return
-
-    # fallback: riquadri che contengono il numero
     await safe_click(page.get_by_text(p, exact=True).first, f"persone_text={p}")
 
 
 async def select_seggiolone(page, yes: bool) -> None:
-    # Bottoni "NO" "SI"
     target = "SI" if yes else "NO"
     b = page.get_by_role("button", name=re.compile(rf"^{target}$", re.I)).first
     if await b.count() > 0:
         await safe_click(b, f"seggiolone={target}")
         return
-    # fallback testo
     await safe_click(page.get_by_text(target, exact=True).first, f"seggiolone_text={target}")
 
 
-async def select_data(page, data_yyyy_mm_dd: str) -> None:
-    """
-    Provo prima Oggi/Domani se coincide, altrimenti "Altra data" e input date.
-    """
-    target = datetime.strptime(data_yyyy_mm_dd, "%Y-%m-%d").date()
+async def select_data(page, data_str: str) -> None:
+    # prova oggi/domani se coincide
+    target = datetime.strptime(data_str, "%Y-%m-%d").date()
     today = datetime.now().date()
 
     if target == today:
@@ -151,123 +192,92 @@ async def select_data(page, data_yyyy_mm_dd: str) -> None:
             await safe_click(btn, "data=oggi")
             return
 
-    if target == (today + timedelta(days=1)):
+    if target == today + timedelta(days=1):
         btn = page.get_by_role("button", name=re.compile(r"^Domani$", re.I)).first
         if await btn.count() > 0:
             await safe_click(btn, "data=domani")
             return
 
-    # Altra data
+    # altra data
     altra = page.get_by_role("button", name=re.compile(r"Altra\s+data", re.I)).first
     if await altra.count() > 0:
         await safe_click(altra, "data=altra_data")
     else:
         await safe_click(page.get_by_text("Altra data", exact=False).first, "data=altra_data_text")
 
-    # Molti datepicker sono input type="date"
-    date_input = page.locator('input[type="date"]').first
-    if await date_input.count() > 0:
-        await date_input.fill(data_yyyy_mm_dd)
-        # spesso serve Enter o blur
-        await date_input.press("Enter")
+    # preferito: input type=date
+    date_input = page.locator("input[type='date']").first
+    if await date_input.count() == 0:
+        raise RuntimeError("Input data (type=date) non trovato dopo 'Altra data'.")
+
+    await date_input.fill(data_str)
+    await date_input.press("Enter")
+    await page.wait_for_timeout(400)
+
+
+async def select_pasto(page, pasto: str) -> None:
+    # aspetta che i bottoni PRANZO/CENA siano presenti
+    await wait_text(page, "PRANZO", timeout_ms=30000)
+
+    btn = page.get_by_role("button", name=re.compile(rf"^{pasto}$", re.I)).first
+    if await btn.count() > 0:
+        await safe_click(btn, f"pasto={pasto}")
         return
 
-    # fallback: se non è un input date, provo a cliccare il giorno nel calendario
-    # (non perfetto, ma salva situazioni)
-    day = str(target.day)
-    await safe_click(page.get_by_text(day, exact=True).first, f"data_day={day}")
+    # fallback testo
+    await safe_click(page.get_by_text(pasto, exact=True).first, f"pasto_text={pasto}")
+
+
+async def wait_for_step_orario(page, timeout_ms: int = 25000) -> None:
+    await page.get_by_text("Orario", exact=False).wait_for(state="visible", timeout=timeout_ms)
 
 
 async def select_sede_and_turno(page, sede_label: str, orario: str) -> None:
-    """
-    V24: trova la "riga" della sede e gestisce:
-    - scenario B: bottoni I/II TURNO dentro la riga
-    - scenario A: clic sul contenitore cliccabile della riga
-    Con retry + verifica avanzamento (Orario).
-    """
+    # aspetta che almeno una sede sia visibile (lo step è montato)
+    await wait_text(page, "Talenti", timeout_ms=30000)
 
-    # 1) trova il testo sede (preferibilmente label completa es: "Talenti - Roma")
     sede_text = page.get_by_text(re.compile(re.escape(sede_label), re.I)).first
-    await sede_text.wait_for(state="visible", timeout=25000)
+    await sede_text.wait_for(state="visible", timeout=30000)
 
-    # 2) risali a un contenitore “riga” coerente
-    # Tentiamo: il primo ancestor div "grande" (molto spesso è la card).
+    # “riga/card” della sede
     row = sede_text.locator("xpath=ancestor::div[1]")
 
-    # 3) dentro la riga cerco bottoni turno
+    # scenario B: turni presenti
     turno_buttons = row.get_by_role("button", name=re.compile(r"\bI TURNO\b|\bII TURNO\b", re.I))
-    desired_turno = choose_turno(orario)
-
-    async def try_select_once() -> bool:
-        # Weekend: click TURNO specifico
-        if await turno_buttons.count() > 0:
-            btn = row.get_by_role("button", name=re.compile(rf"^{re.escape(desired_turno)}$", re.I)).first
-            if await btn.count() == 0:
-                btn = turno_buttons.first
-            await safe_click(btn, f"turno={desired_turno}")
+    if await turno_buttons.count() > 0:
+        desired = choose_turno(orario)
+        btn = row.get_by_role("button", name=re.compile(rf"^{re.escape(desired)}$", re.I)).first
+        if await btn.count() == 0:
+            btn = turno_buttons.first
+        await safe_click(btn, f"turno={desired}")
+    else:
+        # scenario A: clic su elemento cliccabile della card
+        inner_btn = row.get_by_role("button").first
+        if await inner_btn.count() > 0:
+            await safe_click(inner_btn, f"sede_inner_button={sede_label}")
         else:
-            # Feriale: clicca il vero elemento cliccabile della riga
-            # Priorità: un vero button/link dentro la riga
-            inner_btn = row.get_by_role("button").first
-            if await inner_btn.count() > 0:
-                await safe_click(inner_btn, f"sede_inner_button={sede_label}")
+            role_btn = sede_text.locator("xpath=ancestor::*[@role='button'][1]")
+            if await role_btn.count() > 0:
+                await safe_click(role_btn, f"sede_role_button={sede_label}")
             else:
-                # prova a cliccare un ancestor con ruolo button (se presente)
-                role_btn = sede_text.locator("xpath=ancestor::*[@role='button'][1]")
-                if await role_btn.count() > 0:
-                    await safe_click(role_btn, f"sede_role_button={sede_label}")
-                else:
-                    # ultimo fallback: clic sul container row
-                    await safe_click(row, f"sede_row={sede_label}")
+                await safe_click(row, f"sede_row={sede_label}")
 
-        # Verifica avanzamento: compare "Orario"
-        try:
-            await wait_for_step_orario(page, timeout_ms=15000)
-            return True
-        except PWTimeout:
-            return False
-
-    # 4) retry intelligente: se non avanza, riprovo cliccando vari target
-    ok = await try_select_once()
-    if ok:
-        return
-
-    # retry 1: clic direttamente sul testo sede (a volte è link)
-    try:
-        await safe_click(sede_text, f"sede_text={sede_label}")
-        await wait_for_step_orario(page, timeout_ms=15000)
-        return
-    except Exception:
-        pass
-
-    # retry 2: clic su un ancestor più alto (card più estesa)
-    try:
-        bigger = sede_text.locator("xpath=ancestor::div[2]")
-        if await bigger.count() > 0:
-            await safe_click(bigger, f"sede_big_container={sede_label}")
-            await wait_for_step_orario(page, timeout_ms=15000)
-            return
-    except Exception:
-        pass
-
-    # Se ancora nulla, fail esplicito con screenshot
-    raise RuntimeError(f"Selezione sede/turno fallita per '{sede_label}' (nessun avanzamento a 'Orario').")
+    # verifica avanzamento
+    await wait_for_step_orario(page, timeout_ms=25000)
 
 
 async def select_orario(page, orario: str) -> None:
-    """
-    Dalle schermate: campo dropdown “Orario” che apre una lista con orari cliccabili.
-    """
-    # prova combobox
+    # apri dropdown: combobox se esiste, altrimenti click su “Orario”
     combo = page.get_by_role("combobox").first
     if await combo.count() > 0 and await combo.is_visible():
         await safe_click(combo, "orario_combobox")
     else:
-        # fallback: clic sul blocco vicino "Orario"
         await safe_click(page.get_by_text("Orario", exact=False).first, "orario_label")
 
-    # scegli orario esatto
+    # scegli orario esatto (mai “a caso”)
     opt = page.get_by_text(orario, exact=True).first
+    if await opt.count() == 0:
+        raise RuntimeError(f"Orario '{orario}' non trovato tra le opzioni disponibili.")
     await safe_click(opt, f"orario={orario}")
 
 
@@ -275,118 +285,150 @@ async def proceed_conferma(page) -> None:
     btn = page.get_by_role("button", name=re.compile(r"CONFERMA", re.I)).first
     if await btn.count() > 0:
         await safe_click(btn, "conferma")
-        return
-    await safe_click(page.get_by_text("CONFERMA", exact=False).first, "conferma_text")
+    else:
+        await safe_click(page.get_by_text("CONFERMA", exact=False).first, "conferma_text")
 
 
-async def fill_final_form_and_submit(page, nome: str, telefono: str, email: str) -> None:
+async def fill_final_form(page, nome: str, telefono: str, email: str) -> None:
     first, last = split_name(nome)
 
-    # campi finali: Nome*, Cognome*, Email*, Telefono*
+    await wait_text(page, "Ci siamo quasi", timeout_ms=30000)
+
     await page.get_by_label("Nome*", exact=False).fill(first or ".")
     await page.get_by_label("Cognome*", exact=False).fill(last or ".")
     await page.get_by_label("Email*", exact=False).fill(email)
     await page.get_by_label("Telefono*", exact=False).fill(telefono)
 
+
+async def click_prenota(page) -> None:
     btn = page.get_by_role("button", name=re.compile(r"PRENOTA", re.I)).first
     if await btn.count() > 0:
         await safe_click(btn, "prenota")
-        return
-    await safe_click(page.get_by_text("PRENOTA", exact=False).first, "prenota_text")
+    else:
+        await safe_click(page.get_by_text("PRENOTA", exact=False).first, "prenota_text")
 
 
 # ----------------------------
-# MAIN ENDPOINT
+# ENDPOINTS
 # ----------------------------
-@app.post("/book_table")
-async def book_table(dati: RichiestaPrenotazione):
-    sede_label = normalize_sede(dati.sede)
-    seggiolone = needs_seggiolone(dati.note)
-
+@app.post("/check_availability")
+async def check_availability(dati: RichiestaControllo):
+    """
+    Check semplice: compila persone+data e verifica se la UI prosegue almeno fino a “PRANZO/CENA”.
+    (È più affidabile che cercare “non ci sono” dentro page.content()).
+    """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu"]
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
         context = await browser.new_context(viewport={"width": 390, "height": 844})
         page = await context.new_page()
         page.set_default_timeout(60000)
 
         try:
-            print(f"✍️ START BOOKING V24: sede={sede_label}, data={dati.data}, ora={dati.orario}, persone={dati.persone}")
-
             await page.goto("https://rione.fidy.app/prenew.php?referer=sito", wait_until="domcontentloaded")
-            await page.wait_for_timeout(500)
+            await accept_cookies_if_any(page)
 
-            # 1) Persone
-            print("-> 1. Selezione persone...")
             await select_persone(page, dati.persone)
-
-            # 2) Seggiolone
-            print("-> 2. Seggiolone...")
-            await select_seggiolone(page, seggiolone)
-
-            # 3) Data
-            print(f"-> 3. Data ({dati.data})...")
+            await select_seggiolone(page, False)
             await select_data(page, dati.data)
 
-            # 4) Sede / Turno (critico)
-            print(f"-> 4. Selezione sede/turno: '{sede_label}'...")
-            await select_sede_and_turno(page, sede_label, dati.orario)
-
-            # 5) Orario
-            print(f"-> 5. Selezione orario: {dati.orario} ...")
-            await select_orario(page, dati.orario)
-
-            # 6) Note (se c’è textarea)
-            if dati.note:
-                print("-> 6. Note...")
-                ta = page.locator("textarea").first
-                if await ta.count() > 0:
-                    await ta.fill(dati.note)
-
-            # 7) Conferma
-            print("-> 7. Conferma...")
-            await proceed_conferma(page)
-
-            # 8) Dati finali + Prenota
-            print("-> 8. Dati finali + PRENOTA...")
-            await fill_final_form_and_submit(page, dati.nome, dati.telefono, dati.email)
-
-            # (Opzionale) attesa mini per eventuale pagina di successo
-            await page.wait_for_timeout(800)
-
-            return {
-                "result": "Success",
-                "sede": sede_label,
-                "data": dati.data,
-                "orario": dati.orario,
-                "persone": dati.persone,
-                "turno": choose_turno(dati.orario),
-                "seggiolone": seggiolone
-            }
-
-        except PWTimeout as e:
-            path = await screenshot(page, "timeout")
-            return {
-                "result": f"Error: Timeout - {str(e)}",
-                "debug_screenshot": path
-            }
+            # se arriviamo a vedere PRANZO/CENA, il flusso è “aperto”
+            await wait_text(page, "PRANZO", timeout_ms=20000)
+            return {"result": "OK", "detail": "Flow disponibile fino a scelta pasto."}
 
         except Exception as e:
-            path = await screenshot(page, "error")
-            return {
-                "result": f"Error: {str(e)}",
-                "debug_screenshot": path
-            }
+            path = await screenshot(page, "check_error")
+            return {"result": "Error", "detail": str(e), "debug_screenshot": path}
 
         finally:
             await browser.close()
 
 
-# ----------------------------
-# LOCAL RUN (optional)
-# ----------------------------
+@app.post("/book_table")
+async def book_table(dati: RichiestaPrenotazione):
+    sede_label = normalize_sede(dati.sede)
+    seggiolone = needs_seggiolone(dati.note)
+
+    try:
+        pasto_target = get_pasto_rigido(dati.orario)
+    except ValueError as e:
+        # errore “logico”, non tecnico
+        raise HTTPException(status_code=400, detail=str(e))
+
+    DRY_RUN = os.getenv("DRY_RUN", "1") == "1"  # 1 = non clicca PRENOTA
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        context = await browser.new_context(viewport={"width": 390, "height": 844})
+        page = await context.new_page()
+        page.set_default_timeout(60000)
+
+        try:
+            print(f"✍️ BOOKING V26: {dati.nome} -> {sede_label} | {dati.data} {dati.orario} | {dati.persone} pax | pasto={pasto_target} | dry_run={DRY_RUN}")
+
+            await page.goto("https://rione.fidy.app/prenew.php?referer=sito", wait_until="domcontentloaded")
+            await accept_cookies_if_any(page)
+
+            print("-> 1. Persone")
+            await select_persone(page, dati.persone)
+
+            print("-> 2. Seggiolone")
+            await select_seggiolone(page, seggiolone)
+
+            print("-> 3. Data")
+            await select_data(page, dati.data)
+
+            print(f"-> 4. Pasto ({pasto_target})")
+            await select_pasto(page, pasto_target)
+
+            print(f"-> 5. Sede/Turno ({sede_label})")
+            await select_sede_and_turno(page, sede_label, dati.orario)
+
+            print(f"-> 6. Orario ({dati.orario})")
+            await select_orario(page, dati.orario)
+
+            if dati.note:
+                print("-> 7. Note")
+                ta = page.locator("textarea").first
+                if await ta.count() > 0:
+                    await ta.fill(dati.note)
+
+            print("-> 8. Conferma")
+            await proceed_conferma(page)
+
+            print("-> 9. Form finale")
+            await fill_final_form(page, dati.nome, dati.telefono, dati.email)
+
+            if DRY_RUN:
+                return {
+                    "result": "DryRunSuccess",
+                    "detail": "Arrivato fino alla schermata finale. DRY_RUN=1, quindi NON ho cliccato PRENOTA.",
+                    "sede": sede_label,
+                    "pasto": pasto_target,
+                    "data": dati.data,
+                    "orario": dati.orario,
+                    "persone": dati.persone
+                }
+
+            print("-> 10. PRENOTA")
+            await click_prenota(page)
+
+            return {
+                "result": "Success",
+                "sede": sede_label,
+                "pasto": pasto_target,
+                "data": dati.data,
+                "orario": dati.orario,
+                "persone": dati.persone
+            }
+
+        except Exception as e:
+            path = await screenshot(page, "book_error")
+            return {"result": "Error", "detail": str(e), "debug_screenshot": path}
+
+        finally:
+            await browser.close()
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
