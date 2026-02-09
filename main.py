@@ -1,132 +1,149 @@
 import os
 import re
 import asyncio
+import logging
 from datetime import date, datetime, timedelta
-from typing import Optional, Literal, Any, Dict, List
+from typing import Optional, Literal, Dict, Any
 
-import phonenumbers
-from phonenumbers.phonenumberutil import NumberParseException
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator
+import phonenumbers
+from phonenumbers.phonenumberutil import NumberParseException
 
-from playwright.async_api import async_playwright, Browser, Playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 
-# ----------------------------
+# -------------------------
 # CONFIG
-# ----------------------------
-DEFAULT_TZ = "Europe/Rome"
-MAX_DAYS_AHEAD = 30
-MAX_PEOPLE_AUTOMATION = 9
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("centralino-webhook")
 
-# Link prenotazione: aggiunge metadato referer=AI
-BOOKING_URL = "https://rione.fidy.app/prenew.php?referer=AI"
+BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?referer=AI")
+DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IT")
+MAX_DAYS_AHEAD = int(os.getenv("MAX_DAYS_AHEAD", "30"))
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 
-# Numero operatore per gruppi / richieste speciali (metti quello reale)
-OPERATOR_PHONE = os.getenv("OPERATOR_PHONE", "+390656556263")
+# Timeout Playwright (ms)
+NAV_TIMEOUT = int(os.getenv("NAV_TIMEOUT_MS", "25000"))
+ACTION_TIMEOUT = int(os.getenv("ACTION_TIMEOUT_MS", "15000"))
 
-# Playwright tuning
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "12000"))     # navigazione
-PW_STEP_TIMEOUT_MS = int(os.getenv("PW_STEP_TIMEOUT_MS", "9000"))    # step/selector
-PW_TOTAL_TIMEOUT_SEC = int(os.getenv("PW_TOTAL_TIMEOUT_SEC", "25"))  # hard cap per chiamata tool
+# Retry
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "0.6"))
 
-# Concorrenza: evita di aprire 3 prenotazioni insieme e impallare
-BOOKING_CONCURRENCY = int(os.getenv("BOOKING_CONCURRENCY", "1"))
-_booking_sem = asyncio.Semaphore(BOOKING_CONCURRENCY)
-
-# Retry su errori transient (1 retry = sufficiente)
-MAX_RETRY = int(os.getenv("MAX_RETRY", "1"))
-
-# Globals (browser persistente)
-_pw: Optional[Playwright] = None
+# Worker-safe: ogni processo uvicorn avrà il suo browser singleton
+_pw = None
 _browser: Optional[Browser] = None
+_context: Optional[BrowserContext] = None
 
 
-# ----------------------------
-# UTILS
-# ----------------------------
-def _today_rome() -> date:
-    # Evitiamo dipendenze extra: assumiamo server in CET/UTC e lavoriamo a giorni.
-    # Per regole "passato / 30 giorni" basta confrontare date ISO che arrivano dal bot.
-    return date.today()
+# -------------------------
+# HELPERS
+# -------------------------
+class TransferRequired(Exception):
+    def __init__(self, reason: str, phone: Optional[str] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.phone = phone
 
 
 def normalize_time_to_hhmm(raw: str) -> str:
     """
-    Accetta: '13', 'ore 13', '13:00', '8', '08', '8:30', 'ore 20.15'
-    Ritorna sempre HH:MM oppure alza ValueError.
+    Accetta:
+    - "13" -> "13:00"
+    - "ore 13" -> "13:00"
+    - "13:5" -> "13:05"
+    - "8" -> "08:00"
+    - "20.30" -> "20:30"
+    - "20,30" -> "20:30"
     """
-    s = (raw or "").strip().lower()
-    s = s.replace(".", ":")
+    if raw is None:
+        raise ValueError("Ora mancante")
+
+    s = str(raw).strip().lower()
+    s = s.replace(".", ":").replace(",", ":")
+
     s = re.sub(r"\bore\b", "", s).strip()
+    s = re.sub(r"\s+", "", s)
 
-    # Match "H" or "HH"
-    m1 = re.fullmatch(r"(\d{1,2})", s)
-    if m1:
-        h = int(m1.group(1))
-        if 0 <= h <= 23:
-            return f"{h:02d}:00"
-        raise ValueError("Orario non valido")
+    # Solo ore (es. "13" o "8")
+    if re.fullmatch(r"\d{1,2}", s):
+        h = int(s)
+        if not (0 <= h <= 23):
+            raise ValueError("Ora non valida")
+        return f"{h:02d}:00"
 
-    # Match "H:MM" or "HH:MM"
-    m2 = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if m2:
-        h = int(m2.group(1))
-        mm = int(m2.group(2))
-        if 0 <= h <= 23 and 0 <= mm <= 59:
-            return f"{h:02d}:{mm:02d}"
-        raise ValueError("Orario non valido")
+    # hh:mm
+    m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", s)
+    if m:
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        if not (0 <= h <= 23 and 0 <= mi <= 59):
+            raise ValueError("Ora non valida")
+        return f"{h:02d}:{mi:02d}"
 
-    raise ValueError("Orario non valido")
+    raise ValueError("Formato ora non riconosciuto")
 
 
-def validate_and_format_phone(phone: str, default_region: str = "IT") -> str:
+def validate_and_format_phone_it(raw: str) -> str:
     """
-    Valida e normalizza in E.164 se possibile.
-    Accetta numeri italiani con o senza +39.
+    Valida telefono con phonenumbers.
+    Output: numero nazionale SOLO cifre, usabile nel form (tipicamente 10 cifre per mobile IT).
     """
-    p = (phone or "").strip()
-    if not p:
+    if not raw:
         raise ValueError("Telefono mancante")
 
-    # Togli spazi e separatori
-    p_clean = re.sub(r"[^\d+]", "", p)
+    s = re.sub(r"[^\d+]", "", str(raw).strip())
 
     try:
-        num = phonenumbers.parse(p_clean, default_region)
+        pn = phonenumbers.parse(s, DEFAULT_REGION)
     except NumberParseException:
-        raise ValueError("Numero di telefono non valido")
+        raise ValueError("Telefono non valido")
 
-    if not phonenumbers.is_valid_number(num):
-        raise ValueError("Numero di telefono non valido")
+    if not phonenumbers.is_valid_number(pn):
+        raise ValueError("Telefono non valido")
 
-    # E.164 (+39347...)
-    return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    if phonenumbers.region_code_for_number(pn) != "IT":
+        # se vuoi accettare esteri, qui puoi cambiare logica
+        raise ValueError("Telefono non italiano")
+
+    national = str(pn.national_number)
+
+    # In pratica, per booking via form (maxlength=10) conviene standardizzare a 10 cifre mobile
+    # Se vuoi gestire anche fissi (lunghezza variabile), serve aggiornare form lato sito.
+    if len(national) != 10:
+        raise ValueError("Telefono italiano non nel formato atteso (10 cifre)")
+
+    if not national.isdigit():
+        raise ValueError("Telefono non valido")
+
+    return national
 
 
-def enforce_date_rules(d: date, people: int) -> None:
-    today = _today_rome()
-
+def validate_date_window(d: date) -> None:
+    today = date.today()
     if d < today:
-        raise ValueError("Non è possibile prenotare per date passate.")
-
+        raise TransferRequired("Non è possibile prenotare per una data passata.")
     if d > today + timedelta(days=MAX_DAYS_AHEAD):
-        # Non automatizziamo oltre 30 giorni
-        raise ValueError(
-            f"Per prenotazioni oltre {MAX_DAYS_AHEAD} giorni è necessario contattare un operatore."
+        raise TransferRequired(
+            f"Per prenotazioni oltre {MAX_DAYS_AHEAD} giorni è necessario parlare con un operatore."
         )
 
-    if people > MAX_PEOPLE_AUTOMATION:
-        raise ValueError("Per tavoli superiori a 9 persone è necessario contattare un operatore.")
 
-
-def _map_sede_label(sede: str) -> str:
+def sede_to_label(sede: str) -> str:
     """
-    Normalizza sede: accetta varianti.
+    Mappa input sede -> testo presente nella UI
     """
-    s = (sede or "").strip().lower()
-    m = {
+    s = sede.strip().lower()
+    mapping = {
         "talenti": "Talenti - Roma",
         "roma talenti": "Talenti - Roma",
         "appia": "Appia",
@@ -137,492 +154,383 @@ def _map_sede_label(sede: str) -> str:
         "palermo": "Palermo",
         "palermo centro": "Palermo",
     }
-    if s in m:
-        return m[s]
-    # fallback: tenta titolo
-    return sede.strip()
+    return mapping.get(s, sede)
 
 
-def _tipo_from_time_or_label(tipologia: str) -> str:
-    """
-    Tipologia deve essere PRANZO o CENA.
-    """
-    t = (tipologia or "").strip().upper()
-    if t in ("PRANZO", "CENA"):
-        return t
-    raise ValueError("Tipologia deve essere PRANZO o CENA")
+async def retry_async(fn, *args, **kwargs):
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(f"Retry {attempt+1}/{MAX_RETRIES+1} after error: {e}. Waiting {delay:.2f}s")
+            await asyncio.sleep(delay)
+    raise last_exc
 
 
-def confirmation_text() -> str:
-    return (
-        "Riceverai la conferma della prenotazione via WhatsApp e via email. "
-        "È importante rispettare l’orario scelto: in caso di ritardo prolungato "
-        "il tavolo potrebbe non essere più garantito."
-    )
+async def ensure_browser():
+    global _pw, _browser, _context
+    if _pw is None:
+        _pw = await async_playwright().start()
+
+    if _browser is None:
+        _browser = await _pw.chromium.launch(
+            headless=PLAYWRIGHT_HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+            ],
+        )
+
+    if _context is None:
+        _context = await _browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            locale="it-IT",
+        )
+    return _context
 
 
-# ----------------------------
-# MODELS (Pydantic v2)
-# ----------------------------
+async def close_browser():
+    global _pw, _browser, _context
+    try:
+        if _context is not None:
+            await _context.close()
+    except Exception:
+        pass
+    _context = None
+    try:
+        if _browser is not None:
+            await _browser.close()
+    except Exception:
+        pass
+    _browser = None
+    try:
+        if _pw is not None:
+            await _pw.stop()
+    except Exception:
+        pass
+    _pw = None
+
+
+# -------------------------
+# MODELS
+# -------------------------
+class CheckAvailabilityRequest(BaseModel):
+    sede: str
+    data: str  # YYYY-MM-DD
+    ora: Optional[str] = None
+    persone: int = Field(ge=1, le=9)
+
+
 class BookTableRequest(BaseModel):
-    nome: str = Field(..., min_length=1)
-    cognome: str = Field(..., min_length=1)
+    nome: str
+    cognome: str
     email: EmailStr
     telefono: str
-    persone: int = Field(..., ge=1, le=50)
+    persone: int = Field(ge=1, le=20)  # validiamo poi: >9 -> transfer
     sede: str
-    data: str  # YYYY-MM-DD (già risolta dall’agente)
-    ora: str   # HH:MM o forme convertibili
+    data: str  # YYYY-MM-DD
+    ora: str
     seggiolone: bool = False
-    seggiolini: int = Field(0, ge=0, le=5)
+    seggiolini: int = Field(default=0, ge=0, le=5)
     nota: str = ""
     referer: str = "AI"
     dry_run: bool = False
 
-    # Normalizza ora
+    @field_validator("nome", "cognome")
+    @classmethod
+    def name_not_empty(cls, v: str):
+        v = (v or "").strip()
+        if len(v) < 2:
+            raise ValueError("Nome/Cognome non valido")
+        return v
+
     @field_validator("ora")
     @classmethod
-    def _v_ora(cls, v: str) -> str:
-        try:
-            return normalize_time_to_hhmm(v)
-        except ValueError:
-            raise ValueError("Ora non valida. Usa HH:MM (es. 13:00) o un orario chiaro (es. 13).")
+    def normalize_time(cls, v: str):
+        return normalize_time_to_hhmm(v)
 
-    # Normalizza sede
-    @field_validator("sede")
-    @classmethod
-    def _v_sede(cls, v: str) -> str:
-        vv = (v or "").strip()
-        if not vv:
-            raise ValueError("Sede mancante")
-        return _map_sede_label(vv)
-
-    # Telefono valido
     @field_validator("telefono")
     @classmethod
-    def _v_tel(cls, v: str) -> str:
-        try:
-            return validate_and_format_phone(v)
-        except ValueError as e:
-            raise ValueError(str(e))
+    def normalize_phone(cls, v: str):
+        return validate_and_format_phone_it(v)
 
     @field_validator("data")
     @classmethod
-    def _v_data(cls, v: str) -> str:
-        vv = (v or "").strip()
+    def validate_date_str(cls, v: str):
         try:
-            datetime.strptime(vv, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("Data non valida. Usa il formato YYYY-MM-DD.")
-        return vv
-
-    @model_validator(mode="after")
-    def _business_rules(self) -> "BookTableRequest":
-        d = datetime.strptime(self.data, "%Y-%m-%d").date()
-        enforce_date_rules(d, self.persone)
-        if self.seggiolini == 0 and self.seggiolone:
-            # seggiolone true senza seggiolini indicati: impostiamo 1
-            self.seggiolini = 1
-        if self.referer != "AI":
-            # forziamo sempre AI in produzione per tracking
-            self.referer = "AI"
-        return self
+            d = datetime.strptime(v, "%Y-%m-%d").date()
+        except Exception:
+            raise ValueError("Data non valida (usa YYYY-MM-DD)")
+        validate_date_window(d)
+        return v
 
 
-class AvailabilityRequest(BaseModel):
-    persone: int = Field(..., ge=1, le=9)
-    sede: str
-    data: str  # YYYY-MM-DD
-    tipologia: Literal["PRANZO", "CENA"]
-
-    @field_validator("sede")
-    @classmethod
-    def _v_sede(cls, v: str) -> str:
-        vv = (v or "").strip()
-        if not vv:
-            raise ValueError("Sede mancante")
-        return _map_sede_label(vv)
-
-    @field_validator("data")
-    @classmethod
-    def _v_data(cls, v: str) -> str:
-        vv = (v or "").strip()
-        try:
-            datetime.strptime(vv, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("Data non valida. Usa il formato YYYY-MM-DD.")
-        d = datetime.strptime(vv, "%Y-%m-%d").date()
-        enforce_date_rules(d, people=1)  # check date range; people check handled separately
-        return vv
+# -------------------------
+# FASTAPI APP (lifespan)
+# -------------------------
+app = FastAPI(title="centralino-webhook", version="1.0.0")
 
 
-# ----------------------------
-# FASTAPI (lifespan)
-# ----------------------------
-async def lifespan(app: FastAPI):
-    global _pw, _browser
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-gpu",
-        ],
-    )
-    yield
-    try:
-        if _browser:
-            await _browser.close()
-    finally:
-        _browser = None
-        if _pw:
-            await _pw.stop()
-        _pw = None
+@app.on_event("startup")
+async def _deprecated_startup_notice():
+    # lasciato vuoto per compatibilità, ma usiamo lifespan-like logic sotto
+    pass
 
 
-app = FastAPI(title="centralino-webhook", version="1.0.0", lifespan=lifespan)
+@app.on_event("shutdown")
+async def _deprecated_shutdown_notice():
+    pass
 
 
-# ----------------------------
-# PLAYWRIGHT CORE
-# ----------------------------
-async def _new_fast_context():
-    """
-    Crea contesto ottimizzato: blocca immagini/font/media per velocizzare.
-    """
-    if _browser is None:
-        raise RuntimeError("Browser non inizializzato")
-
-    context = await _browser.new_context(
-        locale="it-IT",
-        viewport={"width": 1280, "height": 800},
-    )
-
-    async def route_handler(route, request):
-        if request.resource_type in ("image", "media", "font"):
-            await route.abort()
-            return
-        await route.continue_()
-
-    await context.route("**/*", route_handler)
-    return context
-
-
-async def _click_by_text(page, text: str, timeout_ms: int = PW_STEP_TIMEOUT_MS):
-    loc = page.get_by_text(text, exact=False)
-    await loc.first.click(timeout=timeout_ms)
-
-
-async def _select_time_option(page, hhmm: str):
-    """
-    select#OraPren, value potrebbe essere "13:00" o "13:00:00".
-    Proviamo match esatto e fallback.
-    """
-    # Primo tentativo: value == HH:MM
-    try:
-        await page.select_option("#OraPren", value=hhmm, timeout=PW_STEP_TIMEOUT_MS)
-        return
-    except Exception:
-        pass
-
-    # Fallback: trova opzioni che iniziano con HH:MM
-    opts = await page.query_selector_all("#OraPren option")
-    for o in opts:
-        val = await o.get_attribute("value")
-        if val and val.startswith(hhmm):
-            await page.select_option("#OraPren", value=val, timeout=PW_STEP_TIMEOUT_MS)
-            return
-
-    raise ValueError("Orario non disponibile per i parametri scelti.")
-
-
-async def _wait_ajax_ok(page):
-    """
-    Attende la risposta POST ajax.php e verifica che torni OK.
-    """
-    def is_target(resp):
-        return ("ajax.php" in resp.url) and resp.request.method == "POST"
-
-    async with page.expect_response(is_target, timeout=PW_NAV_TIMEOUT_MS) as resp_info:
-        await page.locator('input[type="submit"][value="PRENOTA"]').click(timeout=PW_STEP_TIMEOUT_MS)
-
-    resp = await resp_info.value
-    if resp.status != 200:
-        raise RuntimeError("Errore nella conferma prenotazione (HTTP non 200).")
-
-    txt = (await resp.text()).strip()
-    if txt != "OK":
-        raise RuntimeError(txt or "Errore nella conferma prenotazione.")
-
-
-async def _perform_booking(req: BookTableRequest) -> Dict[str, Any]:
-    """
-    Automazione completa prenotazione.
-    """
-    context = await _new_fast_context()
-    page = await context.new_page()
-    page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
-    page.set_default_timeout(PW_STEP_TIMEOUT_MS)
-
-    try:
-        await page.goto(BOOKING_URL, wait_until="domcontentloaded")
-
-        # Intro: a volte fa fadeIn; aspettiamo step1 visibile
-        await page.wait_for_selector(".stepCont", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-
-        # STEP 1: coperti
-        await page.locator(f'.nCoperti[rel="{req.persone}"]').click(timeout=PW_STEP_TIMEOUT_MS)
-
-        # Seggiolini
-        if req.seggiolini > 0:
-            await page.locator(".seggioliniTxt").click(timeout=PW_STEP_TIMEOUT_MS)
-            await page.locator(f'.nSeggiolini[rel="{req.seggiolini}"]').click(timeout=PW_STEP_TIMEOUT_MS)
-        else:
-            # Forza NO se presente
-            if await page.locator(".SeggNO").count():
-                await page.locator(".SeggNO").click(timeout=PW_STEP_TIMEOUT_MS)
-
-        # STEP 2: data
-        # Se data = oggi/domani usa i bottoni, altrimenti input date
-        d = req.data
-        today = _today_rome().strftime("%Y-%m-%d")
-        tomorrow = (_today_rome() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        if d == today:
-            await page.locator('.dataOggi[rel="' + today + '"]').click(timeout=PW_STEP_TIMEOUT_MS)
-        elif d == tomorrow:
-            await page.locator('.dataOggi[rel="' + tomorrow + '"]').click(timeout=PW_STEP_TIMEOUT_MS)
-        else:
-            # input#DataPren + trigger change
-            await page.locator("#DataPren").fill(d, timeout=PW_STEP_TIMEOUT_MS)
-            await page.locator("#DataPren").dispatch_event("change")
-
-        # STEP 3: pranzo/cena
-        tipologia = _tipo_from_time_or_label("PRANZO")  # placeholder
-        # In questo sistema la tipologia arriva implicitamente dall’agente, ma nel tool la riceviamo già?
-        # Qui usiamo un euristico: se ora < 17:00 => PRANZO else CENA.
-        h = int(req.ora.split(":")[0])
-        tipologia = "PRANZO" if h < 17 else "CENA"
-        await page.locator(f'.tipoBtn[rel="{tipologia}"]').click(timeout=PW_STEP_TIMEOUT_MS)
-
-        # STEP 4: scelta ristorante
-        # Aspetta che lista sedi compaia
-        await page.wait_for_selector(".ristoCont", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-
-        # Click sulla riga che contiene il nome sede
-        await _click_by_text(page, req.sede, timeout_ms=PW_STEP_TIMEOUT_MS)
-
-        # STEP 5: orario
-        await page.wait_for_selector("#OraPren", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-        await _select_time_option(page, req.ora)
-
-        # Nota (facoltativa)
-        if req.nota:
-            await page.locator("#Nota").fill(req.nota[:250], timeout=PW_STEP_TIMEOUT_MS)
-
-        # Conferma step dati
-        await page.locator(".confDati").click(timeout=PW_STEP_TIMEOUT_MS)
-
-        # STEP DATI: form
-        await page.wait_for_selector("#prenoForm", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-
-        await page.locator("#Nome").fill(req.nome, timeout=PW_STEP_TIMEOUT_MS)
-        await page.locator("#Cognome").fill(req.cognome, timeout=PW_STEP_TIMEOUT_MS)
-        await page.locator("#Email").fill(str(req.email), timeout=PW_STEP_TIMEOUT_MS)
-
-        # Telefono: sito sembra accettare 10 cifre italiane.
-        # Noi abbiamo E.164: convertiamo a nazionale IT se +39
-        tel = req.telefono
-        if tel.startswith("+39"):
-            tel_local = tel.replace("+39", "")
-        else:
-            tel_local = re.sub(r"\D", "", tel)
-        tel_local = tel_local[:10]
-        await page.locator("#Telefono").fill(tel_local, timeout=PW_STEP_TIMEOUT_MS)
-
-        # Submit + verifica OK
-        await _wait_ajax_ok(page)
-
-        return {
-            "status": "OK",
-            "message": "Prenotazione confermata.",
-            "confirmations": {
-                "whatsapp": True,
-                "email": True,
-                "note": confirmation_text(),
-            },
-        }
-
-    finally:
-        await context.close()
-
-
-async def _perform_availability(req: AvailabilityRequest) -> Dict[str, Any]:
-    """
-    Ritorna lista orari disponibili (best effort).
-    """
-    context = await _new_fast_context()
-    page = await context.new_page()
-    page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
-    page.set_default_timeout(PW_STEP_TIMEOUT_MS)
-
-    try:
-        await page.goto(BOOKING_URL, wait_until="domcontentloaded")
-        await page.wait_for_selector(".stepCont", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-
-        await page.locator(f'.nCoperti[rel="{req.persone}"]').click(timeout=PW_STEP_TIMEOUT_MS)
-
-        d = req.data
-        today = _today_rome().strftime("%Y-%m-%d")
-        tomorrow = (_today_rome() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        if d == today:
-            await page.locator('.dataOggi[rel="' + today + '"]').click(timeout=PW_STEP_TIMEOUT_MS)
-        elif d == tomorrow:
-            await page.locator('.dataOggi[rel="' + tomorrow + '"]').click(timeout=PW_STEP_TIMEOUT_MS)
-        else:
-            await page.locator("#DataPren").fill(d, timeout=PW_STEP_TIMEOUT_MS)
-            await page.locator("#DataPren").dispatch_event("change")
-
-        await page.locator(f'.tipoBtn[rel="{req.tipologia}"]').click(timeout=PW_STEP_TIMEOUT_MS)
-
-        await page.wait_for_selector(".ristoCont", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-        await _click_by_text(page, req.sede, timeout_ms=PW_STEP_TIMEOUT_MS)
-
-        await page.wait_for_selector("#OraPren", state="visible", timeout=PW_NAV_TIMEOUT_MS)
-
-        options = await page.query_selector_all("#OraPren option")
-        times: List[str] = []
-        for o in options:
-            val = await o.get_attribute("value")
-            if not val:
-                continue
-            # prendi solo HH:MM
-            m = re.match(r"^(\d{2}:\d{2})", val)
-            if m:
-                times.append(m.group(1))
-
-        times = sorted(list(dict.fromkeys(times)))
-        return {"status": "OK", "available_times": times}
-
-    finally:
-        await context.close()
-
-
-# ----------------------------
-# ROUTES
-# ----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
 @app.post("/checkavailability")
-async def checkavailability(req: AvailabilityRequest):
-    # regole date (in caso)
-    d = datetime.strptime(req.data, "%Y-%m-%d").date()
-    # MAX 30 giorni / no passato
-    today = _today_rome()
-    if d < today:
+async def checkavailability(req: CheckAvailabilityRequest):
+    """
+    Endpoint opzionale: al momento restituiamo ok e rimandiamo la verifica reale al booking step.
+    Se vuoi, lo possiamo arricchire interrogando il sito e leggendo orari disponibili.
+    """
+    try:
+        d = datetime.strptime(req.data, "%Y-%m-%d").date()
+        validate_date_window(d)
+    except TransferRequired as tr:
         return JSONResponse(
             status_code=200,
-            content={"status": "NOT_ALLOWED", "reason": "PAST_DATE", "message": "Non è possibile prenotare per date passate."},
+            content={"available": False, "transfer_required": True, "reason": tr.reason},
         )
-    if d > today + timedelta(days=MAX_DAYS_AHEAD):
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={"available": False, "error": "invalid_request", "detail": str(e)},
+        )
+
+    if req.persone > 9:
         return JSONResponse(
             status_code=200,
             content={
-                "status": "NEED_HUMAN",
-                "reason": "TOO_FAR",
-                "message": f"Per prenotazioni oltre {MAX_DAYS_AHEAD} giorni è necessario contattare un operatore.",
-                "transfer_to": OPERATOR_PHONE,
+                "available": False,
+                "transfer_required": True,
+                "reason": "Per gruppi superiori a 9 persone è necessario parlare con un operatore.",
             },
         )
 
-    async with _booking_sem:
-        try:
-            return await _perform_availability(req)
-        except Exception as e:
-            # Best effort: non bloccare il bot
-            return JSONResponse(
-                status_code=200,
-                content={"status": "ERROR", "message": "Non sono riuscito a recuperare gli orari disponibili in questo momento.", "detail": str(e)},
+    return {"available": True}
+
+
+# -------------------------
+# PLAYWRIGHT BOOKING FLOW
+# -------------------------
+async def perform_booking(payload: BookTableRequest) -> Dict[str, Any]:
+    """
+    Automazione booking su rione.fidy.app
+    """
+    if payload.persone > 9:
+        raise TransferRequired("Per gruppi superiori a 9 persone è necessario parlare con un operatore.")
+
+    # Tipologia PRANZO/CENA in base a ora (regola semplice)
+    hh = int(payload.ora.split(":")[0])
+    tipologia = "PRANZO" if 11 <= hh <= 16 else "CENA"
+
+    context = await ensure_browser()
+    page: Page = await context.new_page()
+    page.set_default_navigation_timeout(NAV_TIMEOUT)
+    page.set_default_timeout(ACTION_TIMEOUT)
+
+    try:
+        await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+
+        # Attendi che compaia la stepCont (dopo intro fade)
+        await page.wait_for_selector(".stepCont", state="visible")
+
+        # 1) Coperti
+        await page.click(f".nCoperti[rel='{payload.persone}']")
+
+        # seggiolini flow
+        if payload.seggiolini > 0:
+            await page.click(".seggioliniTxt")
+            await page.wait_for_selector(".seggioliniCont", state="visible")
+            await page.click(f".nSeggiolini[rel='{payload.seggiolini}']")
+        else:
+            # default NO già selezionato lato UI; se vuoi forzare:
+            pass
+
+        # 2) Data (YYYY-MM-DD)
+        # Se è oggi/domani gestiamo clic rapido, altrimenti input date
+        d = datetime.strptime(payload.data, "%Y-%m-%d").date()
+        today = date.today()
+        if d == today:
+            await page.click(".dataOggi[rel]")
+            # In pagina ci sono due pulsanti "Oggi" e "Domani" con class dataOggi
+            # Seleziona quello con rel=oggi:
+            await page.click(f".dataOggi[rel='{payload.data}']")
+        elif d == today + timedelta(days=1):
+            await page.click(f".dataOggi[rel='{payload.data}']")
+        else:
+            # altra data: setta value nell'input e trigger change
+            await page.evaluate(
+                """(val) => {
+                    const i = document.querySelector('#DataPren');
+                    i.value = val;
+                    i.dispatchEvent(new Event('change', { bubbles: true }));
+                }""",
+                payload.data,
             )
+
+        # 3) Tipologia
+        await page.wait_for_selector(".tipoBtn", state="visible")
+        await page.click(f".tipoBtn[rel='{tipologia}']")
+
+        # 4) Selezione ristorante: si carica dinamicamente dentro .ristoCont
+        await page.wait_for_selector(".ristoCont", state="visible")
+        label = sede_to_label(payload.sede)
+
+        # Click sul ristorante che contiene il testo label
+        # (prenew_rist.php genera card/clickable; usiamo text locator robusto)
+        await page.get_by_text(label, exact=False).click()
+
+        # 5) Orario: select #OraPren con option value HH:MM
+        await page.wait_for_selector("#OraPren", state="visible")
+        # attendi che le opzioni vengano popolate
+        await page.wait_for_function(
+            """() => {
+                const s = document.querySelector('#OraPren');
+                return s && s.options && s.options.length > 1;
+            }"""
+        )
+
+        # Se l'opzione non esiste, falliamo con messaggio chiaro
+        exists = await page.evaluate(
+            """(t) => {
+                const s = document.querySelector('#OraPren');
+                return Array.from(s.options).some(o => (o.value || '').startsWith(t));
+            }""",
+            payload.ora,
+        )
+        if not exists:
+            raise HTTPException(status_code=200, detail="Orario non disponibile per la sede/data selezionata")
+
+        await page.select_option("#OraPren", value=re.compile(f"^{re.escape(payload.ora)}"))
+
+        # Nota
+        if payload.nota:
+            await page.fill("#Nota", payload.nota)
+
+        # CONFERMA (step dati)
+        await page.click(".confDati")
+
+        # Compila dati
+        await page.wait_for_selector("#Nome", state="visible")
+        await page.fill("#Nome", payload.nome)
+        await page.fill("#Cognome", payload.cognome)
+        await page.fill("#Email", str(payload.email))
+        await page.fill("#Telefono", payload.telefono)
+
+        if payload.dry_run:
+            return {
+                "status": "DRY_RUN_OK",
+                "message": "Validazione completata. (dry_run=true)",
+                "normalized": {
+                    "ora": payload.ora,
+                    "telefono": payload.telefono,
+                    "tipologia": tipologia,
+                    "referer": "AI",
+                },
+            }
+
+        # Submit
+        await page.click("input[type='submit'][value='PRENOTA']")
+
+        # Attendi che la pagina cambi / carichi risultato (prenew_res.php)
+        await page.wait_for_timeout(1200)
+
+        # Euristica success: la UI sostituisce .stepCont con pagina di risultato
+        # Se non troviamo errori JS e la pagina resta stabile, consideriamo OK.
+        content = await page.content()
+        if "Si è verificata" in content or "errore" in content.lower():
+            raise HTTPException(status_code=200, detail="Errore durante la conferma prenotazione")
+
+        return {
+            "status": "OK",
+            "message": "Prenotazione inviata correttamente.",
+            "normalized": {
+                "ora": payload.ora,
+                "telefono": payload.telefono,
+                "tipologia": tipologia,
+                "referer": "AI",
+            },
+        }
+
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
 
 @app.post("/book_table")
 async def book_table(req: BookTableRequest):
-    # Regole business (già validate in model), ma qui ritorniamo messaggi strutturati per il bot.
-    d = datetime.strptime(req.data, "%Y-%m-%d").date()
-    today = _today_rome()
-
-    if req.persone > MAX_PEOPLE_AUTOMATION:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "NEED_HUMAN",
-                "reason": "TOO_MANY_PEOPLE",
-                "message": "Per tavoli superiori a 9 persone è necessario contattare un operatore.",
-                "transfer_to": OPERATOR_PHONE,
-            },
-        )
-
-    if d < today:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "NOT_ALLOWED",
-                "reason": "PAST_DATE",
-                "message": "Non è possibile prenotare per date passate.",
-            },
-        )
-
-    if d > today + timedelta(days=MAX_DAYS_AHEAD):
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "NEED_HUMAN",
-                "reason": "TOO_FAR",
-                "message": f"Per prenotazioni oltre {MAX_DAYS_AHEAD} giorni è necessario contattare un operatore.",
-                "transfer_to": OPERATOR_PHONE,
-            },
-        )
-
-    # Hard cap totale (evita timeout Railway)
-    async def _run_with_timeout():
-        async with _booking_sem:
-            attempt = 0
-            last_err: Optional[str] = None
-            while attempt <= MAX_RETRY:
-                try:
-                    return await _perform_booking(req)
-                except (PWTimeoutError, asyncio.TimeoutError) as e:
-                    last_err = f"Timeout: {e}"
-                except Exception as e:
-                    last_err = str(e)
-
-                attempt += 1
-
-            # fallback: dopo retry, proponi operatore
-            return {
-                "status": "NEED_HUMAN",
-                "reason": "AUTOMATION_FAILED",
-                "message": "Non sono riuscito a completare la prenotazione in automatico. Ti passo un operatore per chiuderla rapidamente.",
-                "transfer_to": OPERATOR_PHONE,
-                "detail": last_err,
-            }
+    """
+    Endpoint usato come tool (ElevenLabs / agent).
+    Restituisce sempre 200 con payload strutturato:
+    - status OK / DRY_RUN_OK
+    - transfer_required True quando serve operatore (date >30, date passate, persone>9)
+    """
+    # forza referer AI sempre
+    req.referer = "AI"
 
     try:
-        result = await asyncio.wait_for(_run_with_timeout(), timeout=PW_TOTAL_TIMEOUT_SEC)
+        # Validazioni extra (oltre Pydantic)
+        d = datetime.strptime(req.data, "%Y-%m-%d").date()
+        validate_date_window(d)
+
+        if req.persone > 9:
+            raise TransferRequired("Per gruppi superiori a 9 persone è necessario parlare con un operatore.")
+
+        # Booking con retry (stabilità anti-502)
+        result = await retry_async(perform_booking, req)
+
+        # Messaggio post-prenotazione “operativo” (WhatsApp + email + puntualità)
+        result["customer_notice"] = (
+            "Riceverai una conferma via WhatsApp e via email ai contatti indicati. "
+            "Ti consigliamo di rispettare l’orario scelto: in caso di ritardo prolungato "
+            "potrebbe non essere possibile garantire il tavolo."
+        )
         return result
-    except asyncio.TimeoutError:
+
+    except TransferRequired as tr:
         return JSONResponse(
             status_code=200,
             content={
-                "status": "NEED_HUMAN",
-                "reason": "TIMEOUT",
-                "message": "Per evitare attese, ti passo un operatore per completare la prenotazione.",
-                "transfer_to": OPERATOR_PHONE,
+                "status": "TRANSFER_REQUIRED",
+                "transfer_required": True,
+                "reason": tr.reason,
+            },
+        )
+    except HTTPException as he:
+        # Manteniamo 200 per compatibilità tool (evitiamo 502 “a cascata”)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ERROR",
+                "transfer_required": False,
+                "reason": str(he.detail),
+            },
+        )
+    except Exception as e:
+        logger.exception(f"Unhandled error in /book_table: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ERROR",
+                "transfer_required": False,
+                "reason": "Si è verificata una difficoltà nel confermare la prenotazione. Riprova tra poco.",
             },
         )
