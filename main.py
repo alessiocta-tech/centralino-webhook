@@ -23,14 +23,18 @@ class RichiestaPrenotazione(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - Booking Engine V8 (Sedi Fix)"}
+    return {"status": "Centralino AI - Versione Anti-Crash V9"}
 
 # --- TOOL 1: CHECK ---
 @app.post("/check_availability")
 async def check_availability(dati: RichiestaControllo):
     print(f"🔎 CHECK: {dati.persone} pax, {dati.data}")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # OTTIMIZZAZIONE MEMORIA (CRUCIALE PER RAILWAY)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--single-process"]
+        )
         context = await browser.new_context(viewport={"width": 390, "height": 844})
         page = await context.new_page()
         try:
@@ -63,12 +67,13 @@ async def check_availability(dati: RichiestaControllo):
         finally:
             await browser.close()
 
-# --- TOOL 2: BOOKING (con TRADUTTORE SEDI) ---
+# --- TOOL 2: BOOKING (Versione Leggera + Mappa) ---
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    print(f"📝 BOOKING START: {dati.nome} -> {dati.sede} ({dati.orario})")
+    print(f"📝 BOOKING: {dati.nome} -> {dati.sede} ({dati.orario})")
     
-    # DIZIONARIO TRADUTTORE (AI -> SITO WEB)
+    # 1. TRADUZIONE NOMI (AI -> SITO)
+    # L'AI dice "talenti", il sito vuole "Talenti - Roma"
     mappa_sedi = {
         "talenti": "Talenti - Roma",
         "ostia": "Ostia Lido",
@@ -77,24 +82,27 @@ async def book_table(dati: RichiestaPrenotazione):
         "palermo": "Palermo"
     }
     
-    # Puliamo l'input dell'AI e troviamo il nome giusto
-    input_sede = dati.sede.lower().strip()
-    nome_bottone_sito = dati.sede # Default se non trova nulla
+    sede_cercata = dati.sede.lower().strip()
+    nome_bottone = dati.sede # Default
     
-    for chiave in mappa_sedi:
-        if chiave in input_sede:
-            nome_bottone_sito = mappa_sedi[chiave]
+    # Trova la corrispondenza parziale
+    for chiave, valore in mappa_sedi.items():
+        if chiave in sede_cercata:
+            nome_bottone = valore
             break
             
-    print(f"   -> Traduzione: '{dati.sede}' diventa '{nome_bottone_sito}'")
+    print(f"   -> Traduzione: Cercherò il bottone '{nome_bottone}'")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # OTTIMIZZAZIONE MEMORIA (CRUCIALE)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--single-process"]
+        )
         context = await browser.new_context(user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', viewport={"width": 390, "height": 844})
         page = await context.new_page()
         
         try:
-            # 1. Navigazione
             await page.goto("https://rione.fidy.app/prenew.php", timeout=60000)
             await page.wait_for_load_state("networkidle")
             try: await page.locator("text=/accetta|consent|ok/i").first.click(timeout=3000)
@@ -118,36 +126,34 @@ async def book_table(dati: RichiestaPrenotazione):
             try: await page.locator("text=/conferma|cerca/i").first.click(timeout=2000)
             except: pass
 
-            # --- 2. SELEZIONE SEDE (FIXED) ---
-            print(f"   -> Cerco bottone esatto: '{nome_bottone_sito}'...")
+            # --- SELEZIONE SEDE ---
+            print(f"   -> Clicco sede: '{nome_bottone}'")
             await page.wait_for_timeout(4000)
             
-            # Cerca il testo esatto che abbiamo mappato
-            btn_sede = page.get_by_text(nome_bottone_sito, exact=False).first
+            # Cerca il testo esatto tradotto
+            btn_sede = page.get_by_text(nome_bottone, exact=False).first
             
             if await btn_sede.count() > 0:
-                print("   -> Sede trovata e cliccata!")
                 await btn_sede.click(force=True)
             else:
-                # Fallback disperato: prova a cliccare qualsiasi cosa contenga la parola chiave originale
-                print("   -> Fallback: provo ricerca generica...")
+                # Fallback
+                print("   -> Fallback: cerco testo originale...")
                 await page.get_by_text(dati.sede, exact=False).first.click(force=True)
 
-            # 3. Orario
-            print(f"   -> Cerco orario {dati.orario}...")
+            # Orario
+            print(f"   -> Orario: {dati.orario}")
             await page.wait_for_timeout(3000)
             try: await page.locator("select, div[class*='select']").last.click(force=True)
             except: pass
             
             orario_clean = dati.orario.replace(".", ":")
-            # Cerca l'orario esatto
             orario_btn = page.locator(f"text={orario_clean}").first
             if await orario_btn.count() > 0:
                 await orario_btn.click(force=True)
             else:
-                return {"result": f"Orario {dati.orario} pieno o non disponibile."}
+                return {"result": f"Orario {dati.orario} non disponibile."}
 
-            # 4. Note & Conferma
+            # Note e Dati
             if dati.note:
                 try: await page.locator("textarea").fill(dati.note)
                 except: pass
@@ -155,7 +161,6 @@ async def book_table(dati: RichiestaPrenotazione):
             try: await page.locator("text=/CONFERMA/i").first.click(force=True)
             except: pass
 
-            # 5. Dati Cliente
             await page.wait_for_timeout(2000)
             parti = dati.nome.split(" ", 1)
             n = parti[0]
@@ -171,15 +176,17 @@ async def book_table(dati: RichiestaPrenotazione):
                 for cb in checkboxes: await cb.check()
             except: pass
 
-            print("   -> ✅ PRENOTAZIONE PRONTA!")
-            # await page.locator("text=/PRENOTA/i").last.click() # Scommenta per attivare davvero
+            print("   -> ✅ COMPLETATO!")
+            # await page.locator("text=/PRENOTA/i").last.click() # Scommenta per attivare
             
-            await browser.close()
             return {"result": f"Prenotazione confermata per {dati.nome} a {dati.sede}!"}
 
         except Exception as e:
+            print(f"❌ ERRORE: {e}")
+            return {"result": f"Errore tecnico: {str(e)}"}
+        finally:
+            # IMPORTANTE: Chiude sempre il browser per liberare memoria
             await browser.close()
-            return {"result": f"Errore nel processo: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
