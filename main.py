@@ -1,500 +1,618 @@
+# main.py
+# Centralino webhook → Prenotazione Fidy (Playwright) + controlli robusti (telefono/email/data) + tracking referer=AI
+#
+# ENV consigliate su Railway:
+#   PORT=8080 (Railway la imposta spesso da sola)
+#   FIDY_BASE_URL=https://rione.fidy.app/prenew.php
+#   DEFAULT_REFERER=AI
+#   PHONE_DEFAULT_REGION=IT
+#   DRY_RUN=0   # 0 = PRODUZIONE (prenota davvero), 1 = solo simulazione
+#   RATE_LIMIT_PER_MINUTE=30
+#   ALLOWED_ORIGINS=*   (opzionale se usi CORS)
+#
+# Avvio locale:
+#   uvicorn main:app --host 0.0.0.0 --port 8080
+
+from __future__ import annotations
+
 import os
 import re
-from datetime import datetime
-from typing import Optional, Tuple
+import time
+import uuid
+import asyncio
+import logging
+from datetime import date, datetime, timedelta
+from typing import Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-import uvicorn
 
-# >>> VALIDAZIONE TELEFONO (libphonenumber)
 import phonenumbers
-from phonenumbers.phonenumberutil import NumberParseException
-from phonenumbers import number_type, PhoneNumberType
+from phonenumbers import NumberParseException
 
-app = FastAPI()
+from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PWTimeoutError
 
-# Usa referer=AI di default (puoi cambiarlo con env var su Railway)
-FIDY_URL = os.environ.get("FIDY_URL", "https://rione.fidy.app/prenew.php?referer=AI")
+# -----------------------------
+# Logging
+# -----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("centralino")
 
+# -----------------------------
+# Config
+# -----------------------------
+FIDY_BASE_URL = os.getenv("FIDY_BASE_URL", "https://rione.fidy.app/prenew.php")
+DEFAULT_REFERER = os.getenv("DEFAULT_REFERER", "AI")
+PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IT")
+DRY_RUN_DEFAULT = os.getenv("DRY_RUN", "1").strip()  # 0 prod, 1 dry
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
 
-# =========================
-# MODELS
-# =========================
-class RichiestaControllo(BaseModel):
-    data: str = Field(..., description="YYYY-MM-DD")
-    persone: str = Field(..., description="Numero persone (1..9)")
-    orario: Optional[str] = Field(None, description="HH:MM (opzionale)")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-class RichiestaPrenotazione(BaseModel):
-    data: str = Field(..., description="YYYY-MM-DD")
-    persone: str = Field(..., description="Numero persone (1..9)")
-    orario: str = Field(..., description="HH:MM")
-    nome: str = Field(..., description="Nome e Cognome")
-    telefono: str = Field(..., description="Telefono (accetto +39 o formato nazionale)")
-    email: str
-    sede: str = Field(..., description="Talenti, Appia, Ostia, Reggio, Palermo")
-    note: str = ""
-    seggiolini: Optional[int] = Field(None, description="Numero seggiolini (0..5). Se None: auto da note.")
+# Playwright tuning
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "30000"))
+PW_ACTION_TIMEOUT_MS = int(os.getenv("PW_ACTION_TIMEOUT_MS", "20000"))
+PW_RETRIES = int(os.getenv("PW_RETRIES", "2"))  # tentativi extra oltre al primo
 
-    # --- VALIDAZIONE TELEFONO: Italia, plausibile + valido + mobile
-    @validator("telefono")
-    def validate_telefono(cls, v: str) -> str:
-        raw = (v or "").strip()
-        if not raw:
-            raise ValueError("Telefono mancante")
+# -----------------------------
+# Simple in-memory rate limiter (per IP)
+# -----------------------------
+_rate_state: Dict[str, list[float]] = {}
 
-        # Normalizza: elimina spazi/parentesi/trattini, mantieni + se presente
-        cleaned = re.sub(r"[^\d+]", "", raw)
+def rate_limit_ok(ip: str) -> bool:
+    now = time.time()
+    window_start = now - 60
+    hits = _rate_state.get(ip, [])
+    hits = [t for t in hits if t >= window_start]
+    if len(hits) >= RATE_LIMIT_PER_MINUTE:
+        _rate_state[ip] = hits
+        return False
+    hits.append(now)
+    _rate_state[ip] = hits
+    return True
 
-        try:
-            # Se non inizia con +, assumiamo Italia
-            pn = phonenumbers.parse(cleaned, "IT" if not cleaned.startswith("+") else None)
-        except NumberParseException:
-            raise ValueError("Telefono non interpretabile (formato non valido)")
+# -----------------------------
+# Helpers: validation
+# -----------------------------
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-        # Controlli robusti
-        if not phonenumbers.is_possible_number(pn):
-            raise ValueError("Telefono non plausibile (lunghezza/prefisso non compatibili)")
-        if not phonenumbers.is_valid_number(pn):
-            raise ValueError("Telefono non valido")
+def normalize_email(email: str) -> str:
+    email = (email or "").strip()
+    if not email or not EMAIL_RE.match(email):
+        raise ValueError("Email non valida")
+    return email.lower()
 
-        # Forza Italia (evita numeri esteri per errore)
-        region = phonenumbers.region_code_for_number(pn)
-        if region != "IT":
-            raise ValueError("Telefono non italiano (atteso numero IT)")
+def validate_and_format_phone(phone: str, region: str = PHONE_DEFAULT_REGION) -> str:
+    """
+    Valida telefono con phonenumbers e restituisce formato E.164.
+    Accetta: '3331112222', '+393331112222', '0039333...' ecc.
+    """
+    raw = (phone or "").strip()
+    if not raw:
+        raise ValueError("Telefono mancante")
 
-        # Forza MOBILE (o FIXED_LINE_OR_MOBILE in alcuni casi)
-        t = number_type(pn)
-        if t not in (PhoneNumberType.MOBILE, PhoneNumberType.FIXED_LINE_OR_MOBILE):
-            raise ValueError("Telefono non cellulare (atteso mobile)")
+    # Togli spazi e caratteri comuni
+    raw = re.sub(r"[^\d\+]", "", raw)
 
-        # Ritorno la NSN (solo cifre, senza +39), perfetta per maxlength=10 del form
-        nsn = str(pn.national_number)
-        # Alcuni numeri storici possono essere 9 cifre; il form accetta fino a 10 → ok.
-        if len(nsn) > 10:
-            raise ValueError("Telefono troppo lungo per il form (max 10 cifre senza +39)")
+    try:
+        parsed = phonenumbers.parse(raw, region)
+    except NumberParseException:
+        raise ValueError("Telefono non parsabile")
 
-        return nsn
+    if not phonenumbers.is_valid_number(parsed):
+        raise ValueError("Telefono non valido")
 
+    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
 
-# =========================
-# HEALTH
-# =========================
-@app.get("/")
-def home():
-    return {"status": "Centralino AI - Fidy Booking (referer=AI, phone validation, robust selectors)"}
+def parse_date_flex(value: str) -> date:
+    """
+    Accetta:
+      - '2026-02-10'
+      - '10/02/2026'
+      - '10-02-2026'
+      - 'domani' / 'oggi'
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        raise ValueError("Data mancante")
 
-@app.get("/health")
-def health():
-    return {"ok": True, "fidy_url": FIDY_URL}
+    today = date.today()
+    if v in ("oggi", "today"):
+        return today
+    if v in ("domani", "tomorrow"):
+        return today + timedelta(days=1)
 
+    # ISO
+    try:
+        return datetime.strptime(v, "%Y-%m-%d").date()
+    except ValueError:
+        pass
 
-# =========================
-# HELPERS
-# =========================
-def normalize_sede(raw: str) -> str:
-    s = (raw or "").strip().lower()
+    # dd/mm/yyyy
+    try:
+        return datetime.strptime(v, "%d/%m/%Y").date()
+    except ValueError:
+        pass
+
+    # dd-mm-yyyy
+    try:
+        return datetime.strptime(v, "%d-%m-%Y").date()
+    except ValueError:
+        pass
+
+    raise ValueError("Formato data non riconosciuto")
+
+def parse_time_hhmm(value: str) -> str:
+    """
+    Accetta:
+      - '13:15'
+      - '13.15'
+      - '1315'
+    Ritorna 'HH:MM'
+    """
+    v = (value or "").strip()
+    if not v:
+        raise ValueError("Orario mancante")
+
+    v = v.replace(".", ":")
+    if re.fullmatch(r"\d{4}", v):
+        v = v[:2] + ":" + v[2:]
+    if not re.fullmatch(r"\d{2}:\d{2}", v):
+        raise ValueError("Formato orario non valido (usa HH:MM)")
+
+    hh, mm = v.split(":")
+    h = int(hh)
+    m = int(mm)
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError("Orario fuori range")
+
+    return f"{h:02d}:{m:02d}"
+
+def normalize_location(value: str) -> str:
+    """
+    Normalizza sede. Le etichette visibili in Fidy sembrano:
+      Appia, Ostia Lido, Palermo, Reggio Calabria, Talenti - Roma
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        raise ValueError("Sede mancante")
+
     mapping = {
-        "talenti": "Talenti - Roma",
-        "talenti roma": "Talenti - Roma",
-        "roma talenti": "Talenti - Roma",
         "appia": "Appia",
         "ostia": "Ostia Lido",
         "ostia lido": "Ostia Lido",
+        "ostia - lido": "Ostia Lido",
+        "palermo": "Palermo",
         "reggio": "Reggio Calabria",
         "reggio calabria": "Reggio Calabria",
-        "palermo": "Palermo",
+        "talenti": "Talenti - Roma",
+        "talenti roma": "Talenti - Roma",
+        "talenti - roma": "Talenti - Roma",
+        "roma talenti": "Talenti - Roma",
     }
-    for k, v in mapping.items():
-        if k in s:
-            return v
-    return raw.strip()
 
-def split_name(full: str) -> Tuple[str, str]:
-    parts = (full or "").strip().split()
-    if not parts:
-        return "", ""
-    if len(parts) == 1:
-        return parts[0], "."
-    return parts[0], " ".join(parts[1:])
+    # match diretto
+    if v in mapping:
+        return mapping[v]
 
-def needs_seggiolone_from_note(note: str) -> bool:
-    n = (note or "").lower()
-    return any(k in n for k in ["seggiolon", "seggiolin", "bimbo", "bambin", "bambina", "baby"])
+    # match "contains"
+    for k, out in mapping.items():
+        if k in v:
+            return out
 
-def parse_time_hhmm(orario: str) -> int:
-    o = (orario or "").strip().replace(".", ":")
-    m = re.match(r"^\s*(\d{1,2})\s*:\s*(\d{2})\s*$", o)
-    if not m:
-        raise ValueError(f"Orario non valido: {orario}")
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        raise ValueError(f"Orario non valido: {orario}")
-    return hh * 60 + mm
+    # fallback: title case
+    return value.strip()
 
-def get_pasto_strict(orario: str) -> str:
-    mins = parse_time_hhmm(orario)
-    # Fasce richieste:
-    # PRANZO 12:00-14:30 | CENA 19:00-22:00
-    if 12 * 60 <= mins <= (14 * 60 + 30):
-        return "PRANZO"
-    if 19 * 60 <= mins <= 22 * 60:
-        return "CENA"
-    # fallback non bloccante
-    return "PRANZO" if mins < (17 * 60) else "CENA"
+def infer_meal_type(dt: date, hhmm: str, explicit: Optional[str]) -> str:
+    """
+    Tipologia: PRANZO / CENA
+    Se esplicita, la usa. Altrimenti inferisce (prima delle 17 = PRANZO).
+    """
+    if explicit:
+        e = explicit.strip().upper()
+        if e in ("PRANZO", "CENA"):
+            return e
+    hh = int(hhmm.split(":")[0])
+    return "PRANZO" if hh < 17 else "CENA"
+
+def safe_note(note: Optional[str]) -> str:
+    """
+    Nota max 300 char, pulizia base.
+    """
+    if not note:
+        return ""
+    n = note.strip()
+    n = re.sub(r"\s+", " ", n)
+    return n[:300]
+
+# -----------------------------
+# Request model (flessibile)
+# -----------------------------
+class BookingRequest(BaseModel):
+    # campi minimi
+    nome: str = Field(..., description="Nome cliente")
+    cognome: str = Field(..., description="Cognome cliente")
+    email: str = Field(..., description="Email cliente")
+    telefono: str = Field(..., description="Telefono cliente (anche senza prefisso)")
+    persone: int = Field(..., ge=1, le=9, description="Numero ospiti (1..9). >9 gestisci via centralino")
+    sede: str = Field(..., description="Sede: Talenti, Ostia Lido, Appia, Palermo, Reggio Calabria, ecc.")
+    data: str = Field(..., description="Data: YYYY-MM-DD oppure 'domani'/'oggi'")
+    ora: str = Field(..., description="Orario: HH:MM")
+
+    # opzionali
+    seggiolone: Optional[bool] = Field(default=False, description="Se serve seggiolone")
+    seggiolini: Optional[int] = Field(default=0, ge=0, le=5, description="Numero seggiolini (0..5)")
+    tipologia: Optional[str] = Field(default=None, description="PRANZO o CENA (opzionale)")
+    nota: Optional[str] = Field(default="", description="Nota breve")
+    referer: Optional[str] = Field(default=None, description="Tracking referer (AI, butt, sito...)")
+    dry_run: Optional[bool] = Field(default=None, description="Override DRY_RUN env")
+    # per debug/trace
+    request_id: Optional[str] = Field(default=None)
+
+    @validator("nome", "cognome")
+    def _name_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) < 2:
+            raise ValueError("Nome/Cognome troppo corto")
+        return v
+
+    @validator("persone")
+    def _persone_limit(cls, v: int) -> int:
+        # Il sito gestisce 1..9; oltre chiama centralino
+        if v > 9:
+            raise ValueError("Per più di 9 persone contattare il centralino")
+        return v
 
 
-# =========================
-# PLAYWRIGHT UTILS
-# =========================
-async def log_step(msg: str) -> None:
-    print(msg, flush=True)
+# -----------------------------
+# Playwright lifecycle
+# -----------------------------
+pw = None
+browser: Optional[Browser] = None
 
-async def accept_cookies_if_any(page):
-    for patt in [r"accetta", r"ok", r"consenti", r"consent", r"accept"]:
-        loc = page.locator(f"text=/{patt}/i").first
-        try:
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.click(timeout=3000, force=True)
-                break
-        except Exception:
-            pass
-
-async def ensure_app_ready(page):
-    # dopo fade intro compare .stepCont
-    await page.locator(".stepCont").wait_for(state="visible", timeout=60000)
-
-async def click(locator, label: str, timeout_ms: int = 30000, force: bool = True):
-    await log_step(f"      -> click: {label}")
-    await locator.wait_for(state="visible", timeout=timeout_ms)
-    try:
-        await locator.scroll_into_view_if_needed()
-    except Exception:
-        pass
-    await locator.click(timeout=timeout_ms, force=force)
-
-
-# =========================
-# FLOW STEPS (aderenti all'HTML reale)
-# =========================
-async def step_select_persone(page, persone: str):
-    await log_step("-> 1. Persone")
-    await ensure_app_ready(page)
-    p = (persone or "").strip()
-    loc = page.locator(f".nCoperti[rel='{p}']").first
-    if await loc.count() == 0:
-        loc = page.locator(".nCoperti").filter(has_text=re.compile(rf"^\s*{re.escape(p)}\s*$")).first
-    await click(loc, f"persone={p}")
-
-async def step_select_seggiolini(page, seggiolini: int):
-    await log_step("-> 2. Seggiolini")
-    await ensure_app_ready(page)
-
-    if seggiolini <= 0:
-        await click(page.locator(".SeggNO").first, "seggiolini=NO")
-        return
-
-    await click(page.locator(".SeggSI, .seggioliniTxt").first, "seggiolini=SI")
-    await page.locator(".seggioliniCont").wait_for(state="visible", timeout=20000)
-
-    item = page.locator(f".nSeggiolini[rel='{seggiolini}']").first
-    if await item.count() == 0:
-        item = page.locator(".nSeggiolini[rel='1']").first
-    await click(item, f"n_seggiolini={seggiolini}")
-
-async def step_select_data(page, data_str: str):
-    await log_step("-> 3. Data")
-    await ensure_app_ready(page)
-    # valida formato
-    datetime.strptime(data_str, "%Y-%m-%d")
-
-    await page.locator(".step2").wait_for(state="visible", timeout=30000)
-
-    rel_loc = page.locator(f".step2 .dataBtn[rel='{data_str}']").first
-    if await rel_loc.count() > 0:
-        await click(rel_loc, f"data={data_str}")
-        return
-
-    await click(page.locator(".step2 .altraData").first, "data=altra_data")
-    inp = page.locator("#DataPren").first
-    await inp.wait_for(state="attached", timeout=15000)
-    await inp.fill(data_str)
-
-    await page.evaluate(
-        """(val) => {
-            const i = document.querySelector('#DataPren');
-            if(!i) return;
-            i.value = val;
-            i.dispatchEvent(new Event('change', {bubbles:true}));
-        }""",
-        data_str,
+async def startup_playwright():
+    global pw, browser
+    pw = await async_playwright().start()
+    # args importanti per container
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
+    logger.info("Playwright avviato (Chromium headless).")
 
-async def step_select_pasto(page, pasto: str):
-    await log_step(f"-> 4. Pasto ({pasto})")
-    await ensure_app_ready(page)
-    await page.locator(".step3").wait_for(state="visible", timeout=30000)
-    loc = page.locator(f".step3 .tipoBtn[rel='{pasto}']").first
-    if await loc.count() == 0:
-        loc = page.locator(".step3 .tipoBtn").filter(has_text=re.compile(rf"^{pasto}$", re.I)).first
-    await click(loc, f"pasto={pasto}")
-
-async def step_select_sede(page, sede_label: str):
-    await log_step(f"-> 5. Sede ({sede_label})")
-    await ensure_app_ready(page)
-
-    await page.locator(".step4").wait_for(state="visible", timeout=30000)
-    risto = page.locator(".ristoCont").first
-    await risto.wait_for(state="visible", timeout=30000)
-
-    # aspetta contenuto caricato (non solo spinner)
+async def shutdown_playwright():
+    global pw, browser
     try:
-        await page.wait_for_function(
-            """() => {
-                const c = document.querySelector('.ristoCont');
-                if(!c) return false;
-                const txt = (c.innerText || '').trim();
-                return txt.length > 0 && !txt.toLowerCase().includes('loading');
-            }""",
-            timeout=30000,
-        )
+        if browser:
+            await browser.close()
+    finally:
+        if pw:
+            await pw.stop()
+    logger.info("Playwright chiuso.")
+
+# -----------------------------
+# Core automation
+# -----------------------------
+def build_fidy_url(referer: str) -> str:
+    # es: https://rione.fidy.app/prenew.php?referer=AI
+    r = (referer or DEFAULT_REFERER).strip()
+    if "?" in FIDY_BASE_URL:
+        return f"{FIDY_BASE_URL}&referer={r}"
+    return f"{FIDY_BASE_URL}?referer={r}"
+
+async def with_page() -> Page:
+    if not browser:
+        raise RuntimeError("Browser non inizializzato")
+    context = await browser.new_context()
+    page = await context.new_page()
+    page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+    page.set_default_timeout(PW_ACTION_TIMEOUT_MS)
+    return page
+
+async def close_page(page: Page):
+    try:
+        await page.context.close()
     except Exception:
         pass
 
-    sede_text = page.locator(".ristoCont").get_by_text(re.compile(re.escape(sede_label), re.I)).first
-    await sede_text.wait_for(state="visible", timeout=30000)
+async def click_span_by_rel(page: Page, selector: str, rel_value: str):
+    """
+    Clicca <span ... rel="X">, robusto.
+    """
+    el = page.locator(f'{selector}[rel="{rel_value}"]')
+    await el.first.wait_for(state="visible")
+    await el.first.click()
 
-    # click su container vicino al testo (con fallback)
-    candidates = [
-        sede_text.locator("xpath=ancestor::a[1]"),
-        sede_text.locator("xpath=ancestor::div[contains(@class,'card')][1]"),
-        sede_text.locator("xpath=ancestor::div[1]"),
-        sede_text,
-    ]
-    for i, cand in enumerate(candidates):
-        try:
-            if await cand.count() > 0:
-                await click(cand.first, f"sede_candidate_{i}", timeout_ms=20000, force=True)
-                return
-        except Exception:
-            continue
+async def click_span_by_text(page: Page, selector: str, text: str):
+    el = page.locator(selector, has_text=text)
+    await el.first.wait_for(state="visible")
+    await el.first.click()
 
-    await click(sede_text, "sede_fallback", timeout_ms=20000, force=True)
+async def run_booking_flow(req: BookingRequest) -> Dict[str, Any]:
+    """
+    Automazione step-by-step su prenew.php
+    Ritorna dettagli + eventuale screenshot base64? (qui no, solo log)
+    """
+    # Normalizzazioni & validazioni forti
+    email = normalize_email(req.email)
+    phone_e164 = validate_and_format_phone(req.telefono, PHONE_DEFAULT_REGION)
+    d = parse_date_flex(req.data)
+    hhmm = parse_time_hhmm(req.ora)
+    sede = normalize_location(req.sede)
+    tipologia = infer_meal_type(d, hhmm, req.tipologia)
+    nota = safe_note(req.nota)
+    referer = (req.referer or DEFAULT_REFERER).strip() or DEFAULT_REFERER
 
-async def step_select_orario_and_confirm(page, orario: str, note: str):
-    await log_step(f"-> 6. Orario ({orario})")
-    await ensure_app_ready(page)
+    # seggiolini coerenti
+    seggiolone = bool(req.seggiolone) or (req.seggiolini or 0) > 0
+    seggiolini = int(req.seggiolini or 0)
+    if not seggiolone:
+        seggiolini = 0
+    if seggiolone and seggiolini == 0:
+        # se ha detto seggiolone=True ma non numero, default 1
+        seggiolini = 1
 
-    await page.locator(".step5").wait_for(state="visible", timeout=40000)
+    url = build_fidy_url(referer)
 
-    select = page.locator("#OraPren").first
-    await select.wait_for(state="visible", timeout=20000)
-
-    # opzioni caricate
-    await page.wait_for_function(
-        """() => {
-            const s = document.querySelector('#OraPren');
-            return s && s.options && s.options.length > 1;
-        }""",
-        timeout=30000,
-    )
-
-    orario_clean = (orario or "").strip().replace(".", ":")
-    selected = False
-
-    # 1) select_option value exact
-    try:
-        await select.select_option(value=orario_clean)
-        selected = True
-    except Exception:
-        pass
-
-    # 2) value startswith HH:MM
-    if not selected:
-        selected = await page.evaluate(
-            """(hhmm) => {
-                const s = document.querySelector('#OraPren');
-                if(!s) return false;
-                const opts = Array.from(s.options || []);
-                const found = opts.find(o => (o.value || '').startsWith(hhmm));
-                if(found){
-                    s.value = found.value;
-                    s.dispatchEvent(new Event('change', {bubbles:true}));
-                    return true;
-                }
-                return false;
-            }""",
-            orario_clean,
-        )
-
-    # 3) option text contains HH:MM
-    if not selected:
-        selected = await page.evaluate(
-            """(hhmm) => {
-                const s = document.querySelector('#OraPren');
-                if(!s) return false;
-                const opts = Array.from(s.options || []);
-                const found = opts.find(o => (o.textContent || '').includes(hhmm));
-                if(found){
-                    s.value = found.value;
-                    s.dispatchEvent(new Event('change', {bubbles:true}));
-                    return true;
-                }
-                return false;
-            }""",
-            orario_clean,
-        )
-
-    if not selected:
-        raise RuntimeError(f"Impossibile selezionare orario {orario_clean} (nessuna option compatibile)")
-
-    if note:
-        try:
-            await page.locator("#Nota").fill(note)
-        except Exception:
-            pass
-
-    await log_step("-> 7. Conferma (vai ai dati finali)")
-    await click(page.locator("a.confDati").first, "CONFIRMA", timeout_ms=20000, force=True)
-
-async def step_fill_final_and_submit(page, nome: str, email: str, telefono_nsn: str, dry_run: bool):
-    await log_step("-> 8. Dati finali")
-    await ensure_app_ready(page)
-    await page.locator(".stepDati").wait_for(state="visible", timeout=30000)
-
-    first, last = split_name(nome)
-    await page.locator("#Nome").fill(first)
-    await page.locator("#Cognome").fill(last)
-    await page.locator("#Email").fill(email)
-    await page.locator("#Telefono").fill(telefono_nsn)
-
-    if dry_run:
-        await log_step("-> ✅ DRY RUN: non clicco PRENOTA")
-        return
-
-    await log_step("-> ✅ PRODUZIONE: click PRENOTA")
-    await click(page.locator("#prenoForm input[type='submit'][value='PRENOTA']").first, "PRENOTA", timeout_ms=30000, force=True)
-
-
-# =========================
-# CORE
-# =========================
-async def run_booking_flow(dati: RichiestaPrenotazione, dry_run: bool) -> dict:
-    sede_label = normalize_sede(dati.sede)
-    pasto = get_pasto_strict(dati.orario)
-
-    if dati.seggiolini is not None:
-        seggiolini_n = max(0, int(dati.seggiolini))
+    # DRY RUN (richiesta) o ENV
+    if req.dry_run is None:
+        dry_run = DRY_RUN_DEFAULT != "0"
     else:
-        seggiolini_n = 1 if needs_seggiolone_from_note(dati.note) else 0
+        dry_run = bool(req.dry_run)
 
-    await log_step(
-        f"🚀 BOOKING: {dati.nome} -> {sede_label} | {dati.data} {dati.orario} | pax={dati.persone} | pasto={pasto} | seggiolini={seggiolini_n} | dry_run={dry_run}"
+    rid = req.request_id or str(uuid.uuid4())[:8]
+
+    logger.info(
+        f"🚀 BOOKING {rid}: {req.nome} {req.cognome} -> {sede} | {d.isoformat()} {hhmm} | "
+        f"{req.persone} pax | tipologia={tipologia} | seggiolini={seggiolini} | referer={referer} | dry_run={dry_run}"
     )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(viewport={"width": 390, "height": 844})
-        page = await context.new_page()
-        page.set_default_timeout(60000)
+    page = await with_page()
+    try:
+        # STEP 0: apri pagina
+        await page.goto(url, wait_until="domcontentloaded")
 
+        # Attendi UI (logo/step)
+        # La pagina mostra introCont e poi stepCont dopo 1.5s: aspettiamo stepCont visibile
+        await page.locator(".stepCont").wait_for(state="visible")
+
+        # STEP 1: persone
+        await click_span_by_rel(page, ".nCoperti", str(req.persone))
+
+        # STEP 1b: seggiolini (se serve)
+        if seggiolini > 0:
+            # clic SI
+            await page.locator(".seggioliniTxt").wait_for(state="visible")
+            await page.locator(".seggioliniTxt").click()
+            await click_span_by_rel(page, ".nSeggiolini", str(seggiolini))
+        else:
+            # lascia default NO (già selezionato)
+            pass
+
+        # STEP 2: data
+        # Se data = oggi/domani presenti, altrimenti input date
+        iso = d.isoformat()
+        data_btn = page.locator(f'.dataBtn[rel="{iso}"]')
+        if await data_btn.count() > 0:
+            await data_btn.first.click()
+        else:
+            # Usa input date
+            inp = page.locator("#DataPren")
+            await inp.evaluate("el => el.value = ''")  # pulisci
+            await inp.fill(iso)
+            await inp.dispatch_event("change")
+
+        # STEP 3: pranzo/cena
+        await click_span_by_rel(page, ".tipoBtn", tipologia)
+
+        # STEP 4: selezione sede (caricata via .ristoCont load)
+        # La lista sedi sta in ristoCont; attendiamo che compaia almeno un item cliccabile
+        await page.locator(".ristoCont").wait_for(state="visible")
+        # Qui non conosciamo l'HTML di prenew_rist.php, ma dallo screenshot è una lista con testo della sede.
+        # Tentiamo click per testo:
+        await click_span_by_text(page, ".ristoCont *", sede)
+
+        # STEP 5: selezione orario
+        # L'elemento select è #OraPren. Aspettiamo che abbia option utili.
+        await page.locator("#OraPren").wait_for(state="visible")
+
+        # Attendi che le options si popolino (diverse da placeholder)
+        async def options_ready() -> bool:
+            opts = await page.locator("#OraPren option").count()
+            return opts >= 2
+
+        for _ in range(40):
+            if await options_ready():
+                break
+            await asyncio.sleep(0.25)
+
+        # Seleziona ora (il value può essere "12:30" etc)
         try:
-            await log_step(f"-> GO TO: {FIDY_URL}")
-            await page.goto(FIDY_URL, wait_until="domcontentloaded", timeout=60000)
-            await accept_cookies_if_any(page)
+            await page.select_option("#OraPren", hhmm)
+        except Exception:
+            # fallback: prova a cercare option con text che contiene hhmm
+            opt = page.locator("#OraPren option", has_text=hhmm)
+            if await opt.count() == 0:
+                raise HTTPException(status_code=409, detail=f"Orario {hhmm} non disponibile")
+            value = await opt.first.get_attribute("value")
+            if not value:
+                raise HTTPException(status_code=409, detail=f"Orario {hhmm} non selezionabile")
+            await page.select_option("#OraPren", value)
 
-            await step_select_persone(page, dati.persone)
-            await step_select_seggiolini(page, seggiolini_n)
-            await step_select_data(page, dati.data)
-            await step_select_pasto(page, pasto)
-            await step_select_sede(page, sede_label)
-            await step_select_orario_and_confirm(page, dati.orario, dati.note)
-            # telefono è già validato e normalizzato dal validator (NSN max 10)
-            await step_fill_final_and_submit(page, dati.nome, dati.email, dati.telefono, dry_run=dry_run)
+        # Nota
+        if nota:
+            await page.fill("#Nota", nota)
 
+        # Conferma dati (porta alla form Nome/Cognome/Email/Telefono)
+        await page.locator(".confDati").click()
+        await page.locator("#Nome").wait_for(state="visible")
+
+        # Compila dati finali
+        await page.fill("#Nome", req.nome)
+        await page.fill("#Cognome", req.cognome)
+        await page.fill("#Email", email)
+
+        # Il form accetta 10 cifre IT senza prefisso (+39). Per coerenza:
+        # estraiamo nazionali se IT, altrimenti mettiamo solo digits e max 10 (per non rompere form).
+        digits = re.sub(r"\D", "", phone_e164)
+        if phone_e164.startswith("+39") and len(digits) >= 12:
+            # +39 + 10 cifre
+            phone_form = digits[-10:]
+        else:
+            phone_form = digits[-10:] if len(digits) >= 10 else digits
+
+        if len(phone_form) < 8:
+            raise HTTPException(status_code=422, detail="Telefono troppo corto per il form")
+
+        await page.fill("#Telefono", phone_form)
+
+        if dry_run:
+            logger.info(f"🧪 DRY RUN {rid}: compilazione completata, NON invio la prenotazione.")
             return {
                 "ok": True,
-                "result": f"Prenotazione {'SIMULATA' if dry_run else 'INVIATA'} per {dati.nome}: {sede_label} - {pasto} - {dati.data} {dati.orario} - {dati.persone} pax",
-                "debug": {"sede": sede_label, "pasto": pasto, "seggiolini": seggiolini_n, "dry_run": dry_run, "url_finale": page.url},
+                "dry_run": True,
+                "request_id": rid,
+                "sede": sede,
+                "data": iso,
+                "ora": hhmm,
+                "tipologia": tipologia,
+                "persone": req.persone,
+                "seggiolini": seggiolini,
+                "referer": referer,
+                "telefono_e164": phone_e164,
+                "telefono_form": phone_form,
             }
 
-        except PWTimeout as e:
-            try:
-                await page.screenshot(path="/tmp/timeout.png", full_page=True)
-                await log_step("📸 Screenshot timeout: /tmp/timeout.png")
-            except Exception:
-                pass
-            return {"ok": False, "result": f"Timeout Playwright: {str(e)}"}
+        # Invio (submit form)
+        # Il submit viene intercettato da jQuery e manda ajax.php.
+        await page.locator('input[type="submit"][value="PRENOTA"]').click()
 
-        except Exception as e:
-            try:
-                await page.screenshot(path="/tmp/error.png", full_page=True)
-                await log_step("📸 Screenshot errore: /tmp/error.png")
-            except Exception:
-                pass
-            return {"ok": False, "result": f"Errore tecnico: {str(e)}"}
+        # Attendi risultato: la pagina carica prenew_res.php dentro .stepCont.
+        # Cerchiamo un segnale generico: cambiamento contenuto / presenza di testo "OK" o simili
+        # Qui: aspettiamo che spariscano i campi o compaia qualcosa di diverso.
+        for _ in range(60):
+            if await page.locator("#Nome").count() == 0:
+                break
+            await asyncio.sleep(0.25)
 
-        finally:
-            await browser.close()
+        logger.info(f"✅ BOOKED {rid}: prenotazione inviata su Fidy.")
 
+        return {
+            "ok": True,
+            "dry_run": False,
+            "request_id": rid,
+            "sede": sede,
+            "data": iso,
+            "ora": hhmm,
+            "tipologia": tipologia,
+            "persone": req.persone,
+            "seggiolini": seggiolini,
+            "referer": referer,
+            "telefono_e164": phone_e164,
+            "telefono_form": phone_form,
+        }
 
-# =========================
-# ENDPOINTS
-# =========================
-@app.post("/check_availability")
-async def check_availability(dati: RichiestaControllo):
-    pasto = "PRANZO"
-    if dati.orario:
-        pasto = get_pasto_strict(dati.orario)
+    finally:
+        await close_page(page)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-        context = await browser.new_context(viewport={"width": 390, "height": 844})
-        page = await context.new_page()
-        page.set_default_timeout(60000)
+async def book_with_retries(req: BookingRequest) -> Dict[str, Any]:
+    """
+    Retry su timeout/instabilità. Se fallisce restituisce errore leggibile.
+    """
+    last_err: Optional[str] = None
 
+    for attempt in range(PW_RETRIES + 1):
         try:
-            await log_step(f"🔎 CHECK: {dati.persone} pax | {dati.data} | pasto={pasto}")
-            await page.goto(FIDY_URL, wait_until="domcontentloaded", timeout=60000)
-            await accept_cookies_if_any(page)
+            if attempt > 0:
+                logger.warning(f"🔁 Retry attempt {attempt}/{PW_RETRIES}")
+            return await run_booking_flow(req)
 
-            await step_select_persone(page, dati.persone)
-            await step_select_seggiolini(page, 0)
-            await step_select_data(page, dati.data)
-            await step_select_pasto(page, pasto)
-
-            risto = page.locator(".ristoCont").first
-            await risto.wait_for(state="visible", timeout=30000)
-            txt = (await risto.inner_text()).strip().lower()
-
-            if not txt or "loading" in txt:
-                return {"ok": False, "result": "Non riesco a leggere le disponibilità (contenuto non pronto)."}
-            if "non ci sono" in txt or "nessun" in txt:
-                return {"ok": True, "result": "Sembra pieno (nessuna disponibilità)."}
-            return {"ok": True, "result": "Sembra esserci disponibilità (almeno una sede visibile).", "debug": {"pasto": pasto}}
-
+        except PWTimeoutError as e:
+            last_err = f"Timeout Playwright: {str(e)}"
+            logger.error(last_err)
+        except HTTPException:
+            raise
         except Exception as e:
-            return {"ok": False, "result": f"Errore: {str(e)}"}
-        finally:
-            await browser.close()
+            last_err = f"Errore booking: {type(e).__name__}: {str(e)}"
+            logger.error(last_err)
 
+        # backoff breve
+        await asyncio.sleep(0.8 + attempt * 0.6)
+
+    raise HTTPException(status_code=502, detail=last_err or "Errore sconosciuto")
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="centralino-webhook", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def _startup():
+    await startup_playwright()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await shutdown_playwright()
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 @app.post("/book_table")
-async def book_table(dati: RichiestaPrenotazione, dry_run: int = 0):
-    # dry_run=0 => PRODUZIONE (clic PRENOTA)
-    # dry_run=1 => SIMULAZIONE
+async def book_table(req: Request):
+    ip = req.client.host if req.client else "unknown"
+    if not rate_limit_ok(ip):
+        raise HTTPException(status_code=429, detail="Troppe richieste, riprova tra poco")
+
+    payload = await req.json()
+
+    # Supporto payload "liberi": se arrivano nomi diversi li rimappiamo.
+    # (così il chatbot può mandare dati anche con chiavi differenti)
+    def pick(*keys: str) -> Optional[Any]:
+        for k in keys:
+            if k in payload and payload[k] is not None:
+                return payload[k]
+        return None
+
+    normalized = {
+        "nome": pick("nome", "Nome", "first_name", "firstname"),
+        "cognome": pick("cognome", "Cognome", "last_name", "lastname"),
+        "email": pick("email", "Email", "mail"),
+        "telefono": pick("telefono", "Telefono", "phone", "cell", "cellulare"),
+        "persone": pick("persone", "Persone", "pax", "coperti", "Coperti"),
+        "sede": pick("sede", "Sede", "ristorante", "Ristorante", "location"),
+        "data": pick("data", "Data", "data_pren", "DataPren", "DataPren2"),
+        "ora": pick("ora", "Ora", "orario", "OraPren", "OraPren2"),
+        "seggiolone": pick("seggiolone", "Seggiolone"),
+        "seggiolini": pick("seggiolini", "Seggiolini"),
+        "tipologia": pick("tipologia", "Tipologia", "pasto", "Pasto"),
+        "nota": pick("nota", "Nota", "note", "Note"),
+        "referer": pick("referer", "Fonte", "fonte"),
+        "dry_run": pick("dry_run", "dryRun"),
+        "request_id": pick("request_id", "requestId"),
+    }
+
+    # valori di default
+    if normalized["referer"] is None:
+        normalized["referer"] = DEFAULT_REFERER
+
     try:
-        return await run_booking_flow(dati, dry_run=bool(int(dry_run)))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        booking_req = BookingRequest(**normalized)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Payload non valido: {str(e)}")
 
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    result = await book_with_retries(booking_req)
+    return result
