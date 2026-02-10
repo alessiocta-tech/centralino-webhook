@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-pydantic
 phonenumbers
 playwright==1.41.0
 email-validator
