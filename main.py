@@ -40,6 +40,33 @@ SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "/tmp")
 # FASTAPI
 # -------------------------
 app = FastAPI(title="Centralino AI - deRione Booking Webhook", version="definitive-v2")
+from fastapi import Request
+
+
+@app.post("/check_availability")
+async def check_availability_disabled(request: Request):
+    try:
+        _ = await request.body()
+    except Exception:
+        pass
+
+    return {
+        "status": "DISABLED",
+        "message": "Check availability disabilitato: procedere direttamente con /book_table."
+    }
+
+
+@app.post("/checkavailability")
+async def checkavailability_disabled_alias(request: Request):
+    try:
+        _ = await request.body()
+    except Exception:
+        pass
+
+    return {
+        "status": "DISABLED",
+        "message": "Check availability disabilitato: procedere direttamente con /book_table."
+    }
 
 # -------------------------
 # PLAYWRIGHT GLOBALS
