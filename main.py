@@ -42,7 +42,6 @@ SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "/tmp")
 app = FastAPI(title="Centralino AI - deRione Booking Webhook", version="definitive-v2")
 from fastapi import Request
 
-
 @app.post("/check_availability")
 async def check_availability_disabled(request: Request):
     try:
