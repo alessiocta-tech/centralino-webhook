@@ -1,627 +1,729 @@
 import os
 import re
-import json
-import time
-import asyncio
-import hashlib
-import logging
-from datetime import datetime, date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Optional, List, Any, Dict, Union
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, EmailStr
 from playwright.async_api import async_playwright
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import Error as PlaywrightError
 
+# ============================================================
+# CONFIG
+# ============================================================
 
-# -----------------------------
-# Config
-# -----------------------------
-APP_NAME = "centralino-webhook"
-BASE_URL = os.getenv("FIDY_BASE_URL", "https://rione.fidy.app/prenew.php")
-REFERER_DEFAULT = os.getenv("REFERER_DEFAULT", "AI")
+BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?referer=AI")
+PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
 
-MAX_CONCURRENT_BOOKINGS = int(os.getenv("MAX_CONCURRENT_BOOKINGS", "1"))
-PW_RETRIES = int(os.getenv("PW_RETRIES", "2"))
-PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "25000"))
+# Se true: compila form ma NON clicca PRENOTA (test)
+DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
 
-IDEMPOTENCY_TTL_SECONDS = int(os.getenv("IDEMPOTENCY_TTL_SECONDS", "180"))
-
-SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", ".")
-SAVE_SCREENSHOT_ON_ERROR = os.getenv("SAVE_SCREENSHOT_ON_ERROR", "1") == "1"
-
-SEDE_ALIASES = {
-    "talenti": "Talenti - Roma",
-    "talenti - roma": "Talenti - Roma",
-    "roma talenti": "Talenti - Roma",
-    "appia": "Appia",
-    "palermo": "Palermo",
-    "reggio calabria": "Reggio Calabria",
-    "ostia": "Ostia Lido",
-    "ostia lido": "Ostia Lido",
-}
-
-# -----------------------------
-# Logging
-# -----------------------------
-logger = logging.getLogger(APP_NAME)
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-logger.handlers = [handler]
-
-# -----------------------------
-# App
-# -----------------------------
-app = FastAPI(title=APP_NAME)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+IPHONE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
 )
 
-# -----------------------------
-# Playwright global
-# -----------------------------
-_pw = None
-_browser = None
-_booking_sem = asyncio.Semaphore(MAX_CONCURRENT_BOOKINGS)
+# ============================================================
+# FASTAPI
+# ============================================================
 
-# Idempotency stores
-_idempo_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_idempo_locks: Dict[str, asyncio.Lock] = {}
+app = FastAPI(title="centralino-webhook", version="V13-merge-stable")
 
+# ============================================================
+# MODELS (compat)
+# ============================================================
 
-# -----------------------------
-# Utils
-# -----------------------------
-def _now_ts() -> float:
-    return time.time()
-
-
-def _clean_cache():
-    now = _now_ts()
-    expired = [k for k, (ts, _) in _idempo_cache.items() if now - ts > IDEMPOTENCY_TTL_SECONDS]
-    for k in expired:
-        _idempo_cache.pop(k, None)
+class DisabledAnyBody(BaseModel):
+    """
+    Modello volutamente permissivo: non deve mai generare 422.
+    """
+    class Config:
+        extra = "allow"
 
 
-def _norm_str(x: Any) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
-
-
-def _norm_bool(x: Any) -> bool:
-    if isinstance(x, bool):
-        return x
-    s = _norm_str(x).lower()
-    return s in ("1", "true", "yes", "si", "sì", "y")
-
-
-def _norm_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return default
-
-
-def _norm_date(x: Any) -> Optional[str]:
-    s = _norm_str(x)
-    if not s:
-        return None
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        return s
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
-    if m:
-        dd, mm, yy = m.group(1), m.group(2), m.group(3)
-        return f"{yy}-{int(mm):02d}-{int(dd):02d}"
-    return None
-
-
-def _norm_time(x: Any) -> Optional[str]:
-    s = _norm_str(x)
-    if not s:
-        return None
-    s = s.replace(".", ":")
-    if re.fullmatch(r"\d{1,2}", s):
-        return f"{int(s):02d}:00"
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if m:
-        hh, mm = int(m.group(1)), int(m.group(2))
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
-    return None
-
-
-def _normalize_sede(raw: Any) -> Optional[str]:
-    s = _norm_str(raw).lower()
-    if not s:
-        return None
-    s = re.sub(r"\s+", " ", s)
-    return SEDE_ALIASES.get(s) or _norm_str(raw)
-
-
-def _fingerprint(payload: Dict[str, Any]) -> str:
-    fp = _norm_str(payload.get("fingerprint"))
-    if fp:
-        return fp
-    key = {
-        "nome": _norm_str(payload.get("nome")),
-        "cognome": _norm_str(payload.get("cognome")),
-        "telefono": _norm_str(payload.get("telefono")),
-        "email": _norm_str(payload.get("email")),
-        "persone": _norm_int(payload.get("persone"), 0),
-        "sede": _norm_str(payload.get("sede")),
-        "data": _norm_str(payload.get("data")),
-        "ora": _norm_str(payload.get("ora")),
-        "seggiolini": _norm_int(payload.get("seggiolini"), 0),
-    }
-    blob = json.dumps(key, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()
-
-
-def _validate_required(p: Dict[str, Any]) -> List[str]:
-    missing = []
-    for k in ("nome", "cognome", "telefono", "email", "persone", "sede", "data", "ora"):
-        if _norm_str(p.get(k)) == "":
-            missing.append(k)
-
-    n = _norm_int(p.get("persone"), 0)
-    if n < 1 or n > 9:
-        if "persone" not in missing:
-            missing.append("persone")
-
-    if p.get("data"):
-        try:
-            d = datetime.strptime(p["data"], "%Y-%m-%d").date()
-            if d < date.today():
-                missing.append("data_passata")
-            if d > date.today() + timedelta(days=30):
-                missing.append("data_oltre_30gg")
-        except Exception:
-            missing.append("data_formato")
-
-    if p.get("ora"):
-        if not re.fullmatch(r"\d{2}:\d{2}", p["ora"]):
-            missing.append("ora_formato")
-
-    if p.get("email"):
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", p["email"]):
-            missing.append("email_formato")
-
-    if p.get("telefono"):
-        t = re.sub(r"\s+", "", p["telefono"])
-        if not re.fullmatch(r"\+?\d{8,15}", t):
-            missing.append("telefono_formato")
-
-    return missing
-
-
-def _format_message_slot_full(alt: Optional[str]) -> str:
-    if alt:
-        return f"Il turno selezionato è pieno. Ti proponiamo in alternativa il seguente turno {alt}."
-    return "Il turno selezionato è pieno. Ti proponiamo in alternativa un altro turno disponibile."
-
-
-# -----------------------------
-# Startup / Shutdown
-# -----------------------------
-@app.on_event("startup")
-async def _startup():
-    global _pw, _browser
-    logger.info("Starting Playwright...")
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    )
-    logger.info("Playwright started.")
-
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global _pw, _browser
-    try:
-        if _browser:
-            await _browser.close()
-    finally:
-        _browser = None
-    try:
-        if _pw:
-            await _pw.stop()
-    finally:
-        _pw = None
-
-
-# -----------------------------
-# Health
-# -----------------------------
-@app.get("/", response_class=PlainTextResponse)
-async def home():
-    return "OK"
-
-
-# -----------------------------
-# Compat: check availability (mai 422)
-# -----------------------------
-@app.post("/check_availability")
-async def check_availability_compat(request: Request):
-    return {"ok": True, "status": "disabled", "message": "availability_check_disabled"}
-
-
-@app.post("/checkavailability")
-async def checkavailability_alias(request: Request):
-    return {"ok": True, "status": "disabled", "message": "availability_check_disabled"}
-
-
-# -----------------------------
-# Body parsing (per evitare 422)
-# -----------------------------
-async def _parse_any_body(request: Request) -> Dict[str, Any]:
+class RichiestaPrenotazioneCompat(BaseModel):
     """
     Accetta:
-    - JSON (application/json)
-    - form-urlencoded / multipart
-    - text/plain contenente JSON
-    - body vuoto
-    Restituisce sempre dict (anche {}).
+    - schema "vecchio": nome, email, telefono, sede, data, orario, persone, note
+    - schema tool-call: nome, cognome, email, telefono, sede, data, ora, persone, seggiolone, seggiolini, nota, referer, dry_run
     """
-    # 1) prova JSON
+
+    # dati anagrafici
+    nome: Optional[str] = None
+    cognome: Optional[str] = None
+
+    email: Optional[str] = None
+    telefono: Optional[str] = None
+
+    # booking
+    sede: Optional[str] = None
+    data: Optional[str] = None  # YYYY-MM-DD
+
+    # orario: accetta sia "orario" sia "ora"
+    orario: Optional[str] = None
+    ora: Optional[str] = None
+
+    persone: Optional[int] = None
+
+    # note: accetta sia "note" sia "nota"
+    note: Optional[str] = ""
+    nota: Optional[str] = ""
+
+    # extra tool-call (non obbligatori)
+    seggiolone: Optional[bool] = False
+    seggiolini: Optional[int] = 0
+    referer: Optional[str] = "AI"
+    dry_run: Optional[bool] = False
+
+    class Config:
+        extra = "allow"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def calcola_pasto(orario_str: str) -> str:
+    """13:00 -> PRANZO, 20:30 -> CENA"""
     try:
-        data = await request.json()
-        if isinstance(data, dict):
-            return data
-        return {"_raw": data}
+        hh = int(orario_str.split(":")[0])
+        return "PRANZO" if hh < 17 else "CENA"
+    except Exception:
+        return "CENA"
+
+
+def get_data_type(data_str: str) -> str:
+    """Ritorna: Oggi / Domani / Altra"""
+    try:
+        data_pren = datetime.strptime(data_str, "%Y-%m-%d").date()
+        oggi = datetime.now().date()
+        domani = oggi + timedelta(days=1)
+        if data_pren == oggi:
+            return "Oggi"
+        if data_pren == domani:
+            return "Domani"
+        return "Altra"
+    except Exception:
+        return "Altra"
+
+
+def normalize_orario(s: Optional[str]) -> str:
+    s = (s or "").strip().lower().replace("ore", "").replace("alle", "").strip()
+    s = s.replace(".", ":").replace(",", ":")
+    if re.fullmatch(r"\d{1,2}$", s):
+        return f"{int(s):02d}:00"
+    if re.fullmatch(r"\d{1,2}:\d{2}$", s):
+        hh, mm = s.split(":")
+        return f"{int(hh):02d}:{int(mm):02d}"
+    # se arriva "13:00:00" -> taglio
+    if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}$", s):
+        hh, mm, _ = s.split(":")
+        return f"{int(hh):02d}:{int(mm):02d}"
+    return s
+
+
+def normalize_sede(s: Optional[str]) -> str:
+    s0 = (s or "").strip().lower()
+    mapping = {
+        "talenti": "Talenti - Roma",
+        "talenti - roma": "Talenti - Roma",
+        "ostia": "Ostia Lido",
+        "ostia lido": "Ostia Lido",
+        "appia": "Appia",
+        "reggio": "Reggio Calabria",
+        "reggio calabria": "Reggio Calabria",
+        "palermo": "Palermo",
+        "palermo centro": "Palermo",
+    }
+    if s0 in mapping:
+        return mapping[s0]
+    return (s or "").strip()
+
+
+def merge_nome_cognome(nome: str, cognome: Optional[str]) -> str:
+    nome = (nome or "").strip()
+    cognome = (cognome or "").strip()
+    if nome and cognome:
+        return f"{nome} {cognome}"
+    return nome or cognome or ""
+
+
+def is_valid_date_yyyy_mm_dd(s: str) -> bool:
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
+
+
+def validate_phone_basic(s: str) -> bool:
+    x = re.sub(r"\s+", "", (s or ""))
+    # accetta +39..., oppure solo cifre >= 8
+    if x.startswith("+"):
+        x2 = x[1:]
+    else:
+        x2 = x
+    return bool(re.fullmatch(r"\d{8,15}", x2))
+
+
+def validate_email_basic(s: str) -> bool:
+    if not s:
+        return False
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", s.strip()))
+
+
+async def maybe_click_cookie(page):
+    for patt in [r"accetta", r"consent", r"ok", r"accetto"]:
+        try:
+            loc = page.locator(f"text=/{patt}/i").first
+            if await loc.count() > 0:
+                await loc.click(timeout=2000, force=True)
+                return
+        except Exception:
+            pass
+
+
+async def click_exact_number(page, n: int):
+    txt = str(n)
+    for sel in [f"button:text-is('{txt}')", f"div:text-is('{txt}')", f"span:text-is('{txt}')"]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click(timeout=3000, force=True)
+                return True
+        except Exception:
+            pass
+    try:
+        await page.get_by_text(txt, exact=True).first.click(timeout=3000, force=True)
+        return True
+    except Exception:
+        return False
+
+
+async def click_seggiolini_no(page):
+    try:
+        if await page.locator("text=/seggiolini/i").count() > 0:
+            no_btn = page.locator("text=/^\\s*NO\\s*$/i").first
+            if await no_btn.count() > 0:
+                await no_btn.click(timeout=4000, force=True)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def set_date(page, data_iso: str):
+    tipo = get_data_type(data_iso)
+    await page.wait_for_timeout(800)
+
+    if tipo in ["Oggi", "Domani"]:
+        try:
+            btn = page.locator(f"text=/{tipo}/i").first
+            if await btn.count() > 0:
+                await btn.click(timeout=4000, force=True)
+                return
+        except Exception:
+            pass
+
+    try:
+        altra = page.locator("text=/Altra data/i").first
+        if await altra.count() > 0:
+            await altra.click(timeout=5000, force=True)
     except Exception:
         pass
 
-    # 2) prova form
+    await page.wait_for_timeout(600)
     try:
-        form = await request.form()
-        if form:
-            return dict(form)
+        await page.evaluate(
+            f"""() => {{
+                const el = document.querySelector('input[type="date"]');
+                if (el) el.value = "{data_iso}";
+            }}"""
+        )
     except Exception:
         pass
 
-    # 3) prova text
     try:
-        raw = await request.body()
-        if not raw:
-            return {}
-        txt = raw.decode("utf-8", errors="ignore").strip()
-        if not txt:
-            return {}
-        # se è JSON dentro testo
-        if txt.startswith("{") and txt.endswith("}"):
-            try:
-                j = json.loads(txt)
-                if isinstance(j, dict):
-                    return j
-                return {"_raw": j}
-            except Exception:
-                return {"_raw_text": txt}
-        return {"_raw_text": txt}
+        date_input = page.locator('input[type="date"]').first
+        if await date_input.count() > 0:
+            await date_input.press("Enter")
     except Exception:
-        return {}
+        pass
+
+    for patt in [r"conferma", r"cerca", r"ok"]:
+        try:
+            btn = page.locator(f"text=/{patt}/i").first
+            if await btn.count() > 0:
+                await btn.click(timeout=2000, force=True)
+                break
+        except Exception:
+            pass
 
 
-# -----------------------------
-# Playwright helpers
-# -----------------------------
-async def _save_screenshot(page, prefix: str = "booking_error") -> Optional[str]:
-    if not SAVE_SCREENSHOT_ON_ERROR:
-        return None
+async def click_pasto(page, pasto: str):
+    await page.wait_for_timeout(1200)
     try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        path = os.path.join(SCREENSHOT_DIR, f"{prefix}_{ts}.png")
-        await page.screenshot(path=path, full_page=True)
-        logger.error(f"Saved screenshot: {os.path.basename(path)}")
-        return path
-    except Exception:
-        return None
-
-
-async def _extract_time_options(page) -> List[str]:
-    opts = await page.locator("#OraPren option").all()
-    out = []
-    for o in opts:
-        val = (await o.get_attribute("value")) or ""
-        disabled = await o.get_attribute("disabled")
-        if not val or disabled is not None:
-            continue
-        m = re.match(r"^(\d{2}:\d{2})", val.strip())
-        if m:
-            out.append(m.group(1))
-    seen = set()
-    uniq = []
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
-
-
-async def _pick_best_alternative(desired_hhmm: str, available: List[str]) -> Optional[str]:
-    if not available:
-        return None
-    try:
-        dh, dm = map(int, desired_hhmm.split(":"))
-        desired_min = dh * 60 + dm
-        avail_min = []
-        for t in available:
-            h, m = map(int, t.split(":"))
-            avail_min.append((h * 60 + m, t))
-        later = [x for x in avail_min if x[0] >= desired_min]
-        if later:
-            later.sort(key=lambda x: x[0])
-            return later[0][1]
-        avail_min.sort(key=lambda x: x[0])
-        return avail_min[0][1]
-    except Exception:
-        return available[0]
-
-
-async def _click_people(page, n: int) -> None:
-    await page.locator(f'.nCoperti[rel="{n}"]').first.click(timeout=PW_TIMEOUT_MS)
-
-
-async def _set_seggiolini(page, seggiolini: int) -> None:
-    if seggiolini and seggiolini > 0:
-        if await page.locator(".seggioliniTxt, .SeggSI").count() > 0:
-            await page.locator(".seggioliniTxt, .SeggSI").first.click(timeout=PW_TIMEOUT_MS)
-        await page.locator(f'.nSeggiolini[rel="{seggiolini}"]').first.click(timeout=PW_TIMEOUT_MS)
-    else:
-        if await page.locator(".SeggNO").count() > 0:
-            await page.locator(".SeggNO").first.click(timeout=PW_TIMEOUT_MS)
-
-
-async def _set_date(page, yyyy_mm_dd: str) -> None:
-    if await page.locator("#DataPren").count() > 0:
-        await page.locator("#DataPren").fill(yyyy_mm_dd, timeout=PW_TIMEOUT_MS)
-        await page.locator("#DataPren").dispatch_event("change")
-    else:
-        btn = page.locator(f'.dataBtn[rel="{yyyy_mm_dd}"], .dataOggi[rel="{yyyy_mm_dd}"]')
+        btn = page.locator(f"text=/{pasto}/i").first
         if await btn.count() > 0:
-            await btn.first.click(timeout=PW_TIMEOUT_MS)
-
-
-async def _set_tipologia(page, hhmm: str) -> str:
-    h = int(hhmm.split(":")[0])
-    tip = "PRANZO" if h < 17 else "CENA"
-    btn = page.locator(f'.tipoBtn[rel="{tip}"]')
-    if await btn.count() > 0:
-        await btn.first.click(timeout=PW_TIMEOUT_MS)
-    return tip
-
-
-async def _select_sede(page, sede_label: str) -> None:
-    await page.wait_for_selector(".ristoBtn", timeout=PW_TIMEOUT_MS)
-    candidates = page.locator(".ristoBtn")
-    count = await candidates.count()
-    best = None
-    for i in range(count):
-        el = candidates.nth(i)
-        txt = (await el.inner_text()).strip()
-        if sede_label.lower() in txt.lower():
-            best = el
-            break
-    if best is None:
-        best = candidates.first
-    await best.click(timeout=PW_TIMEOUT_MS)
-
-
-async def _select_time(page, hhmm: str) -> Tuple[str, List[str], str]:
-    await page.wait_for_selector("#OraPren", timeout=PW_TIMEOUT_MS)
-    desired_value = f"{hhmm}:00"
-    option = page.locator(f'#OraPren option[value="{desired_value}"]')
-    if await option.count() == 0:
-        available = await _extract_time_options(page)
-        return "slot_not_found", available, ""
-    disabled = await option.get_attribute("disabled")
-    if disabled is not None:
-        available = await _extract_time_options(page)
-        return "slot_full", available, ""
-    await page.select_option("#OraPren", value=desired_value, timeout=PW_TIMEOUT_MS)
-    return "ok", [], desired_value
-
-
-async def _fill_customer_and_submit(page, payload: Dict[str, Any]) -> None:
-    if await page.locator(".confDati").count() > 0:
-        await page.locator(".confDati").first.click(timeout=PW_TIMEOUT_MS)
-
-    await page.wait_for_selector("#prenoForm", timeout=PW_TIMEOUT_MS)
-
-    await page.locator("#Nome").fill(payload["nome"], timeout=PW_TIMEOUT_MS)
-    await page.locator("#Cognome").fill(payload["cognome"], timeout=PW_TIMEOUT_MS)
-    await page.locator("#Email").fill(payload["email"], timeout=PW_TIMEOUT_MS)
-
-    tel = re.sub(r"\D+", "", payload["telefono"])
-    if len(tel) > 10:
-        tel = tel[-10:]
-    await page.locator("#Telefono").fill(tel, timeout=PW_TIMEOUT_MS)
-
-    if payload.get("nota") and await page.locator("#Nota").count() > 0:
-        await page.locator("#Nota").fill(payload["nota"], timeout=PW_TIMEOUT_MS)
-
-    await page.locator('#prenoForm input[type="submit"]').first.click(timeout=PW_TIMEOUT_MS)
-
-
-async def playwright_submit_booking(payload: Dict[str, Any]) -> Dict[str, Any]:
-    referer = payload.get("referer") or REFERER_DEFAULT
-    url = f"{BASE_URL}?referer={referer}"
-
-    ctx = await _browser.new_context()
-    page = await ctx.new_page()
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PW_TIMEOUT_MS)
-
-        await page.wait_for_selector(".nCoperti", timeout=PW_TIMEOUT_MS)
-        await _click_people(page, int(payload["persone"]))
-        await _set_seggiolini(page, int(payload.get("seggiolini", 0)))
-        await _set_date(page, payload["data"])
-        await _set_tipologia(page, payload["ora"])
-
-        await page.wait_for_timeout(400)
-        await _select_sede(page, payload["sede_label"])
-
-        status, alternatives, _ = await _select_time(page, payload["ora"])
-        if status == "slot_not_found":
-            best = await _pick_best_alternative(payload["ora"], alternatives)
-            return {
-                "ok": False,
-                "status": "slot_not_found",
-                "message": "Orario non disponibile. Ecco i turni pubblicati.",
-                "alternatives": alternatives,
-                "suggested": best,
-            }
-        if status == "slot_full":
-            best = await _pick_best_alternative(payload["ora"], alternatives)
-            return {
-                "ok": False,
-                "status": "slot_full",
-                "message": _format_message_slot_full(best),
-                "alternatives": alternatives,
-                "suggested": best,
-            }
-
-        if payload.get("nota") and await page.locator("#Nota").count() > 0:
-            await page.locator("#Nota").fill(payload["nota"], timeout=PW_TIMEOUT_MS)
-
-        await _fill_customer_and_submit(page, payload)
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=PW_TIMEOUT_MS)
-        except Exception:
-            pass
-
-        content = (await page.content()).lower()
-        if "prenotazione" in content and ("confermata" in content or "confermato" in content or "grazie" in content):
-            return {"ok": True, "status": "confirmed", "message": "Prenotazione confermata."}
-
-        return {"ok": True, "status": "submitted", "message": "Richiesta inviata. In attesa conferma."}
-
-    except (PlaywrightTimeoutError, PlaywrightError) as e:
-        await _save_screenshot(page)
-        raise RuntimeError(str(e)) from e
+            await btn.click(timeout=5000, force=True)
+            return True
     except Exception:
-        await _save_screenshot(page)
-        raise
-    finally:
+        pass
+    return False
+
+
+async def click_sede(page, sede_target: str) -> bool:
+    await page.wait_for_timeout(1200)
+    try:
+        loc = page.get_by_text(sede_target, exact=False).first
+        if await loc.count() > 0:
+            await loc.click(timeout=6000, force=True)
+            return True
+    except Exception:
+        pass
+
+    base = sede_target.split("-")[0].strip()
+    if base:
         try:
-            await ctx.close()
+            loc = page.get_by_text(base, exact=False).first
+            if await loc.count() > 0:
+                await loc.click(timeout=6000, force=True)
+                return True
         except Exception:
             pass
 
+    return False
 
-async def run_with_retries(fn, retries: int):
-    last_err = None
-    for attempt in range(1, retries + 1):
+
+async def extract_sedi_visibili(page) -> List[str]:
+    """
+    Dopo il click PRANZO/CENA, la pagina mostra la lista ristoranti.
+    Estraggo i nomi visibili (best-effort).
+    """
+    js = """
+    () => {
+      const out = new Set();
+      const nodes = document.querySelectorAll('.ristoBtn, .selettore, [class*="ristoBtn"]');
+      for (const n of nodes) {
+        const t = (n.innerText || '').trim();
+        if (!t) continue;
+        // prima riga sensata
+        const firstLine = t.split('\\n').map(x=>x.trim()).find(x=>x.length>0);
+        if (firstLine) out.add(firstLine);
+      }
+      // fallback: qualsiasi "small" dentro lista
+      const smalls = document.querySelectorAll('.ristoCont small, .ristoCont .lead, .ristoCont');
+      for (const n of smalls) {
+        const t = (n.innerText || '').trim();
+        if (!t) continue;
+        const firstLine = t.split('\\n').map(x=>x.trim()).find(x=>x.length>0);
+        if (firstLine && firstLine.length < 60) out.add(firstLine);
+      }
+      return Array.from(out);
+    }
+    """
+    try:
+        res = await page.evaluate(js)
+        if isinstance(res, list):
+            # pulizia
+            cleaned = []
+            for x in res:
+                x = re.sub(r"\s+", " ", str(x)).strip()
+                if x and x.lower() not in ["orario", "conferma", "pranzo", "cena"]:
+                    cleaned.append(x)
+            # de-dup preservando ordine
+            seen = set()
+            out = []
+            for x in cleaned:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out[:12]
+    except Exception:
+        pass
+    return []
+
+
+async def extract_orari_disponibili_da_select(page) -> List[str]:
+    """
+    Dopo aver scelto sede, normalmente esiste una <select> con <option>.
+    Ritorna lista HH:MM disponibili (enabled).
+    """
+    js = """
+    () => {
+      const sel = document.querySelector('select');
+      if (!sel) return [];
+      const out = [];
+      for (const opt of sel.querySelectorAll('option')) {
+        const val = (opt.value || '').trim();
+        const txt = (opt.textContent || '').trim();
+        const disabled = opt.disabled || opt.getAttribute('disabled') !== null;
+        if (!val) continue;
+        // prendo HH:MM dai primi 5 caratteri (es: 13:00:00) oppure da txt
+        let hhmm = '';
+        if (/^\\d{1,2}:\\d{2}/.test(val)) {
+          const m = val.match(/^(\\d{1,2}:\\d{2})/);
+          if (m) hhmm = m[1];
+        } else {
+          const m = txt.match(/(\\d{1,2}:\\d{2})/);
+          if (m) hhmm = m[1];
+        }
+        if (!hhmm) continue;
+        if (!disabled) out.push(hhmm);
+      }
+      return out;
+    }
+    """
+    try:
+        res = await page.evaluate(js)
+        if isinstance(res, list):
+            # normalizzo HH:MM
+            out = []
+            for x in res:
+                out.append(normalize_orario(str(x)))
+            # de-dup
+            seen = set()
+            uniq = []
+            for x in out:
+                if x not in seen:
+                    seen.add(x)
+                    uniq.append(x)
+            return uniq[:12]
+    except Exception:
+        pass
+    return []
+
+
+async def click_orario(page, orario_hhmm: str) -> Dict[str, Any]:
+    """
+    Tenta di selezionare orario.
+    Ritorna dict:
+      { ok: bool, reason: 'OK'|'NOT_FOUND'|'SOLD_OUT', alternatives: [...] }
+    """
+    await page.wait_for_timeout(1200)
+
+    # se c'è una select, provo a selezionare l'option corrispondente e verificare disabled
+    try:
+        sel = page.locator("select").first
+        if await sel.count() > 0:
+            # cerco option matching per value che inizi con hh:mm
+            # nota: sul sito value spesso è "13:00:00"
+            opt = page.locator(f"select option[value^='{orario_hhmm}']").first
+            if await opt.count() > 0:
+                # se disabled -> SOLD_OUT
+                try:
+                    disabled = await opt.is_disabled()
+                except Exception:
+                    disabled = False
+                if disabled:
+                    alts = await extract_orari_disponibili_da_select(page)
+                    return {"ok": False, "reason": "SOLD_OUT", "alternatives": alts}
+
+                # seleziono la option
+                try:
+                    await sel.select_option(value=re.compile(rf"^{re.escape(orario_hhmm)}"))
+                    return {"ok": True, "reason": "OK", "alternatives": []}
+                except Exception:
+                    # fallback click
+                    try:
+                        await opt.click(timeout=5000, force=True)
+                        return {"ok": True, "reason": "OK", "alternatives": []}
+                    except Exception:
+                        pass
+
+            # non trovata option -> NOT_FOUND + alternatives
+            alts = await extract_orari_disponibili_da_select(page)
+            return {"ok": False, "reason": "NOT_FOUND", "alternatives": alts}
+    except Exception:
+        pass
+
+    # fallback: click testo libero
+    candidates = [
+        f"text=/{re.escape(orario_hhmm)}/",
+        f"text={orario_hhmm}",
+        f"text=/{re.escape(orario_hhmm.replace(':', '.'))}/",
+    ]
+    for c in candidates:
         try:
-            return await fn(attempt)
-        except Exception as e:
-            last_err = e
-            logger.error(f"Attempt {attempt} failed: {e}")
-            await asyncio.sleep(0.5 * attempt)
-    raise last_err
+            loc = page.locator(c).first
+            if await loc.count() > 0:
+                await loc.click(timeout=6000, force=True)
+                return {"ok": True, "reason": "OK", "alternatives": []}
+        except Exception:
+            pass
+
+    alts = await extract_orari_disponibili_da_select(page)
+    return {"ok": False, "reason": "NOT_FOUND", "alternatives": alts}
 
 
-# -----------------------------
-# BOOK TABLE (mai 422)
-# -----------------------------
-@app.post("/book_table")
-async def book_table(request: Request):
-    """
-    Endpoint che NON va mai in 422:
-    - body vuoto / non JSON -> accetta comunque
-    - risponde sempre 200 JSON
-    """
-    _clean_cache()
+async def click_conferma(page):
+    for patt in [r"CONFERMA", r"Conferma", r"continua", r"avanti"]:
+        try:
+            btn = page.locator(f"text=/{patt}/").first
+            if await btn.count() > 0:
+                await btn.click(timeout=5000, force=True)
+                return True
+        except Exception:
+            pass
+    return False
 
-    incoming = await _parse_any_body(request)
-    p = dict(incoming or {})
 
-    normalized = {
-        "nome": _norm_str(p.get("nome") or p.get("Nome")),
-        "cognome": _norm_str(p.get("cognome") or p.get("Cognome")),
-        "email": _norm_str(p.get("email") or p.get("Email")),
-        "telefono": _norm_str(p.get("telefono") or p.get("Telefono")),
-        "persone": _norm_int(p.get("persone") or p.get("Persone") or p.get("coperti"), 0),
-        "sede": _normalize_sede(p.get("sede") or p.get("Sede") or p.get("ristorante")),
-        "data": _norm_date(p.get("data") or p.get("Data") or p.get("giorno")),
-        "ora": _norm_time(p.get("ora") or p.get("Ora") or p.get("orario")),
-        "seggiolone": _norm_bool(p.get("seggiolone") or p.get("Seggiolone") or False),
-        "seggiolini": _norm_int(p.get("seggiolini") or p.get("Seggiolini") or 0, 0),
-        "nota": _norm_str(p.get("nota") or p.get("Nota") or ""),
-        "referer": _norm_str(p.get("referer") or REFERER_DEFAULT),
-        "dry_run": _norm_bool(p.get("dry_run") or False),
-        "fingerprint": _norm_str(p.get("fingerprint")),
+async def fill_final_form(page, full_name: str, email: str, telefono: str, note: str):
+    await page.wait_for_timeout(1200)
+
+    parts = (full_name or "").strip().split(" ", 1)
+    n = parts[0] if parts else full_name
+    c = parts[1] if len(parts) > 1 else "Cliente"
+
+    async def try_fill_any(selectors, value):
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.fill(value, timeout=4000)
+                    return True
+            except Exception:
+                pass
+        return False
+
+    await try_fill_any(['input[name="Nome"]', 'input[name="nome"]', 'input[placeholder*="Nome" i]', 'input#Nome', 'input#nome'], n)
+    await try_fill_any(['input[name="Cognome"]', 'input[name="cognome"]', 'input[placeholder*="Cognome" i]', 'input#Cognome', 'input#cognome'], c)
+    await try_fill_any(['input[name="Email"]', 'input[name="email"]', 'input[type="email"]', 'input[placeholder*="Email" i]', 'input#Email'], email)
+    await try_fill_any(['input[name="Telefono"]', 'input[name="telefono"]', 'input[type="tel"]', 'input[placeholder*="Telefono" i]', 'input#Telefono'], telefono)
+
+    if note:
+        await try_fill_any(['textarea[name="Nota"]', 'textarea[name="note"]', 'textarea', 'textarea[placeholder*="note" i]', 'textarea#Nota'], note)
+
+    # checkbox consensi
+    try:
+        checkboxes = page.locator('input[type="checkbox"]')
+        cnt = await checkboxes.count()
+        for i in range(cnt):
+            cb = checkboxes.nth(i)
+            try:
+                if await cb.is_visible():
+                    await cb.check(timeout=2000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def click_prenota(page):
+    for patt in [r"PRENOTA", r"Prenota", r"CONFERMA PRENOTAZIONE"]:
+        try:
+            btn = page.locator(f"text=/{patt}/").last
+            if await btn.count() > 0:
+                await btn.click(timeout=8000, force=True)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def normalize_payload(dati: RichiestaPrenotazioneCompat) -> Dict[str, Any]:
+    # orario: preferisci orario, poi ora
+    orario_raw = dati.orario or dati.ora or ""
+    orario = normalize_orario(orario_raw)
+
+    # note: preferisci note, poi nota
+    note = (dati.note or "").strip()
+    if not note:
+        note = (dati.nota or "").strip()
+
+    sede = normalize_sede(dati.sede)
+    full_name = merge_nome_cognome(dati.nome or "", dati.cognome)
+
+    return {
+        "full_name": full_name,
+        "email": (dati.email or "").strip(),
+        "telefono": (dati.telefono or "").strip(),
+        "sede": sede,
+        "data": (dati.data or "").strip(),
+        "orario": orario,
+        "persone": int(dati.persone or 0),
+        "note": note,
+        "dry_run": bool(dati.dry_run),
+        "seggiolini": int(dati.seggiolini or 0),
+        "seggiolone": bool(dati.seggiolone),
+        "referer": (dati.referer or "AI").strip() or "AI",
     }
 
-    sede_label = _norm_str(normalized["sede"])
-    normalized["sede_label"] = SEDE_ALIASES.get(sede_label.lower().strip(), None) or sede_label
 
-    fp = _fingerprint(normalized)
-    normalized["fingerprint"] = fp
+# ============================================================
+# ROUTES
+# ============================================================
 
-    logger.info(f"BOOK_TABLE request normalized: {json.dumps(normalized, ensure_ascii=False)}")
+@app.get("/")
+def home():
+    return {"status": "Centralino AI - Booking Engine V13 (merge-stable)"}
 
-    # Idempotenza
-    if fp in _idempo_cache:
-        ts, cached = _idempo_cache[fp]
-        if _now_ts() - ts <= IDEMPOTENCY_TTL_SECONDS:
-            return JSONResponse(status_code=200, content={"ok": True, "status": "idempotent_replay", **cached})
 
-    lock = _idempo_locks.get(fp)
-    if lock is None:
-        lock = asyncio.Lock()
-        _idempo_locks[fp] = lock
+@app.post("/check_availability")
+async def check_availability(_: DisabledAnyBody):
+    """
+    Compatibilità: NON usare più questo endpoint.
+    Serve solo a non far crashare eventuali chiamate residue.
+    Deve rispondere SEMPRE 200 (mai 422).
+    """
+    return {
+        "status": "DISABLED",
+        "message": "check_availability disabilitato: procedere direttamente con book_table."
+    }
 
-    async with lock:
-        if fp in _idempo_cache:
-            ts, cached = _idempo_cache[fp]
-            if _now_ts() - ts <= IDEMPOTENCY_TTL_SECONDS:
-                return JSONResponse(status_code=200, content={"ok": True, "status": "idempotent_replay", **cached})
 
-        missing = _validate_required(normalized)
-        if missing:
-            out = {
-                "ok": False,
-                "status": "invalid_request",
-                "message": "Dati mancanti o non validi: " + ", ".join(missing),
-                "missing": missing,
-            }
-            _idempo_cache[fp] = (_now_ts(), out)
-            return JSONResponse(status_code=200, content=out)
+@app.post("/book_table")
+async def book_table(dati: RichiestaPrenotazioneCompat):
+    payload = normalize_payload(dati)
 
-        if normalized.get("dry_run"):
-            out = {"ok": True, "status": "dry_run", "message": "Dry run: nessuna prenotazione eseguita."}
-            _idempo_cache[fp] = (_now_ts(), out)
-            return JSONResponse(status_code=200, content=out)
+    # Validazioni minime per evitare 422, ma rispondiamo 200 con errore gestito
+    missing = []
+    if not payload["full_name"]:
+        missing.append("nome")
+    if not validate_email_basic(payload["email"]):
+        missing.append("email")
+    if not validate_phone_basic(payload["telefono"]):
+        missing.append("telefono")
+    if not payload["sede"]:
+        missing.append("sede")
+    if not is_valid_date_yyyy_mm_dd(payload["data"]):
+        missing.append("data")
+    if not re.fullmatch(r"\d{2}:\d{2}", payload["orario"]):
+        missing.append("ora")
+    if payload["persone"] < 1:
+        missing.append("persone")
 
-        async with _booking_sem:
-            async def _do(attempt: int):
-                logger.info(f"Booking attempt #{attempt} - opening {BASE_URL}?referer={normalized['referer']}")
-                return await playwright_submit_booking(normalized)
+    if missing:
+        return {
+            "status": "INVALID",
+            "message": f"Dati mancanti/non validi: {', '.join(missing)}",
+            "alternatives": []
+        }
 
-            try:
-                result = await run_with_retries(_do, retries=PW_RETRIES)
-                _idempo_cache[fp] = (_now_ts(), result)
-                return JSONResponse(status_code=200, content=result)
-            except Exception as e:
-                out = {
-                    "ok": False,
-                    "status": "failed",
-                    "message": "Non riesco a completare la prenotazione in questo momento.",
-                    "debug": str(e),
+    # regole operative
+    if payload["persone"] > 9:
+        return {
+            "status": "TRANSFER",
+            "message": "Per tavolate superiori a 9 persone è necessario contattare il centralino.",
+            "alternatives": []
+        }
+
+    orario = payload["orario"]
+    pasto = calcola_pasto(orario)
+
+    print(
+        f"🚀 BOOKING: {payload['full_name']} -> {payload['sede']} | {payload['data']} {orario} "
+        f"| pax={payload['persone']} | pasto={pasto} | dry_run={payload['dry_run'] or DISABLE_FINAL_SUBMIT}"
+    )
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--single-process", "--disable-gpu"],
+        )
+        context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
+        page = await context.new_page()
+        page.set_default_timeout(PW_TIMEOUT_MS)
+        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+
+        async def route_handler(route):
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                await route.abort()
+            else:
+                await route.continue_()
+        await page.route("**/*", route_handler)
+
+        try:
+            await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+            await maybe_click_cookie(page)
+
+            # 1) Persone
+            await page.wait_for_timeout(800)
+            ok_people = await click_exact_number(page, payload["persone"])
+            if not ok_people:
+                print("⚠️ bottone persone non trovato, continuo...")
+
+            # 2) Seggiolini: per ora NO (come V12)
+            await page.wait_for_timeout(700)
+            await click_seggiolini_no(page)
+
+            # 3) Data
+            await set_date(page, payload["data"])
+
+            # 4) Pasto
+            await click_pasto(page, pasto)
+
+            # 5) Sede
+            ok_sede = await click_sede(page, payload["sede"])
+            if not ok_sede:
+                sedi = await extract_sedi_visibili(page)
+                return {
+                    "status": "SEDE_NOT_FOUND",
+                    "message": f"Sede non trovata: {payload['sede']}",
+                    "alternatives": sedi
                 }
-                _idempo_cache[fp] = (_now_ts(), out)
-                logger.error(f"Booking failed: {e}", exc_info=True)
-                return JSONResponse(status_code=200, content=out)
+
+            # 6) Orario
+            res_orario = await click_orario(page, orario)
+            if not res_orario.get("ok"):
+                alts = res_orario.get("alternatives", []) or []
+                if res_orario.get("reason") == "SOLD_OUT":
+                    return {
+                        "status": "SOLD_OUT",
+                        "message": "Il turno selezionato è pieno. Ti proponiamo in alternativa il seguente turno.",
+                        "alternatives": alts
+                    }
+                return {
+                    "status": "NOT_AVAILABLE",
+                    "message": "L’orario selezionato non è disponibile. Ti proponiamo in alternativa il seguente turno.",
+                    "alternatives": alts
+                }
+
+            # 7) Conferma (vai a form finale)
+            await page.wait_for_timeout(800)
+            await click_conferma(page)
+
+            # 8) Form finale
+            await fill_final_form(page, payload["full_name"], payload["email"], payload["telefono"], payload["note"])
+
+            # test mode: se dry_run true oppure env DISABLE_FINAL_SUBMIT
+            if payload["dry_run"] or DISABLE_FINAL_SUBMIT:
+                return {
+                    "status": "OK_DRY_RUN",
+                    "message": "Form compilato correttamente (dry-run, submit non inviato).",
+                    "alternatives": []
+                }
+
+            ok_submit = await click_prenota(page)
+            if not ok_submit:
+                return {
+                    "status": "ERROR",
+                    "message": "Bottone PRENOTA non trovato.",
+                    "alternatives": []
+                }
+
+            await page.wait_for_timeout(1500)
+            return {
+                "status": "OK",
+                "message": f"Prenotazione inviata: {payload['sede']} {payload['data']} {orario} per {payload['persone']} persone.",
+                "alternatives": []
+            }
+
+        except Exception as e:
+            # screenshot debug
+            try:
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                path = f"booking_error_{ts}.png"
+                await page.screenshot(path=path, full_page=True)
+                print(f"📸 Screenshot salvato: {path}")
+            except Exception:
+                pass
+
+            return {
+                "status": "ERROR",
+                "message": f"Errore prenotazione: {str(e)}",
+                "alternatives": []
+            }
+        finally:
+            await browser.close()
