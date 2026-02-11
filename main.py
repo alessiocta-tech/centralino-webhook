@@ -1,9 +1,12 @@
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Any, Dict, Union
 
-from fastapi import Body, FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, validator
 from playwright.async_api import async_playwright
 
 # ============================================================
@@ -23,67 +26,118 @@ IPHONE_UA = (
 
 app = FastAPI()
 
+
 # ============================================================
-# NORMALIZATION / VALIDATION (compat con ElevenLabs payload)
+# DEBUG: LOG 422 WITH BODY (super utile con ElevenLabs)
 # ============================================================
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-PHONE_RE = re.compile(r"^\+?\d{7,15}$")  # permissivo (E.164-ish)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.json()
+    except Exception:
+        body = "<non-json body>"
+    print("❌ 422 VALIDATION ERROR")
+    print("PATH:", request.url.path)
+    print("BODY:", body)
+    print("DETAILS:", exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "received_body": body},
+    )
 
-SEDE_MAP = {
-    "talenti": "Talenti - Roma",
-    "talenti - roma": "Talenti - Roma",
-    "roma talenti": "Talenti - Roma",
-    "ostia": "Ostia Lido",
-    "ostia lido": "Ostia Lido",
-    "appia": "Appia",
-    "reggio": "Reggio Calabria",
-    "reggio calabria": "Reggio Calabria",
-    "palermo": "Palermo",
-}
 
+# ============================================================
+# INPUT NORMALIZATION (ElevenLabs compat)
+# ============================================================
 
-def normalize_sede(s: str) -> str:
-    s0 = (s or "").strip().lower()
-    return SEDE_MAP.get(s0, (s or "").strip())
+def unwrap_body(payload: Any) -> Dict[str, Any]:
+    """
+    ElevenLabs a volte manda:
+      { "body": { ... } }
+    oppure manda direttamente:
+      { ... }
+    """
+    if isinstance(payload, dict) and "body" in payload and isinstance(payload["body"], dict):
+        return payload["body"]
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
 def normalize_orario(s: str) -> str:
     s = (s or "").strip().lower().replace("ore", "").replace("alle", "").strip()
     s = s.replace(".", ":").replace(",", ":")
-    # "13" -> "13:00"
     if re.fullmatch(r"\d{1,2}$", s):
         return f"{int(s):02d}:00"
-    # "13:30" -> "13:30"
     if re.fullmatch(r"\d{1,2}:\d{2}$", s):
         hh, mm = s.split(":")
-        return f"{int(hh):02d}:{int(mm):02d}"
-    # "13:30:00" -> "13:30"
-    if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}$", s):
-        hh, mm, _ = s.split(":")
         return f"{int(hh):02d}:{int(mm):02d}"
     return s
 
 
-def normalize_date(s: str) -> str:
-    s = (s or "").strip()
-    # accetta YYYY-MM-DD
+def normalize_sede(s: str) -> str:
+    s0 = (s or "").strip().lower()
+    mapping = {
+        "talenti": "Talenti - Roma",
+        "talenti roma": "Talenti - Roma",
+        "roma talenti": "Talenti - Roma",
+        "ostia": "Ostia Lido",
+        "ostia lido": "Ostia Lido",
+        "appia": "Appia",
+        "reggio": "Reggio Calabria",
+        "reggio calabria": "Reggio Calabria",
+        "palermo": "Palermo",
+        "palermo centro": "Palermo",
+    }
+    return mapping.get(s0, (s or "").strip())
+
+
+def parse_data_iso(value: str) -> str:
+    """
+    Accetta:
+    - '2026-02-12'
+    - '12/02/2026'
+    - 'domani', 'oggi'
+    Ritorna sempre YYYY-MM-DD
+    """
+    v = (value or "").strip().lower()
+
+    oggi = datetime.now().date()
+    if v in ("oggi", "today"):
+        return oggi.strftime("%Y-%m-%d")
+    if v in ("domani", "tomorrow"):
+        return (oggi + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # YYYY-MM-DD
     try:
-        datetime.strptime(s, "%Y-%m-%d")
-        return s
+        d = datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        return d.strftime("%Y-%m-%d")
     except Exception:
-        return s
+        pass
 
-
-def calcola_pasto(orario_hhmm: str) -> str:
+    # DD/MM/YYYY
     try:
-        hh = int(orario_hhmm.split(":")[0])
+        d = datetime.strptime(value.strip(), "%d/%m/%Y").date()
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # fallback: lascia com’è (meglio che 422)
+    return value.strip()
+
+
+def calcola_pasto(orario_str: str) -> str:
+    """13:00 -> PRANZO, 20:30 -> CENA"""
+    try:
+        hh = int(orario_str.split(":")[0])
         return "PRANZO" if hh < 17 else "CENA"
     except Exception:
         return "CENA"
 
 
 def get_data_type(data_str: str) -> str:
+    """Ritorna: Oggi / Domani / Altra"""
     try:
         data_pren = datetime.strptime(data_str, "%Y-%m-%d").date()
         oggi = datetime.now().date()
@@ -97,120 +151,72 @@ def get_data_type(data_str: str) -> str:
         return "Altra"
 
 
-def today_iso() -> str:
-    d = datetime.now().date()
-    return d.strftime("%Y-%m-%d")
+# ============================================================
+# MODELS (compat: persone può arrivare string)
+# ============================================================
+
+class RichiestaControllo(BaseModel):
+    sede: str
+    data: str  # YYYY-MM-DD
+    persone: Union[int, str] = Field(..., description="Numero persone")
+    orario: Optional[str] = None
+
+    @validator("persone", pre=True)
+    def coerce_persone(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, int):
+            return v
+        s = str(v).strip()
+        # prendi primo numero dentro stringa
+        m = re.search(r"\d+", s)
+        return int(m.group(0)) if m else 1
+
+    @validator("data", pre=True)
+    def coerce_data(cls, v):
+        return parse_data_iso(str(v))
+
+    @validator("sede", pre=True)
+    def coerce_sede(cls, v):
+        return normalize_sede(str(v))
 
 
-def plus_days_iso(days: int) -> str:
-    d = (datetime.now().date() + timedelta(days=days))
-    return d.strftime("%Y-%m-%d")
+class RichiestaPrenotazione(BaseModel):
+    nome: str
+    email: str
+    telefono: str
 
+    sede: str
+    data: str
+    orario: str
+    persone: Union[int, str]
+    note: Optional[str] = ""
 
-def extract_payload(data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Compat: accetta sia schema "vecchio" (nome/email/telefono/orario/note)
-    sia schema "Eleven" (nome/cognome/email/telefono/data/ora/persone/sede/nota/seggiolone/seggiolini/referer/dry_run)
-    Ritorna: payload normalizzato + lista campi mancanti/invalidi (per risposta 200, evitando 422).
-    """
-    missing: List[str] = []
+    @validator("persone", pre=True)
+    def coerce_persone(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, int):
+            return v
+        s = str(v).strip()
+        m = re.search(r"\d+", s)
+        return int(m.group(0)) if m else 1
 
-    nome = (data.get("nome") or "").strip()
-    cognome = (data.get("cognome") or "").strip()
-    # se arriva tutto in "nome" tipo "Alessio Muzzarelli"
-    if nome and not cognome and " " in nome:
-        parts = nome.split(" ", 1)
-        nome, cognome = parts[0].strip(), parts[1].strip()
+    @validator("data", pre=True)
+    def coerce_data(cls, v):
+        return parse_data_iso(str(v))
 
-    email = (data.get("email") or "").strip()
-    telefono = (data.get("telefono") or "").strip()
+    @validator("orario", pre=True)
+    def coerce_orario(cls, v):
+        return normalize_orario(str(v))
 
-    sede = (data.get("sede") or "").strip()
-    data_iso = (data.get("data") or "").strip()
-
-    # orario compat: "ora" o "orario"
-    ora = (data.get("ora") or data.get("orario") or "").strip()
-
-    # persone compat: "persone" o "coperti"
-    persone = data.get("persone")
-    if persone is None:
-        persone = data.get("coperti")
-    try:
-        persone_int = int(persone)
-    except Exception:
-        persone_int = 0
-
-    # note compat: "nota" o "note"
-    note = (data.get("nota") if data.get("nota") is not None else data.get("note")) or ""
-    note = str(note).strip()
-
-    seggiolone = bool(data.get("seggiolone", False))
-    try:
-        seggiolini = int(data.get("seggiolini", 0) or 0)
-    except Exception:
-        seggiolini = 0
-
-    referer = (data.get("referer") or "AI").strip()
-    dry_run = bool(data.get("dry_run", False))
-
-    # normalize
-    sede_n = normalize_sede(sede)
-    data_n = normalize_date(data_iso)
-    ora_n = normalize_orario(ora)
-
-    # validate required (logica tua)
-    if not nome:
-        missing.append("nome")
-    if not cognome:
-        missing.append("cognome")
-    if not email or not EMAIL_RE.match(email):
-        missing.append("email")
-    if not telefono:
-        missing.append("telefono")
-    else:
-        t = telefono.replace(" ", "").replace("-", "")
-        telefono = t
-        if not PHONE_RE.match(telefono):
-            # non blocco duro, ma segnalo (meglio chiedere all’utente)
-            missing.append("telefono_valido")
-
-    if not sede_n:
-        missing.append("sede")
-    if not data_n or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_n):
-        missing.append("data")
-    else:
-        # data passata
-        try:
-            if datetime.strptime(data_n, "%Y-%m-%d").date() < datetime.now().date():
-                missing.append("data_passata")
-        except Exception:
-            pass
-
-    if not ora_n or not re.fullmatch(r"\d{2}:\d{2}", ora_n):
-        missing.append("ora")
-    if persone_int < 1 or persone_int > 9:
-        missing.append("persone_1_9")
-
-    normalized = {
-        "nome": nome,
-        "cognome": cognome,
-        "email": email,
-        "telefono": telefono,
-        "sede": sede_n,
-        "data": data_n,
-        "ora": ora_n,
-        "persone": persone_int,
-        "note": note,
-        "seggiolone": seggiolone,
-        "seggiolini": seggiolini,
-        "referer": referer,
-        "dry_run": dry_run,
-    }
-    return normalized, missing
+    @validator("sede", pre=True)
+    def coerce_sede(cls, v):
+        return normalize_sede(str(v))
 
 
 # ============================================================
-# PLAYWRIGHT HELPERS (stile V12 “FUNZIONA”)
+# PLAYWRIGHT HELPERS (come versione FUNZIONA)
 # ============================================================
 
 async def maybe_click_cookie(page):
@@ -224,7 +230,7 @@ async def maybe_click_cookie(page):
             pass
 
 
-async def click_exact_number(page, n: int) -> bool:
+async def click_exact_number(page, n: int):
     txt = str(n)
     for sel in [f"button:text-is('{txt}')", f"div:text-is('{txt}')", f"span:text-is('{txt}')"]:
         try:
@@ -241,7 +247,7 @@ async def click_exact_number(page, n: int) -> bool:
         return False
 
 
-async def click_seggiolini_no(page) -> bool:
+async def click_seggiolini_no(page):
     try:
         if await page.locator("text=/seggiolini/i").count() > 0:
             no_btn = page.locator("text=/^\\s*NO\\s*$/i").first
@@ -291,17 +297,8 @@ async def set_date(page, data_iso: str):
     except Exception:
         pass
 
-    for patt in [r"conferma", r"cerca", r"ok"]:
-        try:
-            btn = page.locator(f"text=/{patt}/i").first
-            if await btn.count() > 0:
-                await btn.click(timeout=2000, force=True)
-                break
-        except Exception:
-            pass
 
-
-async def click_pasto(page, pasto: str) -> bool:
+async def click_pasto(page, pasto: str):
     await page.wait_for_timeout(1200)
     try:
         btn = page.locator(f"text=/{pasto}/i").first
@@ -313,8 +310,10 @@ async def click_pasto(page, pasto: str) -> bool:
     return False
 
 
-async def click_sede(page, sede_target: str) -> bool:
+async def click_sede(page, sede_target: str):
     await page.wait_for_timeout(1200)
+
+    # prova testo completo
     try:
         loc = page.get_by_text(sede_target, exact=False).first
         if await loc.count() > 0:
@@ -323,6 +322,7 @@ async def click_sede(page, sede_target: str) -> bool:
     except Exception:
         pass
 
+    # fallback: prima parola (es: "Talenti")
     base = sede_target.split("-")[0].strip()
     if base:
         try:
@@ -336,7 +336,34 @@ async def click_sede(page, sede_target: str) -> bool:
     return False
 
 
-async def click_conferma(page) -> bool:
+async def click_orario(page, orario_hhmm: str):
+    await page.wait_for_timeout(1200)
+
+    try:
+        sel = page.locator("select").first
+        if await sel.count() > 0:
+            await sel.click(timeout=2000)
+    except Exception:
+        pass
+
+    candidates = [
+        f"text=/{re.escape(orario_hhmm)}/",
+        f"text={orario_hhmm}",
+        f"text=/{re.escape(orario_hhmm.replace(':', '.'))}/",
+    ]
+    for c in candidates:
+        try:
+            loc = page.locator(c).first
+            if await loc.count() > 0:
+                await loc.click(timeout=6000, force=True)
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def click_conferma(page):
     for patt in [r"CONFERMA", r"Conferma", r"continua", r"avanti"]:
         try:
             btn = page.locator(f"text=/{patt}/").first
@@ -348,10 +375,13 @@ async def click_conferma(page) -> bool:
     return False
 
 
-async def fill_final_form(page, nome: str, cognome: str, email: str, telefono: str, note: str):
+async def fill_final_form(page, nome: str, email: str, telefono: str, note: str):
     await page.wait_for_timeout(1200)
+    parti = (nome or "").strip().split(" ", 1)
+    n = parti[0] if parti else nome
+    c = parti[1] if len(parti) > 1 else "Cliente"
 
-    async def try_fill_any(selectors, value) -> bool:
+    async def try_fill_any(selectors, value):
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
@@ -362,15 +392,14 @@ async def fill_final_form(page, nome: str, cognome: str, email: str, telefono: s
                 pass
         return False
 
-    await try_fill_any(['input[name="Nome"]', 'input[name="nome"]', 'input[placeholder*="Nome" i]', 'input#Nome', 'input#nome'], nome)
-    await try_fill_any(['input[name="Cognome"]', 'input[name="cognome"]', 'input[placeholder*="Cognome" i]', 'input#Cognome', 'input#cognome'], cognome)
-    await try_fill_any(['input[name="Email"]', 'input[name="email"]', 'input[type="email"]', 'input[placeholder*="Email" i]', 'input#Email', 'input#email'], email)
-    await try_fill_any(['input[name="Telefono"]', 'input[name="telefono"]', 'input[type="tel"]', 'input[placeholder*="Telefono" i]', 'input#Telefono', 'input#telefono'], telefono)
+    await try_fill_any(['input[name="Nome"]', 'input[name="nome"]', 'input[placeholder*="Nome" i]', 'input#Nome', 'input#nome'], n)
+    await try_fill_any(['input[name="Cognome"]', 'input[name="cognome"]', 'input[placeholder*="Cognome" i]', 'input#Cognome', 'input#cognome'], c)
+    await try_fill_any(['input[name="Email"]', 'input[name="email"]', 'input[type="email"]', 'input[placeholder*="Email" i]', 'input#Email'], email)
+    await try_fill_any(['input[name="Telefono"]', 'input[name="telefono"]', 'input[type="tel"]', 'input[placeholder*="Telefono" i]', 'input#Telefono'], telefono)
 
     if note:
-        await try_fill_any(['textarea[name="Nota"]', 'textarea[name="note"]', 'textarea', 'textarea[placeholder*="note" i]', 'textarea#Nota'], note)
+        await try_fill_any(['textarea[name="Nota"]', 'textarea[name="note"]', 'textarea', 'textarea[placeholder*="note" i]'], note)
 
-    # checkbox privacy/consensi: spunta tutto ciò che è visibile
     try:
         checkboxes = page.locator('input[type="checkbox"]')
         cnt = await checkboxes.count()
@@ -385,7 +414,7 @@ async def fill_final_form(page, nome: str, cognome: str, email: str, telefono: s
         pass
 
 
-async def click_prenota(page) -> bool:
+async def click_prenota(page):
     for patt in [r"PRENOTA", r"Prenota", r"CONFERMA PRENOTAZIONE"]:
         try:
             btn = page.locator(f"text=/{patt}/").last
@@ -397,159 +426,88 @@ async def click_prenota(page) -> bool:
     return False
 
 
-async def list_turni_disponibili(page) -> List[str]:
-    """
-    Legge le option disponibili dentro la select degli orari (se esiste).
-    Ritorna lista di HH:MM (uniche, ordinate).
-    """
-    out: List[str] = []
-    try:
-        sel = page.locator("select#OraPren, select[name='OraPren'], select").first
-        if await sel.count() == 0:
-            return out
-
-        options = sel.locator("option")
-        cnt = await options.count()
-        for i in range(cnt):
-            opt = options.nth(i)
-            try:
-                val = (await opt.get_attribute("value")) or ""
-                txt = (await opt.inner_text()) or ""
-                disabled = await opt.get_attribute("disabled")
-                if disabled is not None:
-                    continue
-                if not val or val.strip() == "":
-                    continue
-
-                # val spesso "13:00:00" o "13:00"
-                v = normalize_orario(val.strip())
-                if re.fullmatch(r"\d{2}:\d{2}", v):
-                    # se testo indica esaurito, skip
-                    if "ESAURIT" in txt.upper():
-                        continue
-                    out.append(v)
-            except Exception:
-                continue
-
-        out = sorted(list(dict.fromkeys(out)))
-    except Exception:
-        pass
-    return out
-
-
-async def pick_best_alternatives(turni: List[str], target: str, k: int = 3) -> List[str]:
-    """
-    Sceglie alternative vicine all’orario target.
-    """
-    if not turni:
-        return []
-    try:
-        th, tm = target.split(":")
-        tgt = int(th) * 60 + int(tm)
-    except Exception:
-        return turni[:k]
-
-    scored = []
-    for t in turni:
-        try:
-            h, m = t.split(":")
-            mins = int(h) * 60 + int(m)
-            scored.append((abs(mins - tgt), t))
-        except Exception:
-            scored.append((999999, t))
-    scored.sort(key=lambda x: x[0])
-    return [t for _, t in scored[:k]]
-
-
 # ============================================================
 # ROUTES
 # ============================================================
 
 @app.get("/")
 def home():
-    return {"status": "Centralino AI - Booking Engine (Compat, no-422)"}
+    return {"status": "Centralino AI - Booking Engine (ElevenLabs compat)"}
 
 
-# Lasciato per evitare che Eleven o cache chiamino ancora /check_availability.
-# Risponde SEMPRE 200 e non fa nulla.
 @app.post("/check_availability")
-@app.post("/checkavailability")
-async def check_availability_disabled(_: Dict[str, Any] = Body(default={})):
-    return {
-        "status": "DISABLED",
-        "message": "Check availability disabilitato: si procede direttamente con book_table.",
-    }
+async def check_availability_raw(request: Request):
+    payload = unwrap_body(await request.json())
+    dati = RichiestaControllo(**payload)
 
+    sede_target = dati.sede
+    orario = normalize_orario(dati.orario) if dati.orario else None
+    pasto = calcola_pasto(orario) if orario else None
 
-@app.post("/book_table")
-async def book_table(raw: Dict[str, Any] = Body(default={})):
-    """
-    Endpoint robusto:
-    - Mai 422 (Body è dict con default).
-    - Valida a mano e ritorna 200 con elenco campi mancanti.
-    - Prova prenotazione diretta.
-    - Se turno/orario non disponibile o pieno: propone alternative (turni pubblicati).
-    """
-    data, missing = extract_payload(raw)
-
-    # Se mancano campi, NON 422: ritorna 200 con istruzioni
-    if missing:
-        return {
-            "status": "MISSING_FIELDS",
-            "missing": missing,
-            "message": "Dati incompleti o non validi.",
-            "expected_example": {
-                "nome": "Alessio",
-                "cognome": "Muzzarelli",
-                "email": "alessiocta@gmail.com",
-                "telefono": "+393477692795",
-                "persone": 2,
-                "sede": "Talenti",
-                "data": plus_days_iso(1),
-                "ora": "13:00",
-                "seggiolone": False,
-                "seggiolini": 0,
-                "nota": "",
-                "referer": "AI",
-                "dry_run": False,
-            },
-        }
-
-    sede_target = data["sede"]
-    orario = data["ora"]
-    pasto = calcola_pasto(orario)
-
-    nome = data["nome"]
-    cognome = data["cognome"]
-    email = data["email"]
-    telefono = data["telefono"]
-    persone = data["persone"]
-    note = data["note"]
-    dry_run = bool(data["dry_run"]) or DISABLE_FINAL_SUBMIT
+    print(f"🔎 CHECK: {dati.persone} pax | {dati.data} | sede={sede_target} | ora={orario or '-'}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--single-process",
-                "--disable-gpu",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--single-process", "--disable-gpu"],
         )
         context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
         page = await context.new_page()
         page.set_default_timeout(PW_TIMEOUT_MS)
         page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
 
-        # blocca risorse pesanti (come la V12 stabile)
         async def route_handler(route):
             if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
                 await route.abort()
             else:
                 await route.continue_()
+        await page.route("**/*", route_handler)
 
+        try:
+            await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+            await maybe_click_cookie(page)
+
+            await page.wait_for_timeout(600)
+            await click_exact_number(page, int(dati.persone))
+            await click_seggiolini_no(page)
+            await set_date(page, dati.data)
+
+            if pasto:
+                await click_pasto(page, pasto)
+
+            return {"result": "OK (check completato fino a data/pasto)."}
+        except Exception as e:
+            return {"result": f"Errore Check: {e}"}
+        finally:
+            await browser.close()
+
+
+@app.post("/book_table")
+async def book_table_raw(request: Request):
+    payload = unwrap_body(await request.json())
+    dati = RichiestaPrenotazione(**payload)
+
+    sede_target = dati.sede
+    orario = dati.orario
+    pasto = calcola_pasto(orario)
+
+    print(f"🚀 BOOKING: {dati.nome} -> {sede_target} | {dati.data} {orario} | pax={dati.persone} | pasto={pasto}")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--single-process", "--disable-gpu"],
+        )
+        context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
+        page = await context.new_page()
+        page.set_default_timeout(PW_TIMEOUT_MS)
+        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+
+        async def route_handler(route):
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                await route.abort()
+            else:
+                await route.continue_()
         await page.route("**/*", route_handler)
 
         try:
@@ -558,14 +516,14 @@ async def book_table(raw: Dict[str, Any] = Body(default={})):
 
             # 1) persone
             await page.wait_for_timeout(800)
-            await click_exact_number(page, persone)
+            await click_exact_number(page, int(dati.persone))
 
-            # 2) seggiolini (NO / oppure ignora)
+            # 2) seggiolini NO
             await page.wait_for_timeout(700)
             await click_seggiolini_no(page)
 
             # 3) data
-            await set_date(page, data["data"])
+            await set_date(page, dati.data)
 
             # 4) pasto
             await click_pasto(page, pasto)
@@ -573,105 +531,31 @@ async def book_table(raw: Dict[str, Any] = Body(default={})):
             # 5) sede
             ok_sede = await click_sede(page, sede_target)
             if not ok_sede:
-                # prova a suggerire sedi leggendo i bottoni presenti (best effort)
-                # (senza fallire in 422)
-                return {
-                    "status": "SEDE_NOT_FOUND",
-                    "message": f"Sede non trovata: {sede_target}",
-                    "suggestion": "Prova una sede tra: Talenti, Appia, Ostia, Palermo, Reggio Calabria.",
-                }
+                raise RuntimeError(f"Sede non trovata/cliccabile: {sede_target}")
 
-            # 6) orario: qui NON usiamo click_orario “rigido”.
-            # Apriamo la select e verifichiamo se l’orario è presente e non disabled.
-            await page.wait_for_timeout(900)
+            # 6) orario
+            ok_orario = await click_orario(page, orario)
+            if not ok_orario:
+                raise RuntimeError(f"Orario non disponibile: {orario}")
 
-            # prova a selezionare l’orario cercando option con value che inizia con HH:MM
-            selected = False
-            try:
-                sel = page.locator("select#OraPren, select[name='OraPren'], select").first
-                if await sel.count() > 0:
-                    # costruisco value tipico: "13:00:00"
-                    target_val_1 = f"{orario}:00"
-                    # seleziona per value exact se possibile
-                    try:
-                        await sel.select_option(value=target_val_1, timeout=3000)
-                        selected = True
-                    except Exception:
-                        # fallback: scan options
-                        options = sel.locator("option")
-                        cnt = await options.count()
-                        for i in range(cnt):
-                            opt = options.nth(i)
-                            val = (await opt.get_attribute("value")) or ""
-                            dis = await opt.get_attribute("disabled")
-                            if dis is not None:
-                                continue
-                            if normalize_orario(val) == orario:
-                                try:
-                                    await sel.select_option(value=val, timeout=3000)
-                                    selected = True
-                                    break
-                                except Exception:
-                                    pass
-            except Exception:
-                selected = False
-
-            if not selected:
-                # Turno non esiste o pieno: proponi turni pubblicati
-                turni = await list_turni_disponibili(page)
-                best = await pick_best_alternatives(turni, orario, k=3)
-                return {
-                    "status": "TURN_NOT_AVAILABLE",
-                    "message": "Il turno selezionato è pieno oppure non disponibile.",
-                    "requested": {"data": data["data"], "ora": orario, "sede": sede_target, "persone": persone},
-                    "alternatives": best,
-                    "all_available_turns": turni[:20],  # limite
-                }
-
-            # 7) conferma (porta alla form)
+            # 7) conferma (vai a schermata finale)
             await page.wait_for_timeout(800)
             await click_conferma(page)
 
             # 8) form finale
-            await fill_final_form(page, nome, cognome, email, telefono, note)
+            await fill_final_form(page, dati.nome, dati.email, dati.telefono, dati.note or "")
 
-            if dry_run:
-                return {
-                    "status": "OK_TEST",
-                    "message": "Form compilato (test mode, submit disattivato).",
-                    "requested": {"data": data["data"], "ora": orario, "sede": sede_target, "persone": persone},
-                }
+            if DISABLE_FINAL_SUBMIT:
+                return {"result": "FORM COMPILATO (test mode, submit disattivato)"}
 
-            # submit finale
             ok_submit = await click_prenota(page)
             if not ok_submit:
-                # se non trovo il bottone, propongo comunque alternative (spesso il flusso è cambiato)
-                turni = await list_turni_disponibili(page)
-                best = await pick_best_alternatives(turni, orario, k=3)
-                return {
-                    "status": "SUBMIT_NOT_FOUND",
-                    "message": "Non riesco a completare l’invio in automatico. Turni alternativi disponibili:",
-                    "alternatives": best,
-                    "all_available_turns": turni[:20],
-                }
+                raise RuntimeError("Bottone PRENOTA non trovato")
 
             await page.wait_for_timeout(1500)
-
-            return {
-                "status": "OK",
-                "message": "Prenotazione inviata.",
-                "reservation": {
-                    "nome": nome,
-                    "cognome": cognome,
-                    "persone": persone,
-                    "sede": sede_target,
-                    "data": data["data"],
-                    "ora": orario,
-                },
-            }
+            return {"result": f"Prenotazione inviata per {dati.nome} - {sede_target} {dati.data} {orario} ({dati.persone} pax)"}
 
         except Exception as e:
-            # screenshot debug
             try:
                 ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
                 path = f"booking_error_{ts}.png"
@@ -679,11 +563,20 @@ async def book_table(raw: Dict[str, Any] = Body(default={})):
                 print(f"📸 Screenshot salvato: {path}")
             except Exception:
                 pass
-
-            return {
-                "status": "ERROR",
-                "message": "Errore durante la prenotazione.",
-                "detail": str(e),
-            }
+            return {"result": f"Errore prenotazione: {e}"}
         finally:
             await browser.close()
+
+
+# ============================================================
+# ALIAS ENDPOINTS (evitano chiamate “sbagliate”)
+# ============================================================
+
+@app.post("/checkavailability")
+async def checkavailability_alias(request: Request):
+    return await check_availability_raw(request)
+
+
+@app.post("/booktable")
+async def booktable_alias(request: Request):
+    return await book_table_raw(request)
