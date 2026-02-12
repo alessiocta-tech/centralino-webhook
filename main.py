@@ -16,7 +16,7 @@ BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?refere
 PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
 DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
-DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "false").lower() == "true"  # utile per verifiche
+DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "false").lower() == "true"
 
 IPHONE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -94,17 +94,17 @@ class RichiestaPrenotazione(BaseModel):
     orario: str  # HH:MM
     persone: Union[int, str] = Field(...)
 
-    # ✅ accetta sia "note" (backend) che "nota" (prompt/tool). Se arrivano entrambi, preferiamo "note".
+    # Accetta sia "note" che "nota" (tool/prompt). Priorità a "note".
     note: Optional[str] = Field("", alias="nota")
 
     class Config:
         allow_population_by_field_name = True
-        extra = "ignore"  # ElevenLabs può mandare altri campi: li ignoriamo
+        extra = "ignore"
 
     @root_validator(pre=True)
     def _coerce_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        # Se arrivano sia note che nota, priorità a "note"
-        if "note" in values and values.get("note") not in (None, ""):
+        # Se arrivano sia note che nota, priorità a note
+        if values.get("note") not in (None, ""):
             values["nota"] = values.get("note")
 
         # persone: string -> int
@@ -115,18 +115,18 @@ class RichiestaPrenotazione(BaseModel):
                 values["persone"] = int(p2)
 
         # orario normalize
-        if "orario" in values and values["orario"] is not None:
+        if values.get("orario") is not None:
             values["orario"] = _norm_orario(str(values["orario"]))
 
         # sede normalize
-        if "sede" in values and values["sede"] is not None:
+        if values.get("sede") is not None:
             values["sede"] = _normalize_sede(str(values["sede"]))
 
         # telefono digits
-        if "telefono" in values and values["telefono"] is not None:
+        if values.get("telefono") is not None:
             values["telefono"] = re.sub(r"[^\d]", "", str(values["telefono"]))
 
-        # email fallback se vuota
+        # email fallback
         if not values.get("email"):
             values["email"] = "prenotazione@prenotazione.com"
 
@@ -248,7 +248,6 @@ async def _click_sede(page, sede_target: str):
         if await loc.count() > 0:
             await loc.click(timeout=10000, force=True)
             return
-
     avail = await _available_sedi(page)
     raise RuntimeError(f"Sede non trovata: '{sede_target}'. Disponibili: {', '.join(avail) if avail else 'N/D'}")
 
@@ -274,44 +273,70 @@ async def _select_orario(page, orario_hhmm: str):
     except Exception:
         pass
 
-    try:
-        await page.evaluate(
-            """(hhmm) => {
-              const sel = document.querySelector('#OraPren');
-              if (!sel) return false;
-              const opt = Array.from(sel.options).find(o => (o.textContent || '').includes(hhmm));
-              if (!opt) return false;
-              sel.value = opt.value;
-              sel.dispatchEvent(new Event('change', { bubbles: true }));
-              return true;
-            }""",
-            wanted,
-        )
-        val = await page.locator("#OraPren").input_value()
-        if val and val != "":
-            return
-    except Exception:
-        pass
-
-    opts = await page.evaluate(
-        """() => {
+    await page.evaluate(
+        """(hhmm) => {
           const sel = document.querySelector('#OraPren');
-          if (!sel) return [];
-          return Array.from(sel.options).map(o => ({value:o.value, text:(o.textContent||'').trim(), disabled:o.disabled}));
-        }"""
+          if (!sel) return false;
+          const opt = Array.from(sel.options).find(o => (o.textContent || '').includes(hhmm));
+          if (!opt) return false;
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }""",
+        wanted,
     )
-    raise RuntimeError(f"Orario non disponibile: {wanted}. Opzioni: {opts}")
+
+    val = await page.locator("#OraPren").input_value()
+    if not val:
+        opts = await page.evaluate(
+            """() => {
+              const sel = document.querySelector('#OraPren');
+              if (!sel) return [];
+              return Array.from(sel.options).map(o => ({value:o.value, text:(o.textContent||'').trim(), disabled:o.disabled}));
+            }"""
+        )
+        raise RuntimeError(f"Orario non disponibile: {wanted}. Opzioni: {opts}")
 
 
-async def _fill_note_step5(page, note: str):
+async def _set_notes_both_fields(page, note: str):
+    """
+    FIX NOTE:
+    - Scrive su textarea #Nota (step5)
+    - Scrive anche su hidden #Nota2 (quello che spesso finisce davvero nel POST)
+    - Lancia gli eventi change/input per far “agganciare” eventuale JS.
+    """
     note = (note or "").strip()
     if not note:
+        # pulizia (in caso di ri-uso sessione)
+        await page.evaluate(
+            """() => {
+              const a = document.querySelector('#Nota');
+              const b = document.querySelector('#Nota2');
+              if (a) { a.value = ''; a.dispatchEvent(new Event('input', {bubbles:true})); a.dispatchEvent(new Event('change', {bubbles:true})); }
+              if (b) { b.value = ''; b.dispatchEvent(new Event('change', {bubbles:true})); }
+            }"""
+        )
         return
-    try:
-        await page.wait_for_selector("#Nota", state="visible", timeout=PW_TIMEOUT_MS)
-        await page.locator("#Nota").fill(note, timeout=8000)
-    except Exception:
-        pass
+
+    await page.wait_for_selector("#Nota", state="visible", timeout=PW_TIMEOUT_MS)
+
+    # 1) fill standard
+    await page.locator("#Nota").fill(note, timeout=8000)
+
+    # 2) forza anche hidden
+    await page.evaluate(
+        """(val) => {
+          const a = document.querySelector('#Nota');
+          const b = document.querySelector('#Nota2');
+          if (a) { a.value = val; a.dispatchEvent(new Event('input', {bubbles:true})); a.dispatchEvent(new Event('change', {bubbles:true})); }
+          if (b) { b.value = val; b.dispatchEvent(new Event('change', {bubbles:true})); }
+          return {
+            Nota: a ? a.value : null,
+            Nota2: b ? b.value : null
+          };
+        }""",
+        note,
+    )
 
 
 async def _click_conferma(page):
@@ -328,7 +353,6 @@ async def _fill_form(page, nome: str, email: str, telefono: str):
     cognome = parti[1] if len(parti) > 1 else "Cliente"
 
     await page.wait_for_selector("#prenoForm", state="visible", timeout=PW_TIMEOUT_MS)
-
     await page.locator("#Nome").fill(nome1, timeout=8000)
     await page.locator("#Cognome").fill(cognome, timeout=8000)
     await page.locator("#Email").fill(email, timeout=8000)
@@ -343,6 +367,16 @@ async def _click_prenota(page):
     await page.locator("text=/PRENOTA/i").last.click(timeout=15000, force=True)
 
 
+async def _read_notes_state(page) -> Dict[str, Any]:
+    return await page.evaluate(
+        """() => {
+          const a = document.querySelector('#Nota');
+          const b = document.querySelector('#Nota2');
+          return { Nota: a ? a.value : null, Nota2: b ? b.value : null };
+        }"""
+    )
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -354,7 +388,6 @@ def home():
 
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione, request: Request):
-    # (opzionale) echo payload per capire cosa arriva davvero da ElevenLabs
     if DEBUG_ECHO_PAYLOAD:
         try:
             raw = await request.json()
@@ -373,9 +406,8 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
     sede_target = dati.sede
     orario = dati.orario
     pasto = _calcola_pasto(orario)
-
-    # ✅ qui puoi vedere se la nota è arrivata davvero al backend
     note_in = (dati.note or "").strip()
+
     print(
         f"🚀 BOOKING: {dati.nome} -> {sede_target} | {dati.data} {orario} | pax={dati.persone} | pasto={pasto} | note='{note_in}'"
     )
@@ -405,14 +437,39 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             await _click_sede(page, sede_target)
             await _select_orario(page, orario)
 
-            # ✅ Step 5: note
-            await _fill_note_step5(page, note_in)
+            # ✅ FIX NOTE: scrivi sia su #Nota che su #Nota2
+            await _set_notes_both_fields(page, note_in)
+            notes_state_before = await _read_notes_state(page)
+            print(f"📝 NOTES_STATE_BEFORE_CONFERMA: {notes_state_before}")
 
             await _click_conferma(page)
+
+            # Dopo CONFERMA, per sicurezza re-imposta #Nota2 (alcuni flussi lo azzerano)
+            if note_in:
+                await page.evaluate(
+                    """(val) => {
+                      const b = document.querySelector('#Nota2');
+                      if (b && (!b.value || b.value.trim() === '')) {
+                        b.value = val;
+                        b.dispatchEvent(new Event('change', {bubbles:true}));
+                      }
+                      return b ? b.value : null;
+                    }""",
+                    note_in,
+                )
+            notes_state_after = await _read_notes_state(page)
+            print(f"📝 NOTES_STATE_AFTER_CONFERMA: {notes_state_after}")
+
             await _fill_form(page, dati.nome, dati.email, dati.telefono)
 
             if DISABLE_FINAL_SUBMIT:
-                return {"ok": True, "message": "FORM COMPILATO (test mode, submit disattivato)", "note": note_in}
+                return {
+                    "ok": True,
+                    "message": "FORM COMPILATO (test mode, submit disattivato)",
+                    "note": note_in,
+                    "notes_state_before": notes_state_before,
+                    "notes_state_after": notes_state_after,
+                }
 
             await _click_prenota(page)
             await page.wait_for_timeout(1500)
@@ -421,10 +478,11 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 "ok": True,
                 "message": f"Prenotazione inviata: {dati.persone} pax - {sede_target} {dati.data} {orario} - {dati.nome}",
                 "note": note_in,
+                "notes_state_before": notes_state_before,
+                "notes_state_after": notes_state_after,
             }
 
         except Exception as e:
-            # ✅ screenshot: niente base64 nei logs, niente bug di indentazione
             screenshot_path = None
             try:
                 ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
