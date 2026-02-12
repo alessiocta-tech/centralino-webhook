@@ -2,10 +2,9 @@ import os
 import re
 import base64
 from datetime import datetime, timedelta
-from typing import Optional, Union, List, Dict, Any
+from typing import Optional, Union, Dict, Any, List
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, root_validator
 from playwright.async_api import async_playwright
 
@@ -17,19 +16,17 @@ BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?refere
 PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
 DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
-RETURN_SCREENSHOT_BASE64 = os.getenv("RETURN_SCREENSHOT_BASE64", "false").lower() == "true"
 
 IPHONE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17_0 "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
     "Mobile/15E148 Safari/604.1"
 )
 
 app = FastAPI()
 
-
 # ============================================================
-# MODELS
+# NORMALIZZAZIONI
 # ============================================================
 
 def _norm_orario(s: str) -> str:
@@ -42,14 +39,12 @@ def _norm_orario(s: str) -> str:
         return f"{int(hh):02d}:{int(mm):02d}"
     return s
 
-
 def _calcola_pasto(orario_hhmm: str) -> str:
     try:
         hh = int(orario_hhmm.split(":")[0])
         return "PRANZO" if hh < 17 else "CENA"
     except Exception:
         return "CENA"
-
 
 def _get_data_type(data_str: str) -> str:
     try:
@@ -63,7 +58,6 @@ def _get_data_type(data_str: str) -> str:
         return "Altra"
     except Exception:
         return "Altra"
-
 
 def _normalize_sede(s: str) -> str:
     s0 = (s or "").strip().lower()
@@ -81,42 +75,60 @@ def _normalize_sede(s: str) -> str:
     }
     return mapping.get(s0, (s or "").strip())
 
+def _digits_only(s: str) -> str:
+    return re.sub(r"[^\d]", "", s or "")
+
+# ============================================================
+# MODEL
+# - IMPORTANTISSIMO: supporta alias ElevenLabs:
+#   ora -> orario
+#   nota -> note
+# ============================================================
 
 class RichiestaPrenotazione(BaseModel):
     nome: str
-    email: str
+    email: str = "prenotazione@prenotazione.com"
     telefono: str
 
     sede: str
     data: str  # YYYY-MM-DD
-    orario: str  # HH:MM
-    persone: Union[int, str] = Field(...)
 
-    note: Optional[str] = ""
+    orario: str = Field(..., alias="ora")  # ElevenLabs manda "ora"
+    persone: Union[int, str]
+
+    note: Optional[str] = Field("", alias="nota")  # ElevenLabs manda "nota"
+
+    class Config:
+        allow_population_by_field_name = True  # accetta anche "orario"/"note"
 
     @root_validator(pre=True)
     def _coerce_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        # persone può arrivare "2 persone" ecc.
         p = values.get("persone")
         if isinstance(p, str):
-            p2 = re.sub(r"[^\d]", "", p)
+            p2 = _digits_only(p)
             if p2:
                 values["persone"] = int(p2)
 
+        # orario/ora
         if "orario" in values and values["orario"] is not None:
             values["orario"] = _norm_orario(str(values["orario"]))
+        if "ora" in values and values["ora"] is not None:
+            values["ora"] = _norm_orario(str(values["ora"]))
 
+        # sede
         if "sede" in values and values["sede"] is not None:
             values["sede"] = _normalize_sede(str(values["sede"]))
 
+        # telefono
         if "telefono" in values and values["telefono"] is not None:
-            t = re.sub(r"[^\d]", "", str(values["telefono"]))
-            values["telefono"] = t
+            values["telefono"] = _digits_only(str(values["telefono"]))
 
-        if "email" in values and values["email"] is None:
-            values["email"] = ""
+        # email vuota -> default
+        if not (values.get("email") or "").strip():
+            values["email"] = "prenotazione@prenotazione.com"
 
         return values
-
 
 # ============================================================
 # PLAYWRIGHT HELPERS
@@ -128,7 +140,6 @@ async def _block_heavy(route):
     else:
         await route.continue_()
 
-
 async def _maybe_click_cookie(page):
     for patt in [r"accetta", r"consent", r"ok", r"accetto"]:
         try:
@@ -139,17 +150,14 @@ async def _maybe_click_cookie(page):
         except Exception:
             pass
 
-
 async def _wait_ready(page):
     await page.wait_for_selector(".nCoperti", state="visible", timeout=PW_TIMEOUT_MS)
-
 
 async def _click_persone(page, n: int):
     loc = page.locator(f'.nCoperti[rel="{n}"]').first
     if await loc.count() == 0:
         loc = page.get_by_text(str(n), exact=True).first
     await loc.click(timeout=8000, force=True)
-
 
 async def _click_seggiolini_no(page):
     try:
@@ -162,7 +170,6 @@ async def _click_seggiolini_no(page):
             await tno.click(timeout=4000, force=True)
     except Exception:
         pass
-
 
 async def _set_date(page, data_iso: str):
     tipo = _get_data_type(data_iso)
@@ -188,7 +195,6 @@ async def _set_date(page, data_iso: str):
         data_iso,
     )
 
-
 async def _click_pasto(page, pasto: str):
     loc = page.locator(f'.tipoBtn[rel="{pasto}"]').first
     if await loc.count() > 0:
@@ -196,12 +202,11 @@ async def _click_pasto(page, pasto: str):
         return
     await page.locator(f"text=/{pasto}/i").first.click(timeout=8000, force=True)
 
-
 async def _available_sedi(page) -> List[str]:
     try:
         nodes = page.locator(".ristoBtn")
         cnt = await nodes.count()
-        out: List[str] = []
+        out = []
         for i in range(cnt):
             txt = (await nodes.nth(i).inner_text()).strip()
             first_line = txt.splitlines()[0].strip()
@@ -210,7 +215,6 @@ async def _available_sedi(page) -> List[str]:
         return out
     except Exception:
         return []
-
 
 def _match_sede_text(sede_target: str) -> List[str]:
     base = sede_target.strip()
@@ -225,19 +229,15 @@ def _match_sede_text(sede_target: str) -> List[str]:
             out.append(c)
     return out
 
-
 async def _click_sede(page, sede_target: str):
     await page.wait_for_selector(".ristoBtn", state="visible", timeout=PW_TIMEOUT_MS)
-
     for cand in _match_sede_text(sede_target):
         loc = page.locator(".ristoBtn", has_text=cand).first
         if await loc.count() > 0:
             await loc.click(timeout=10000, force=True)
             return
-
     avail = await _available_sedi(page)
     raise RuntimeError(f"Sede non trovata: '{sede_target}'. Disponibili: {', '.join(avail) if avail else 'N/D'}")
-
 
 async def _select_orario(page, orario_hhmm: str):
     await page.wait_for_selector("#OraPren", state="visible", timeout=PW_TIMEOUT_MS)
@@ -260,23 +260,22 @@ async def _select_orario(page, orario_hhmm: str):
     except Exception:
         pass
 
-    try:
-        ok = await page.evaluate(
-            """(hhmm) => {
-              const sel = document.querySelector('#OraPren');
-              if (!sel) return false;
-              const opt = Array.from(sel.options).find(o => (o.value || '').startsWith(hhmm));
-              if (!opt) return false;
-              sel.value = opt.value;
-              sel.dispatchEvent(new Event('change', { bubbles: true }));
-              return true;
-            }""",
-            wanted,
-        )
-        if ok:
+    ok = await page.evaluate(
+        """(hhmm) => {
+          const sel = document.querySelector('#OraPren');
+          if (!sel) return false;
+          const opt = Array.from(sel.options).find(o => (o.textContent || '').includes(hhmm));
+          if (!opt) return false;
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }""",
+        wanted,
+    )
+    if ok:
+        val = await page.locator("#OraPren").input_value()
+        if val:
             return
-    except Exception:
-        pass
 
     opts = await page.evaluate(
         """() => {
@@ -287,17 +286,30 @@ async def _select_orario(page, orario_hhmm: str):
     )
     raise RuntimeError(f"Orario non disponibile: {wanted}. Opzioni: {opts}")
 
-
-async def _fill_note_step5(page, note: str):
+async def _set_note_step5_and_hidden(page, note: str):
+    """Scrive la nota in #Nota (step5) e, per sicurezza, anche in #Nota2 (hidden)."""
     note = (note or "").strip()
     if not note:
         return
-    try:
-        await page.wait_for_selector("#Nota", state="visible", timeout=PW_TIMEOUT_MS)
-        await page.locator("#Nota").fill(note, timeout=8000)
-    except Exception:
-        pass
 
+    # Aspetta che la textarea esista
+    await page.wait_for_selector("#Nota", state="visible", timeout=PW_TIMEOUT_MS)
+
+    # Set robusto (value + eventi), non solo .fill()
+    await page.evaluate(
+        """(val) => {
+          const t = document.querySelector('#Nota');
+          if (t) {
+            t.value = val;
+            t.dispatchEvent(new Event('input', { bubbles: true }));
+            t.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          const h = document.querySelector('#Nota2');
+          if (h) h.value = val;
+          return true;
+        }""",
+        note,
+    )
 
 async def _click_conferma(page):
     loc = page.locator(".confDati").first
@@ -306,19 +318,16 @@ async def _click_conferma(page):
         return
     await page.locator("text=/CONFERMA/i").first.click(timeout=8000, force=True)
 
-
 async def _fill_form(page, nome: str, email: str, telefono: str):
-    parts = (nome or "").strip().split(" ", 1)
-    nome1 = parts[0] if parts else (nome or "Cliente")
-    cognome = parts[1] if len(parts) > 1 else "Cliente"
+    parti = (nome or "").strip().split(" ", 1)
+    nome1 = parti[0] if parti else (nome or "Cliente")
+    cognome = parti[1] if len(parti) > 1 else "Cliente"
 
     await page.wait_for_selector("#prenoForm", state="visible", timeout=PW_TIMEOUT_MS)
-
     await page.locator("#Nome").fill(nome1, timeout=8000)
     await page.locator("#Cognome").fill(cognome, timeout=8000)
-    await page.locator("#Email").fill(email or "", timeout=8000)
+    await page.locator("#Email").fill(email, timeout=8000)
     await page.locator("#Telefono").fill(telefono, timeout=8000)
-
 
 async def _click_prenota(page):
     loc = page.locator('input[type="submit"][value="PRENOTA"]').first
@@ -326,19 +335,6 @@ async def _click_prenota(page):
         await loc.click(timeout=15000, force=True)
         return
     await page.locator("text=/PRENOTA/i").last.click(timeout=15000, force=True)
-
-
-async def _safe_screenshot_base64(page) -> Optional[str]:
-    """
-    Screenshot in memory -> base64 (per log o ritorno JSON).
-    Non deve MAI rompere il server.
-    """
-    try:
-        img_bytes = await page.screenshot(full_page=True)
-        return base64.b64encode(img_bytes).decode("utf-8")
-    except Exception:
-        return None
-
 
 # ============================================================
 # ROUTES
@@ -348,32 +344,21 @@ async def _safe_screenshot_base64(page) -> Optional[str]:
 def home():
     return {"status": "Centralino AI - Booking Engine (Railway)"}
 
-
-@app.post("/check_availability")
-async def check_availability_compat(payload: Dict[str, Any]):
-    return {"ok": True, "message": "check_availability disabilitato: usa /book_table", "received": payload}
-
-
-@app.post("/checkavailability")
-async def checkavailability_compat(payload: Dict[str, Any]):
-    return {"ok": True, "message": "check_availability disabilitato: usa /book_table", "received": payload}
-
-
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    # Validazioni base
+    # Validazioni minime
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dati.data or ""):
-        return JSONResponse({"ok": False, "message": f"Formato data non valido: {dati.data}. Usa YYYY-MM-DD."}, status_code=200)
+        return {"ok": False, "message": f"Formato data non valido: {dati.data}. Usa YYYY-MM-DD."}
     if not re.fullmatch(r"\d{2}:\d{2}", dati.orario or ""):
-        return JSONResponse({"ok": False, "message": f"Formato orario non valido: {dati.orario}. Usa HH:MM (es. 13:00)."}, status_code=200)
+        return {"ok": False, "message": f"Formato orario non valido: {dati.orario}. Usa HH:MM (es. 13:00)."}
     if not isinstance(dati.persone, int) or dati.persone < 1 or dati.persone > 50:
-        return JSONResponse({"ok": False, "message": f"Numero persone non valido: {dati.persone}."}, status_code=200)
+        return {"ok": False, "message": f"Numero persone non valido: {dati.persone}."}
 
     sede_target = dati.sede
     orario = dati.orario
     pasto = _calcola_pasto(orario)
 
-    print(f"🚀 BOOKING: {dati.nome} -> {sede_target} | {dati.data} {orario} | pax={dati.persone} | pasto={pasto}")
+    print(f"🚀 BOOKING: {dati.nome} -> {sede_target} | {dati.data} {orario} | pax={dati.persone} | pasto={pasto} | note={(dati.note or '').strip()[:60]}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -384,7 +369,6 @@ async def book_table(dati: RichiestaPrenotazione):
         page = await context.new_page()
         page.set_default_timeout(PW_TIMEOUT_MS)
         page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
-
         await page.route("**/*", _block_heavy)
 
         try:
@@ -392,6 +376,7 @@ async def book_table(dati: RichiestaPrenotazione):
             await _maybe_click_cookie(page)
             await _wait_ready(page)
 
+            # Flow
             await _click_persone(page, int(dati.persone))
             await _click_seggiolini_no(page)
 
@@ -401,10 +386,22 @@ async def book_table(dati: RichiestaPrenotazione):
             await _click_sede(page, sede_target)
             await _select_orario(page, orario)
 
-            # NOTE step5
-            await _fill_note_step5(page, dati.note or "")
+            # NOTE (step5) + hidden Nota2 per sicurezza
+            await _set_note_step5_and_hidden(page, dati.note or "")
 
             await _click_conferma(page)
+
+            # Safety: dopo click conferma, ribadisco Nota2 (alcune UI resettano DOM)
+            if (dati.note or "").strip():
+                await page.evaluate(
+                    """(val) => {
+                      const h = document.querySelector('#Nota2');
+                      if (h) h.value = val;
+                      return true;
+                    }""",
+                    (dati.note or "").strip(),
+                )
+
             await _fill_form(page, dati.nome, dati.email, dati.telefono)
 
             if DISABLE_FINAL_SUBMIT:
@@ -416,22 +413,25 @@ async def book_table(dati: RichiestaPrenotazione):
             return {
                 "ok": True,
                 "message": f"Prenotazione inviata: {dati.persone} pax - {sede_target} {dati.data} {orario} - {dati.nome}",
+                "note_sent": (dati.note or "").strip(),
             }
 
         except Exception as e:
-            # FIX BUG: screenshot dentro try/except e INDENTAZIONE corretta (niente codice fuori dal try)
-            b64 = await _safe_screenshot_base64(page)
-
-            if b64:
+            # Screenshot NON deve mai far crashare: tutto dentro a try/except e ben indentato
+            b64 = None
+            try:
+                img = await page.screenshot(full_page=True)
+                b64 = base64.b64encode(img).decode()
                 print("📸 SCREENSHOT_BASE64_START")
                 print(b64)
                 print("📸 SCREENSHOT_BASE64_END")
+            except Exception:
+                pass
 
-            payload = {"ok": False, "message": f"Errore prenotazione: {e}"}
-            if RETURN_SCREENSHOT_BASE64 and b64:
-                payload["screenshot_base64"] = b64
-
-            return JSONResponse(payload, status_code=200)
-
+            return {
+                "ok": False,
+                "message": f"Errore prenotazione: {e}",
+                "screenshot_base64": b64,  # puoi copiarlo e decodificarlo in locale
+            }
         finally:
             await browser.close()
