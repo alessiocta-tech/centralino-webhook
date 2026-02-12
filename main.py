@@ -26,7 +26,7 @@ app = FastAPI()
 
 
 # ============================================================
-# MODELS (tolleranti: ElevenLabs spesso manda numeri come stringhe)
+# MODELS
 # ============================================================
 
 def _norm_orario(s: str) -> str:
@@ -86,34 +86,34 @@ class RichiestaPrenotazione(BaseModel):
 
     sede: str
     data: str  # YYYY-MM-DD
-    orario: str  # HH:MM (ma accetto anche "13")
+    orario: str  # HH:MM
     persone: Union[int, str] = Field(...)
 
     note: Optional[str] = ""
 
     @root_validator(pre=True)
     def _coerce_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        # persone: "2" -> 2
         p = values.get("persone")
         if isinstance(p, str):
             p2 = re.sub(r"[^\d]", "", p)
             if p2:
                 values["persone"] = int(p2)
-        # orario normalize
+
         if "orario" in values and values["orario"] is not None:
             values["orario"] = _norm_orario(str(values["orario"]))
-        # sede normalize
+
         if "sede" in values and values["sede"] is not None:
             values["sede"] = _normalize_sede(str(values["sede"]))
-        # telefono: solo digits
+
         if "telefono" in values and values["telefono"] is not None:
             t = re.sub(r"[^\d]", "", str(values["telefono"]))
             values["telefono"] = t
+
         return values
 
 
 # ============================================================
-# PLAYWRIGHT HELPERS (aderenti al tuo HTML attuale)
+# PLAYWRIGHT HELPERS
 # ============================================================
 
 async def _block_heavy(route):
@@ -135,27 +135,22 @@ async def _maybe_click_cookie(page):
 
 
 async def _wait_ready(page):
-    # la pagina fa fadeout dell'intro: aspetta che compaiano i bottoni persone
     await page.wait_for_selector(".nCoperti", state="visible", timeout=PW_TIMEOUT_MS)
 
 
 async def _click_persone(page, n: int):
-    # usa rel="2" ecc: più stabile del testo
     loc = page.locator(f'.nCoperti[rel="{n}"]').first
     if await loc.count() == 0:
-        # fallback: testo
         loc = page.get_by_text(str(n), exact=True).first
     await loc.click(timeout=8000, force=True)
 
 
 async def _click_seggiolini_no(page):
-    # se esiste, clicca NO e prosegui
     try:
         no_btn = page.locator(".SeggNO").first
         if await no_btn.count() > 0 and await no_btn.is_visible():
             await no_btn.click(timeout=4000, force=True)
             return
-        # fallback testo
         tno = page.locator("text=/^\\s*NO\\s*$/i").first
         if await tno.count() > 0 and await tno.is_visible():
             await tno.click(timeout=4000, force=True)
@@ -171,13 +166,11 @@ async def _set_date(page, data_iso: str):
         if await btn.count() > 0:
             await btn.click(timeout=6000, force=True)
             return
-        # fallback testo
         t = page.locator(f"text=/{tipo}/i").first
         if await t.count() > 0:
             await t.click(timeout=6000, force=True)
             return
 
-    # altra data: imposta input#DataPren e trigger change
     await page.evaluate(
         """(val) => {
           const el = document.querySelector('#DataPren') || document.querySelector('input[type="date"]');
@@ -191,24 +184,20 @@ async def _set_date(page, data_iso: str):
 
 
 async def _click_pasto(page, pasto: str):
-    # PRANZO/CENA: span.tipoBtn rel="PRANZO"
     loc = page.locator(f'.tipoBtn[rel="{pasto}"]').first
     if await loc.count() > 0:
         await loc.click(timeout=8000, force=True)
         return
-    # fallback testo
     await page.locator(f"text=/{pasto}/i").first.click(timeout=8000, force=True)
 
 
 async def _available_sedi(page) -> List[str]:
-    # estrai le sedi visibili dai blocchi .ristoBtn
     try:
         nodes = page.locator(".ristoBtn")
         cnt = await nodes.count()
         out = []
         for i in range(cnt):
             txt = (await nodes.nth(i).inner_text()).strip()
-            # spesso dentro c'è anche prezzo, prendo solo prima riga “nome sede”
             first_line = txt.splitlines()[0].strip()
             if first_line and first_line not in out:
                 out.append(first_line)
@@ -218,11 +207,9 @@ async def _available_sedi(page) -> List[str]:
 
 
 def _match_sede_text(sede_target: str) -> List[str]:
-    # genera candidate match (Talenti - Roma -> ["Talenti - Roma", "Talenti", "Roma"])
     base = sede_target.strip()
     parts = [p.strip() for p in re.split(r"[-–]", base) if p.strip()]
     cands = [base] + parts
-    # unique preserving order
     seen = set()
     out = []
     for c in cands:
@@ -234,10 +221,8 @@ def _match_sede_text(sede_target: str) -> List[str]:
 
 
 async def _click_sede(page, sede_target: str):
-    # aspetta che l'ajax carichi i ristoranti
     await page.wait_for_selector(".ristoBtn", state="visible", timeout=PW_TIMEOUT_MS)
 
-    # prova match progressivo
     for cand in _match_sede_text(sede_target):
         loc = page.locator(".ristoBtn", has_text=cand).first
         if await loc.count() > 0:
@@ -249,16 +234,11 @@ async def _click_sede(page, sede_target: str):
 
 
 async def _select_orario(page, orario_hhmm: str):
-    # nel tuo JS le option hanno value "13:00:00"
     await page.wait_for_selector("#OraPren", state="visible", timeout=PW_TIMEOUT_MS)
 
     wanted = orario_hhmm.strip()
-    if re.fullmatch(r"\d{2}:\d{2}", wanted):
-        wanted_val = wanted + ":00"
-    else:
-        wanted_val = wanted
+    wanted_val = wanted + ":00" if re.fullmatch(r"\d{2}:\d{2}", wanted) else wanted
 
-    # aspetta che si popolino le option
     await page.wait_for_function(
         """() => {
           const sel = document.querySelector('#OraPren');
@@ -267,7 +247,6 @@ async def _select_orario(page, orario_hhmm: str):
         timeout=PW_TIMEOUT_MS,
     )
 
-    # prova select_option su value
     try:
         res = await page.locator("#OraPren").select_option(value=wanted_val)
         if res:
@@ -275,7 +254,6 @@ async def _select_orario(page, orario_hhmm: str):
     except Exception:
         pass
 
-    # fallback: cerca option che contenga "13:00"
     try:
         await page.evaluate(
             """(hhmm) => {
@@ -289,14 +267,12 @@ async def _select_orario(page, orario_hhmm: str):
             }""",
             wanted,
         )
-        # verifica che non sia rimasto placeholder
         val = await page.locator("#OraPren").input_value()
         if val and val != "":
             return
     except Exception:
         pass
 
-    # lista opzioni disponibili (testo)
     opts = await page.evaluate(
         """() => {
           const sel = document.querySelector('#OraPren');
@@ -307,18 +283,26 @@ async def _select_orario(page, orario_hhmm: str):
     raise RuntimeError(f"Orario non disponibile: {wanted}. Opzioni: {opts}")
 
 
+async def _fill_note_step5(page, note: str):
+    note = (note or "").strip()
+    if not note:
+        return
+    try:
+        await page.wait_for_selector("#Nota", state="visible", timeout=PW_TIMEOUT_MS)
+        await page.locator("#Nota").fill(note, timeout=8000)
+    except Exception:
+        pass
+
+
 async def _click_conferma(page):
-    # bottone a.confDati (nel tuo main)
     loc = page.locator(".confDati").first
     if await loc.count() > 0:
         await loc.click(timeout=8000, force=True)
         return
-    # fallback testo
     await page.locator("text=/CONFERMA/i").first.click(timeout=8000, force=True)
 
 
-async def _fill_form(page, nome: str, email: str, telefono: str, note: str):
-    # la tua form usa #Nome #Cognome #Email #Telefono
+async def _fill_form(page, nome: str, email: str, telefono: str):
     parti = (nome or "").strip().split(" ", 1)
     nome1 = parti[0] if parti else (nome or "Cliente")
     cognome = parti[1] if len(parti) > 1 else "Cliente"
@@ -330,20 +314,12 @@ async def _fill_form(page, nome: str, email: str, telefono: str, note: str):
     await page.locator("#Email").fill(email, timeout=8000)
     await page.locator("#Telefono").fill(telefono, timeout=8000)
 
-    if note:
-        try:
-            await page.locator("#Nota").fill(note, timeout=4000)
-        except Exception:
-            pass
-
 
 async def _click_prenota(page):
-    # bottone submit value="PRENOTA"
     loc = page.locator('input[type="submit"][value="PRENOTA"]').first
     if await loc.count() > 0:
         await loc.click(timeout=15000, force=True)
         return
-    # fallback
     await page.locator("text=/PRENOTA/i").last.click(timeout=15000, force=True)
 
 
@@ -356,7 +332,6 @@ def home():
     return {"status": "Centralino AI - Booking Engine (Railway)"}
 
 
-# Alias “compat” per evitare crash se qualche agent chiama ancora questi path
 @app.post("/check_availability")
 async def check_availability_compat(payload: Dict[str, Any]):
     return {"ok": True, "message": "check_availability disabilitato: usa /book_table", "received": payload}
@@ -369,7 +344,6 @@ async def checkavailability_compat(payload: Dict[str, Any]):
 
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
-    # Validazioni minime lato server (evita loop Eleven)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dati.data or ""):
         return {"ok": False, "message": f"Formato data non valido: {dati.data}. Usa YYYY-MM-DD."}
     if not re.fullmatch(r"\d{2}:\d{2}", dati.orario or ""):
@@ -399,36 +373,25 @@ async def book_table(dati: RichiestaPrenotazione):
             await _maybe_click_cookie(page)
             await _wait_ready(page)
 
-            # 1) Persone
             await _click_persone(page, int(dati.persone))
-
-            # 2) Seggiolini NO (se presente)
             await _click_seggiolini_no(page)
 
-            # 3) Data
             await _set_date(page, dati.data)
-
-            # 4) Pasto
             await _click_pasto(page, pasto)
 
-            # 5) Sede (lista ajax)
             await _click_sede(page, sede_target)
-
-            # 6) Orario (select)
             await _select_orario(page, orario)
 
-            # 7) Conferma (passa a form)
-            await _click_conferma(page)
+            # NOTE: qui è il punto giusto (step5)
+            await _fill_note_step5(page, dati.note or "")
 
-            # 8) Form finale
-            await _fill_form(page, dati.nome, dati.email, dati.telefono, dati.note or "")
+            await _click_conferma(page)
+            await _fill_form(page, dati.nome, dati.email, dati.telefono)
 
             if DISABLE_FINAL_SUBMIT:
                 return {"ok": True, "message": "FORM COMPILATO (test mode, submit disattivato)"}
 
             await _click_prenota(page)
-
-            # attesa breve per completamento
             await page.wait_for_timeout(1500)
 
             return {
@@ -437,7 +400,6 @@ async def book_table(dati: RichiestaPrenotazione):
             }
 
         except Exception as e:
-            # screenshot e risposta “chiara” per Eleven (evita loop)
             try:
                 ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
                 path = f"booking_error_{ts}.png"
@@ -446,11 +408,6 @@ async def book_table(dati: RichiestaPrenotazione):
             except Exception:
                 path = None
 
-            msg = str(e)
-            return {
-                "ok": False,
-                "message": f"Errore prenotazione: {msg}",
-                "screenshot": path,
-            }
+            return {"ok": False, "message": f"Errore prenotazione: {e}", "screenshot": path}
         finally:
             await browser.close()
