@@ -1,9 +1,11 @@
 import os
 import re
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, Union, List, Dict, Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, root_validator
 from playwright.async_api import async_playwright
 
@@ -15,10 +17,11 @@ BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?refere
 PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
 DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
+RETURN_SCREENSHOT_BASE64 = os.getenv("RETURN_SCREENSHOT_BASE64", "false").lower() == "true"
 
 IPHONE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17_0 "
     "Mobile/15E148 Safari/604.1"
 )
 
@@ -109,6 +112,9 @@ class RichiestaPrenotazione(BaseModel):
             t = re.sub(r"[^\d]", "", str(values["telefono"]))
             values["telefono"] = t
 
+        if "email" in values and values["email"] is None:
+            values["email"] = ""
+
         return values
 
 
@@ -195,7 +201,7 @@ async def _available_sedi(page) -> List[str]:
     try:
         nodes = page.locator(".ristoBtn")
         cnt = await nodes.count()
-        out = []
+        out: List[str] = []
         for i in range(cnt):
             txt = (await nodes.nth(i).inner_text()).strip()
             first_line = txt.splitlines()[0].strip()
@@ -255,11 +261,11 @@ async def _select_orario(page, orario_hhmm: str):
         pass
 
     try:
-        await page.evaluate(
+        ok = await page.evaluate(
             """(hhmm) => {
               const sel = document.querySelector('#OraPren');
               if (!sel) return false;
-              const opt = Array.from(sel.options).find(o => (o.textContent || '').includes(hhmm));
+              const opt = Array.from(sel.options).find(o => (o.value || '').startsWith(hhmm));
               if (!opt) return false;
               sel.value = opt.value;
               sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -267,8 +273,7 @@ async def _select_orario(page, orario_hhmm: str):
             }""",
             wanted,
         )
-        val = await page.locator("#OraPren").input_value()
-        if val and val != "":
+        if ok:
             return
     except Exception:
         pass
@@ -303,15 +308,15 @@ async def _click_conferma(page):
 
 
 async def _fill_form(page, nome: str, email: str, telefono: str):
-    parti = (nome or "").strip().split(" ", 1)
-    nome1 = parti[0] if parti else (nome or "Cliente")
-    cognome = parti[1] if len(parti) > 1 else "Cliente"
+    parts = (nome or "").strip().split(" ", 1)
+    nome1 = parts[0] if parts else (nome or "Cliente")
+    cognome = parts[1] if len(parts) > 1 else "Cliente"
 
     await page.wait_for_selector("#prenoForm", state="visible", timeout=PW_TIMEOUT_MS)
 
     await page.locator("#Nome").fill(nome1, timeout=8000)
     await page.locator("#Cognome").fill(cognome, timeout=8000)
-    await page.locator("#Email").fill(email, timeout=8000)
+    await page.locator("#Email").fill(email or "", timeout=8000)
     await page.locator("#Telefono").fill(telefono, timeout=8000)
 
 
@@ -321,6 +326,18 @@ async def _click_prenota(page):
         await loc.click(timeout=15000, force=True)
         return
     await page.locator("text=/PRENOTA/i").last.click(timeout=15000, force=True)
+
+
+async def _safe_screenshot_base64(page) -> Optional[str]:
+    """
+    Screenshot in memory -> base64 (per log o ritorno JSON).
+    Non deve MAI rompere il server.
+    """
+    try:
+        img_bytes = await page.screenshot(full_page=True)
+        return base64.b64encode(img_bytes).decode("utf-8")
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -344,12 +361,13 @@ async def checkavailability_compat(payload: Dict[str, Any]):
 
 @app.post("/book_table")
 async def book_table(dati: RichiestaPrenotazione):
+    # Validazioni base
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dati.data or ""):
-        return {"ok": False, "message": f"Formato data non valido: {dati.data}. Usa YYYY-MM-DD."}
+        return JSONResponse({"ok": False, "message": f"Formato data non valido: {dati.data}. Usa YYYY-MM-DD."}, status_code=200)
     if not re.fullmatch(r"\d{2}:\d{2}", dati.orario or ""):
-        return {"ok": False, "message": f"Formato orario non valido: {dati.orario}. Usa HH:MM (es. 13:00)."}
+        return JSONResponse({"ok": False, "message": f"Formato orario non valido: {dati.orario}. Usa HH:MM (es. 13:00)."}, status_code=200)
     if not isinstance(dati.persone, int) or dati.persone < 1 or dati.persone > 50:
-        return {"ok": False, "message": f"Numero persone non valido: {dati.persone}."}
+        return JSONResponse({"ok": False, "message": f"Numero persone non valido: {dati.persone}."}, status_code=200)
 
     sede_target = dati.sede
     orario = dati.orario
@@ -366,6 +384,7 @@ async def book_table(dati: RichiestaPrenotazione):
         page = await context.new_page()
         page.set_default_timeout(PW_TIMEOUT_MS)
         page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+
         await page.route("**/*", _block_heavy)
 
         try:
@@ -382,7 +401,7 @@ async def book_table(dati: RichiestaPrenotazione):
             await _click_sede(page, sede_target)
             await _select_orario(page, orario)
 
-            # NOTE: qui è il punto giusto (step5)
+            # NOTE step5
             await _fill_note_step5(page, dati.note or "")
 
             await _click_conferma(page)
@@ -400,21 +419,19 @@ async def book_table(dati: RichiestaPrenotazione):
             }
 
         except Exception as e:
-            try:
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-                path = f"booking_error_{ts}.png"
-                import base64
+            # FIX BUG: screenshot dentro try/except e INDENTAZIONE corretta (niente codice fuori dal try)
+            b64 = await _safe_screenshot_base64(page)
 
-img = await page.screenshot(full_page=True)
-b64 = base64.b64encode(img).decode()
+            if b64:
+                print("📸 SCREENSHOT_BASE64_START")
+                print(b64)
+                print("📸 SCREENSHOT_BASE64_END")
 
-print("📸 SCREENSHOT_BASE64_START")
-print(b64)
-print("📸 SCREENSHOT_BASE64_END")
+            payload = {"ok": False, "message": f"Errore prenotazione: {e}"}
+            if RETURN_SCREENSHOT_BASE64 and b64:
+                payload["screenshot_base64"] = b64
 
-            except Exception:
-                path = None
+            return JSONResponse(payload, status_code=200)
 
-            return {"ok": False, "message": f"Errore prenotazione: {e}", "screenshot": path}
         finally:
             await browser.close()
