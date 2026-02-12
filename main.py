@@ -403,8 +403,15 @@ async def book_table(dati: RichiestaPrenotazione):
             try:
                 ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
                 path = f"booking_error_{ts}.png"
-                await page.screenshot(path=path, full_page=True)
-                print(f"📸 Screenshot salvato: {path}")
+                import base64
+
+img = await page.screenshot(full_page=True)
+b64 = base64.b64encode(img).decode()
+
+print("📸 SCREENSHOT_BASE64_START")
+print(b64)
+print("📸 SCREENSHOT_BASE64_END")
+
             except Exception:
                 path = None
 
