@@ -159,11 +159,24 @@ def _norm_orario(s: str) -> str:
     return s
 
 def _calcola_pasto(orario_hhmm: str) -> str:
+    """Determina PRANZO/CENA in base all'orario e valida le fasce.
+    - PRANZO: 12:00–15:00
+    - CENA: 19:00–22:30
+    """
     try:
-        hh = int(orario_hhmm.split(":")[0])
-        return "PRANZO" if hh < 17 else "CENA"
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", (orario_hhmm or "").strip())
+        if not m:
+            return ""
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        tot = hh * 60 + mm
+        if 12 * 60 <= tot <= 15 * 60:
+            return "PRANZO"
+        if 19 * 60 <= tot <= (22 * 60 + 30):
+            return "CENA"
+        return ""
     except Exception:
-        return "CENA"
+        return ""
 
 def _get_data_type(data_str: str) -> str:
     try:
@@ -279,7 +292,7 @@ class RichiestaPrenotazione(BaseModel):
 
         # email fallback (solo se proprio vuota)
         if not values.get("email"):
-            values["email"] = "prenotazione@prenotazione.com"
+            values["email"] = "default@prenotazioni.com"
 
         # nome fallback
         if values.get("nome") is None:
@@ -379,7 +392,7 @@ async def _click_pasto(page, pasto: str):
         return
     await page.locator(f"text=/{pasto}/i").first.click(timeout=8000, force=True)
 
-async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
+async def _scrape_sedi_availability(page, preferred_sede: str = "") -> List[Dict[str, Any]]:
     """Estrae lista sedi, prezzo e disponibilità turni dalla schermata sedi (STEP 4)."""
     known = ["Appia", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"]
     # Attendi che compaiano i bottoni sede
@@ -432,8 +445,18 @@ async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
         if re.search(r"\bII\s*TURNO\b", txt, flags=re.I):
             turni.append("II TURNO")
         out.append({"nome": name, "prezzo": price, "turni": turni})
-    # Ordina come known
-    order = {n:i for i,n in enumerate(known)}
+    
+    preferred = (preferred_sede or "").strip()
+    # Ordine di fallback "più vicino" in base alla sede scelta
+    proximity = {
+        "Talenti - Roma": ["Talenti - Roma", "Appia", "Ostia Lido", "Palermo", "Reggio Calabria"],
+        "Appia": ["Appia", "Talenti - Roma", "Ostia Lido", "Palermo", "Reggio Calabria"],
+        "Ostia Lido": ["Ostia Lido", "Appia", "Talenti - Roma", "Palermo", "Reggio Calabria"],
+        "Palermo": ["Palermo", "Reggio Calabria", "Appia", "Talenti - Roma", "Ostia Lido"],
+        "Reggio Calabria": ["Reggio Calabria", "Palermo", "Appia", "Talenti - Roma", "Ostia Lido"],
+    }
+    base_order = proximity.get(preferred, ["Appia", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"])
+    order = {n: i for i, n in enumerate(base_order)}
     out.sort(key=lambda x: order.get(x["nome"], 999))
     return out
 
@@ -759,6 +782,10 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
     sede_target = dati.sede
     orario_req = dati.orario
     pasto = _calcola_pasto(orario_req)
+            if not pasto:
+                msg = "Per prenotare: pranzo 12:00–15:00 oppure cena 19:00–22:30. Che orario preferisci?"
+                _log_booking(dati.model_dump(), False, msg)
+                return {"ok": False, "message": msg}
 
     # NOTE: sanificazione richiesta
     note_in = (dati.note or "")
@@ -766,11 +793,11 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
     seggiolini = int(dati.seggiolini or 0)
     telefono = re.sub(r"[^\d]", "", dati.telefono or "")
-    email = dati.email or "prenotazione@prenotazione.com"
+    email = dati.email or "default@prenotazioni.com"
 
     # Memoria clienti: se email è quella di default e ho un’email reale salvata, usa quella
     cust = _get_customer(telefono) if telefono else None
-    if cust and (email == "prenotazione@prenotazione.com") and cust.get("email") and ("@" in cust["email"]):
+    if cust and (email == "default@prenotazioni.com") and cust.get("email") and ("@" in cust["email"]):
         email = cust["email"]
 
     print(
@@ -838,7 +865,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             await _click_pasto(page, pasto)
 
             if fase == "availability":
-                sedi = await _scrape_sedi_availability(page)
+                sedi = await _scrape_sedi_availability(page, sede_target)
                 msg = "Disponibilità rilevata."
                 payload_log = dati.model_dump()
                 payload_log.update({"fase": "availability", "seggiolini": seggiolini})
@@ -985,6 +1012,6 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             payload_log.update({"note": note_in, "seggiolini": seggiolini})
             _log_booking(payload_log, False, str(e))
 
-            return {"ok": False, "message": f"Errore prenotazione: {e}", "screenshot": screenshot_path}
+            return {"ok": False, "message": "Ti prego di attendere qualche secondo, sto verificando la disponibilità.", "screenshot": screenshot_path}
         finally:
             await browser.close()
