@@ -381,7 +381,7 @@ async def _click_pasto(page, pasto: str):
 
 async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
     """Estrae lista sedi, prezzo e disponibilità turni dalla schermata sedi (STEP 4)."""
-    known = ["Appia", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"]
+    known = ["Appia", "Talenti", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"]
     # Attendi che compaiano i bottoni sede
     await page.wait_for_selector(".ristoBtn", state="visible", timeout=15000)
 
@@ -431,9 +431,12 @@ async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
             turni.append("I TURNO")
         if re.search(r"\bII\s*TURNO\b", txt, flags=re.I):
             turni.append("II TURNO")
+        # Canonical name
+        if name.strip().lower() in ("talenti - roma", "talenti"):
+            name = "Talenti"
         out.append({"nome": name, "prezzo": price, "turni": turni})
     # Ordina come known
-    order = {n:i for i,n in enumerate(known)}
+    order = {n:i for i,n in enumerate(["Appia","Reggio Calabria","Talenti","Palermo","Ostia Lido"])}
     out.sort(key=lambda x: order.get(x["nome"], 999))
     return out
 
@@ -838,7 +841,40 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             await _click_pasto(page, pasto)
 
             if fase == "availability":
+                # 1) lista sedi (con eventuali bottoni turno presenti in UI)
                 sedi = await _scrape_sedi_availability(page)
+
+                # 2) se il cliente ha già indicato una sede, entriamo nella sede
+                #    e leggiamo gli orari REALMENTE disponibili dal dropdown (quando presente).
+                sede_selezionata = None
+                orari_disponibili = []
+                orario_richiesto_disponibile = None
+                orario_suggerito = None
+
+                if sede_target and sede_target.strip():
+                    try:
+                        await _click_sede(page, sede_target)
+                        # Se esistono pulsanti I/II TURNO nella UI, scegli in base all'orario richiesto
+                        await _maybe_select_turn(page, pasto, orario_req)
+
+                        opts = await _get_orario_options(page)  # [(value,text)]
+                        for v, t in opts:
+                            tt = (t or "").strip()
+                            if re.match(r"^\d{1,2}:\d{2}$", tt):
+                                hh, mm = tt.split(":")
+                                orari_disponibili.append(f"{int(hh):02d}:{mm}")
+                        orari_disponibili = sorted(set(orari_disponibili))
+
+                        sede_selezionata = sede_target.strip()
+                        if orari_disponibili:
+                            orario_richiesto_disponibile = (orario_req in orari_disponibili)
+                            if not orario_richiesto_disponibile:
+                                options_for_pick = [(o, o) for o in orari_disponibili]
+                                best = _pick_closest_time(orario_req, options_for_pick)
+                                orario_suggerito = best
+                    except Exception:
+                        pass
+
                 msg = "Disponibilità rilevata."
                 payload_log = dati.model_dump()
                 payload_log.update({"fase": "availability", "seggiolini": seggiolini})
@@ -853,6 +889,10 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     "persone": int(dati.persone),
                     "seggiolini": seggiolini,
                     "sedi": sedi,
+                    "sede_selezionata": sede_selezionata,
+                    "orari_disponibili": orari_disponibili,
+                    "orario_richiesto_disponibile": orario_richiesto_disponibile,
+                    "orario_suggerito": orario_suggerito,
                 }
 
             # STEP 4: sede
