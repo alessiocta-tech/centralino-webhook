@@ -214,18 +214,24 @@ def _minutes_to_hhmm(minutes: int) -> str:
 # ============================================================
 
 class RichiestaPrenotazione(BaseModel):
-    nome: str
-    email: Optional[str] = ""
-    telefono: str
+    # fase: "availability" (mostra sedi/turni) oppure "book" (prenota fino in fondo)
+    fase: str = Field("book", description='Fase del flusso: "availability" oppure "book"')
 
-    sede: str
+    # In availability possono essere vuoti; in book sono obbligatori (validati a runtime)
+    nome: Optional[str] = ""
+    email: Optional[str] = ""
+    telefono: Optional[str] = ""
+
+    # In availability può essere vuota; in book è obbligatoria (validata a runtime)
+    sede: Optional[str] = ""
+
     data: str
     orario: str
     persone: Union[int, str] = Field(...)
 
     # seggiolini: 0..5 (se >0 -> click SI e seleziona numero)
     seggiolini: Union[int, str] = 0
-    seggiolone: Optional[bool] = False  # compatibilità prompt (se usi anche questo)
+    seggiolone: Optional[bool] = False  # compatibilità prompt
 
     # accetta sia "note" che "nota"
     note: Optional[str] = Field("", alias="nota")
@@ -240,6 +246,11 @@ class RichiestaPrenotazione(BaseModel):
         # note/nota
         if values.get("note") not in (None, ""):
             values["nota"] = values.get("note")
+
+        # fase normalize
+        if values.get("fase") is None or str(values.get("fase")).strip() == "":
+            values["fase"] = "book"
+        values["fase"] = str(values["fase"]).strip().lower()
 
         # persone
         p = values.get("persone")
@@ -266,12 +277,15 @@ class RichiestaPrenotazione(BaseModel):
         if values.get("telefono") is not None:
             values["telefono"] = re.sub(r"[^\d]", "", str(values["telefono"]))
 
-        # email fallback
+        # email fallback (solo se proprio vuota)
         if not values.get("email"):
             values["email"] = "prenotazione@prenotazione.com"
 
-        return values
+        # nome fallback
+        if values.get("nome") is None:
+            values["nome"] = ""
 
+        return values
 
 # ============================================================
 # PLAYWRIGHT HELPERS
@@ -364,6 +378,91 @@ async def _click_pasto(page, pasto: str):
         await loc.click(timeout=8000, force=True)
         return
     await page.locator(f"text=/{pasto}/i").first.click(timeout=8000, force=True)
+
+async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
+    """Estrae lista sedi, prezzo e disponibilità turni dalla schermata sedi (STEP 4)."""
+    known = ["Appia", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"]
+    # Attendi che compaiano i bottoni sede
+    await page.wait_for_selector(".ristoBtn", state="visible", timeout=15000)
+
+    js = r"""
+    (known) => {
+      function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+      const all = Array.from(document.querySelectorAll('body *'));
+      const hits = [];
+      for (const name of known){
+        const el = all.find(e => norm(e.textContent) === name);
+        if (!el) continue;
+        // risali a un contenitore che contenga anche il prezzo o i turni
+        let node = el;
+        let guard = 0;
+        while (node && guard++ < 12){
+          const t = norm(node.innerText);
+          if (t.includes('€') || /TURNO/i.test(t)) break;
+          node = node.parentElement;
+        }
+        if (!node) continue;
+        const txt = norm(node.innerText);
+        hits.push({name, txt});
+      }
+      // de-dup per name
+      const out = [];
+      const seen = new Set();
+      for (const h of hits){
+        if (seen.has(h.name)) continue;
+        seen.add(h.name);
+        out.push(h);
+      }
+      return out;
+    }
+    """
+    raw = await page.evaluate(js, known)
+
+    out: List[Dict[str, Any]] = []
+    for r in raw:
+        name = r.get("name") or ""
+        txt = r.get("txt") or ""
+        price = None
+        m = re.search(r"(\d{1,3}[\.,]\d{2})\s*€", txt)
+        if m:
+            price = m.group(1).replace(",", ".")
+        turni = []
+        if re.search(r"\bI\s*TURNO\b", txt, flags=re.I):
+            turni.append("I TURNO")
+        if re.search(r"\bII\s*TURNO\b", txt, flags=re.I):
+            turni.append("II TURNO")
+        out.append({"nome": name, "prezzo": price, "turni": turni})
+    # Ordina come known
+    order = {n:i for i,n in enumerate(known)}
+    out.sort(key=lambda x: order.get(x["nome"], 999))
+    return out
+
+async def _maybe_select_turn(page, pasto: str, orario_req: str):
+    """Se presenti i pulsanti I/II TURNO, seleziona quello coerente con l'orario richiesto."""
+    try:
+        b1 = page.locator("text=/^\s*I\s*TURNO\s*$/i")
+        b2 = page.locator("text=/^\s*II\s*TURNO\s*$/i")
+        has1 = await b1.count() > 0
+        has2 = await b2.count() > 0
+        if not (has1 and has2):
+            return
+
+        hh, mm = [int(x) for x in orario_req.split(":")]
+        mins = hh * 60 + mm
+
+        # euristiche:
+        # - cena: II turno da 21:30 in poi
+        # - pranzo: II turno da 14:30 in poi (se esiste)
+        if pasto == "cena":
+            choose_second = mins >= (21 * 60 + 30)
+        else:
+            choose_second = mins >= (14 * 60 + 30)
+
+        target = b2 if choose_second else b1
+        await target.first.click(timeout=5000, force=True)
+        await page.wait_for_timeout(300)
+    except Exception:
+        return
 
 def _match_sede_text(sede_target: str) -> List[str]:
     base = sede_target.strip()
@@ -629,6 +728,34 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
         _log_booking(dati.model_dump(), False, msg)
         return {"ok": False, "message": msg}
 
+    fase = (dati.fase or "book").strip().lower()
+    if fase not in ("availability", "book"):
+        msg = f'Valore fase non valido: {dati.fase}. Usa "availability" oppure "book".'
+        _log_booking(dati.model_dump(), False, msg)
+        return {"ok": False, "message": msg}
+
+    # Regola operativa: oltre 9 persone gestiamo con operatore umano (tavolate)
+    if int(dati.persone) > 9:
+        msg = "Per tavoli da più di 9 persone gestiamo una divisione gruppi: contatta il centralino 06 56556 263."
+        _log_booking(dati.model_dump(), False, msg)
+        return {"ok": False, "message": msg, "handoff": True, "phone": "06 56556 263"}
+
+    # In fase book, i dati cliente e la sede sono obbligatori
+    if fase == "book":
+        if not (dati.sede or "").strip():
+            msg = "Sede mancante."
+            _log_booking(dati.model_dump(), False, msg)
+            return {"ok": False, "message": msg}
+        if not (dati.nome or "").strip():
+            msg = "Nome mancante."
+            _log_booking(dati.model_dump(), False, msg)
+            return {"ok": False, "message": msg}
+        tel_clean = re.sub(r"[^\d]", "", dati.telefono or "")
+        if len(tel_clean) < 6:
+            msg = "Telefono mancante o non valido."
+            _log_booking(dati.model_dump(), False, msg)
+            return {"ok": False, "message": msg}
+
     sede_target = dati.sede
     orario_req = dati.orario
     pasto = _calcola_pasto(orario_req)
@@ -710,8 +837,28 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             # STEP 3: pasto
             await _click_pasto(page, pasto)
 
+            if fase == "availability":
+                sedi = await _scrape_sedi_availability(page)
+                msg = "Disponibilità rilevata."
+                payload_log = dati.model_dump()
+                payload_log.update({"fase": "availability", "seggiolini": seggiolini})
+                _log_booking(payload_log, True, msg)
+                return {
+                    "ok": True,
+                    "fase": "availability",
+                    "message": msg,
+                    "data": dati.data,
+                    "orario_richiesto": orario_req,
+                    "pasto": pasto,
+                    "persone": int(dati.persone),
+                    "seggiolini": seggiolini,
+                    "sedi": sedi,
+                }
+
             # STEP 4: sede
             await _click_sede(page, sede_target)
+            await _maybe_select_turn(page, pasto, orario_req)
+
 
             # STEP 5: orario (con retry intelligente)
             selected_orario_value = None
