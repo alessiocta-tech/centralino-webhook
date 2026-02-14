@@ -889,7 +889,9 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 _log_booking(payload_log, True, msg)
                 return {"ok": True, "message": msg, "note": note_in, "seggiolini": seggiolini, "fallback_time": used_fallback}
 
+            
             # Submit con retry se ajax.php risponde con “pieno/non disponibile”
+            # IMPORTANT: non considerare mai "ok" se non abbiamo una conferma dal sistema.
             submit_attempts = 0
             while True:
                 submit_attempts += 1
@@ -897,25 +899,32 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 last_ajax_result["text"] = ""
 
                 await _click_prenota(page)
-                await page.wait_for_timeout(2000)
 
-                ajax_txt = last_ajax_result["text"]
-                # Su questo sito spesso data == 'OK'. Se non intercettiamo ajax, ci basiamo sul fatto che non esplode.
-                ok = (ajax_txt == "OK") or (ajax_txt == "")  # "" = non visto, trattiamolo come ok “best effort”
+                # Attendi la risposta AJAX (fino a ~6s)
+                for _ in range(12):
+                    if last_ajax_result["seen"]:
+                        break
+                    await page.wait_for_timeout(500)
 
-                if ok and ajax_txt != "":
-                    # success “reale”
-                    break
+                if not last_ajax_result["seen"]:
+                    raise RuntimeError("Prenotazione NON confermata: nessuna risposta dal sistema (AJAX non intercettato).")
 
-                if ajax_txt and _looks_like_full_slot(ajax_txt) and submit_attempts <= MAX_SUBMIT_RETRIES:
-                    # prova un altro orario (più vicino disponibile rimasto)
+                ajax_txt = (last_ajax_result["text"] or "").strip()
+
+                if ajax_txt == "OK":
+                    break  # success “reale”
+
+                # Slot pieno: retry su altro orario (se previsto)
+                if _looks_like_full_slot(ajax_txt) and submit_attempts <= MAX_SUBMIT_RETRIES:
                     options = await _get_orario_options(page)
-                    # rimuovi quello appena usato
                     options = [(v, t) for (v, t) in options if v != selected_orario_value]
                     best = _pick_closest_time(orario_req, options)
                     if not best:
-                        raise RuntimeError(f"Slot pieno e nessun orario alternativo entro {RETRY_TIME_WINDOW_MIN} min. Msg: {ajax_txt}")
-                    # torna a step5 (più semplice: ricarica pagina e rifai flusso fino all’orario)
+                        raise RuntimeError(
+                            f"Slot pieno e nessun orario alternativo entro {RETRY_TIME_WINDOW_MIN} min. Msg: {ajax_txt}"
+                        )
+
+                    # Torna a inizio flusso e riprova con nuovo orario
                     await page.goto(BOOKING_URL, wait_until="domcontentloaded")
                     await _maybe_click_cookie(page)
                     await _wait_ready(page)
@@ -932,11 +941,9 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     await _fill_form(page, dati.nome, email, telefono)
                     continue
 
-                # se ajax dice errore non “pieno”
-                if ajax_txt and ajax_txt != "OK":
-                    raise RuntimeError(f"Errore dal sito: {ajax_txt}")
+                # Errore esplicito dal sito
+                raise RuntimeError(f"Errore dal sito: {ajax_txt}")
 
-                break
 
             # Salvataggio memoria clienti
             if telefono:
