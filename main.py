@@ -199,6 +199,40 @@ def _normalize_sede(s: str) -> str:
     return mapping.get(s0, (s or "").strip())
 
 
+
+
+def _suggest_alternative_sedi(target: str, sedi: List[Dict[str, Any]]) -> List[str]:
+    """Suggerisce sedi alternative in ordine di vicinanza (mapping semplice).
+
+    Ritorna solo sedi NON esaurite, se l'informazione è disponibile.
+    """
+    target_n = _normalize_sede(target)
+    order_map = {
+        "Talenti - Roma": ["Appia", "Ostia Lido", "Palermo", "Reggio Calabria"],
+        "Appia": ["Talenti - Roma", "Ostia Lido", "Palermo", "Reggio Calabria"],
+        "Ostia Lido": ["Talenti - Roma", "Appia", "Palermo", "Reggio Calabria"],
+        "Palermo": ["Reggio Calabria", "Talenti - Roma", "Appia", "Ostia Lido"],
+        "Reggio Calabria": ["Palermo", "Talenti - Roma", "Appia", "Ostia Lido"],
+    }
+    pref = order_map.get(target_n, [])
+    # mappa sold-out
+    sold = { _normalize_sede(x.get("nome","")): bool(x.get("tutto_esaurito")) for x in (sedi or []) }
+    out: List[str] = []
+    for s in pref:
+        if sold.get(_normalize_sede(s), False):
+            continue
+        out.append(s)
+    # fallback: tutte le altre non esaurite
+    for x in (sedi or []):
+        n = _normalize_sede(x.get("nome",""))
+        if n == target_n:
+            continue
+        if sold.get(n, False):
+            continue
+        if n not in map(_normalize_sede, out):
+            out.append(x.get("nome") or n)
+    return out
+
 def _time_to_minutes(hhmm: str) -> Optional[int]:
     m = re.fullmatch(r"(\d{2}):(\d{2})", hhmm or "")
     if not m:
@@ -385,65 +419,90 @@ async def _click_pasto(page, pasto: str):
     await page.locator(f"text=/{pasto}/i").first.click(timeout=8000, force=True)
 
 async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
-    """Estrae lista sedi, prezzo e disponibilità turni dalla schermata sedi (STEP 4)."""
+    """Estrae lista sedi, prezzo, turni e stato (esaurito) dalla schermata sedi (STEP 4).
+
+    Nota: la lista viene caricata dentro .ristoCont via .load('prenew_rist.php?...').
+    """
     known = ["Appia", "Talenti", "Talenti - Roma", "Reggio Calabria", "Ostia Lido", "Palermo"]
-    # Attendi che compaiano i bottoni sede
-    await page.wait_for_selector(".ristoBtn", state="visible", timeout=15000)
+
+    # Attende che la lista venga popolata (non basta che la step4 sia visibile)
+    await page.wait_for_selector(".ristoCont", state="visible", timeout=20000)
+    # Attende che compaia almeno un nome sede nel testo della lista
+    await page.wait_for_function(
+        """(names)=>{
+          const root=document.querySelector('.ristoCont');
+          if(!root) return false;
+          const t=(root.innerText||'').replace(/\s+/g,' ').toLowerCase();
+          return names.some(n=>t.includes(n.toLowerCase().replace(' - roma','')));
+        }""",
+        [n for n in known],
+        timeout=20000,
+    )
 
     js = r"""
     (known) => {
       function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
-      const all = Array.from(document.querySelectorAll('body *'));
-      const hits = [];
+      const root = document.querySelector('.ristoCont') || document.body;
+      const all = Array.from(root.querySelectorAll('*'));
+      const out = [];
+
+      function findExact(name){
+        const n = norm(name);
+        let el = all.find(e => norm(e.textContent) === n);
+        if (el) return el;
+        const low = n.toLowerCase();
+        return all.find(e => norm(e.textContent).toLowerCase() === low);
+      }
+
       for (const name of known){
-        const el = all.find(e => norm(e.textContent) === name);
+        const el = findExact(name);
         if (!el) continue;
-        // risali a un contenitore che contenga anche il prezzo o i turni
+        // risali a un contenitore "card" che contenga anche prezzo/turni/esaurito
         let node = el;
         let guard = 0;
-        while (node && guard++ < 12){
+        while (node && guard++ < 14){
           const t = norm(node.innerText);
-          if (t.includes('€') || /TURNO/i.test(t)) break;
+          if (t.includes('€') || /TURNO/i.test(t) || /ESAURITO/i.test(t)) break;
           node = node.parentElement;
         }
         if (!node) continue;
         const txt = norm(node.innerText);
-        hits.push({name, txt});
+        out.push({ name, txt });
       }
-      // de-dup per name
-      const out = [];
+
+      // de-dup per name (prima occorrenza)
       const seen = new Set();
-      for (const h of hits){
-        if (seen.has(h.name)) continue;
-        seen.add(h.name);
-        out.push(h);
-      }
-      return out;
+      return out.filter(o => { if(seen.has(o.name)) return false; seen.add(o.name); return true; });
     }
     """
     raw = await page.evaluate(js, known)
 
     out: List[Dict[str, Any]] = []
     for r in raw:
-        name = r.get("name") or ""
-        txt = r.get("txt") or ""
+        name = (r.get("name") or "").strip()
+        txt = (r.get("txt") or "")
+
+        if name.lower() in ("talenti - roma", "talenti"):
+            name = "Talenti"
+
         price = None
         m = re.search(r"(\d{1,3}[\.,]\d{2})\s*€", txt)
         if m:
             price = m.group(1).replace(",", ".")
-        turni = []
+
+        sold_out = bool(re.search(r"TUTTO\s*ESAURITO", txt, flags=re.I))
+        turni: List[str] = []
         if re.search(r"\bI\s*TURNO\b", txt, flags=re.I):
             turni.append("I TURNO")
         if re.search(r"\bII\s*TURNO\b", txt, flags=re.I):
             turni.append("II TURNO")
-        # Canonical name
-        if name.strip().lower() in ("talenti - roma", "talenti"):
-            name = "Talenti"
-        out.append({"nome": name, "prezzo": price, "turni": turni})
-    # Ordina come known
-    order = {n:i for i,n in enumerate(["Appia","Reggio Calabria","Talenti","Palermo","Ostia Lido"])}
+
+        out.append({"nome": name, "prezzo": price, "turni": turni, "tutto_esaurito": sold_out})
+
+    order = {n: i for i, n in enumerate(["Appia", "Talenti", "Ostia Lido", "Palermo", "Reggio Calabria"])}
     out.sort(key=lambda x: order.get(x["nome"], 999))
     return out
+
 
 async def _maybe_select_turn(page, pasto: str, orario_req: str):
     """Se presenti i pulsanti I/II TURNO, seleziona quello coerente con l'orario richiesto."""
@@ -485,16 +544,46 @@ def _match_sede_text(sede_target: str) -> List[str]:
             out.append(c)
     return out
 
-async def _click_sede(page, sede_target: str):
-    await page.wait_for_selector(".ristoBtn", state="visible", timeout=PW_TIMEOUT_MS)
+async def _click_sede(page, sede_target: str) -> bool:
+    """Clicca la sede scelta nella lista (STEP 4).
 
-    for cand in _match_sede_text(sede_target):
-        loc = page.locator(".ristoBtn", has_text=cand).first
-        if await loc.count() > 0:
-            await loc.click(timeout=10000, force=True)
-            return
+    Ritorna True se il click è andato a buon fine, False se non trova un elemento cliccabile.
+    """
+    target = _normalize_sede(sede_target)
 
-    raise RuntimeError(f"Sede non trovata: '{sede_target}'")
+    await page.wait_for_selector(".ristoCont", state="visible", timeout=20000)
+
+    # 1) percorso principale: bottoni con classe ristoBtn
+    btns = page.locator(".ristoBtn")
+    count = await btns.count()
+    for i in range(count):
+        b = btns.nth(i)
+        txt = _normalize_sede((await b.inner_text()) if await b.is_visible() else "")
+        if txt == target:
+            await b.click()
+            return True
+
+    # 2) fallback: cerca un elemento che contenga il nome e clicca il contenitore più vicino
+    # (utile se l'HTML della lista cambia)
+    locator = page.locator(f"xpath=//*[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyzàèéìòù', 'ABCDEFGHIJKLMNOPQRSTUVWXYZÀÈÉÌÒÙ'), '{target.upper()}')]")
+    try:
+        if await locator.count() > 0:
+            el = locator.first
+            # prova click diretto, poi risali
+            try:
+                await el.click()
+                return True
+            except Exception:
+                # risali a un ancestor cliccabile
+                anc = el.locator("xpath=ancestor-or-self::*[self::a or self::button or @onclick][1]")
+                if await anc.count() > 0:
+                    await anc.first.click()
+                    return True
+    except Exception:
+        pass
+
+    return False
+
 
 async def _select_orario_value(page, hhmm: str) -> bool:
     """Seleziona #OraPren accettando option con value o testo che inizia con HH:MM."""
@@ -948,85 +1037,126 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             await _click_pasto(page, pasto)
 
             if fase == "availability":
-                # 1) lista sedi (con eventuali bottoni turno presenti in UI)
+                # 1) Sempre: estrai lista sedi (con eventuale "TUTTO ESAURITO")
                 sedi = await _scrape_sedi_availability(page)
 
-                # 2) se il cliente ha già indicato una sede, entriamo nella sede
-                #    e leggiamo gli orari REALMENTE disponibili dal dropdown (quando presente).
-                sede_selezionata = None
-                orari_disponibili = []
-                orario_richiesto_disponibile = None
-                orario_suggerito = None
-                time_read_error = None
+                # 2) Arricchisci con info doppi turni (regole interne, indipendenti dal sito)
+                try:
+                    dt = datetime.fromisoformat(data).date()
+                    weekday = dt.weekday()  # 0=lun ... 5=sab 6=dom
+                except Exception:
+                    weekday = None
 
-                if sede_target and sede_target.strip():
-                    try:
-                        clicked = await _click_sede(page, sede_target)
-                        if not clicked:
-                            return {
-                                "ok": True,
-                                "fase": "availability",
-                                "sedi": [{"nome": sede_target, "sold_out": True}],
-                                "orari_disponibili": [],
-                                "orario_richiesto_disponibile": False,
-                                "orario_suggerito": "",
-                            }
-                        # Porta in vista il selettore orario (alcune UI caricano le option solo dopo scroll/click)
-                        try:
-                            await page.locator('#OraPren').scroll_into_view_if_needed(timeout=3000)
-                        except Exception:
-                            pass
-                        # Se esistono pulsanti I/II TURNO nella UI, scegli in base all'orario richiesto
-                        await _maybe_select_turn(page, pasto, orario_req)
+                def has_doppi_turni(nome: str) -> bool:
+                    n = (nome or "").strip().lower()
+                    # Ostia: mai doppi turni
+                    if n in ("ostia", "ostia lido"):
+                        return False
+                    # Talenti: ven/sab cena + sab/dom pranzo
+                    if n == "talenti":
+                        if pasto == "PRANZO":
+                            return weekday in (5, 6)  # sab, dom
+                        if pasto == "CENA":
+                            return weekday in (4, 5)  # ven, sab
+                        return False
+                    # Reggio Calabria / Palermo / Appia: sab/dom pranzo
+                    if n in ("reggio calabria", "palermo", "appia"):
+                        return pasto == "PRANZO" and weekday in (5, 6)
+                    return False
 
-                        opts = await _get_orario_options(page)  # [(value,text)]
-                        for v, t in opts:
-                            tt = (t or "").strip()
-                            if re.match(r"^\d{1,2}:\d{2}$", tt):
-                                hh, mm = tt.split(":")
-                                orari_disponibili.append(f"{int(hh):02d}:{mm}")
-                        orari_disponibili = sorted(set(orari_disponibili))
+                for s in sedi:
+                    s["doppi_turni_previsti"] = has_doppi_turni(s.get("nome"))
 
-                        sede_selezionata = sede_target.strip()
-                        if orari_disponibili:
-                            orario_richiesto_disponibile = (orario_req in orari_disponibili)
-                            if not orario_richiesto_disponibile:
-                                options_for_pick = [(o, o) for o in orari_disponibili]
-                                best = _pick_closest_time(orario_req, options_for_pick)
-                                orario_suggerito = best
-                    except Exception as e:
-                        orari_disponibili = []
-                        orario_richiesto_disponibile = None
-                        orario_suggerito = None
-                        sede_selezionata = sede_target.strip()
-                        time_read_error = str(e)
+                # 3) Se non è stata indicata la sede: ritorna lista sedi subito (serve al bot per chiedere la sede)
+                target = _normalize_sede(sede)
+                if not target:
+                    return {
+                        "ok": True,
+                        "fase": "choose_sede",
+                        "pasto": pasto,
+                        "data": data,
+                        "orario": orario,
+                        "pax": pax,
+                        "sedi": sedi,
+                    }
 
-                msg = "Disponibilità rilevata."
-                payload_log = dati.model_dump()
-                payload_log.update({"fase": "availability", "seggiolini": seggiolini})
-                _log_booking(payload_log, True, msg)
+                # 4) Se sede indicata: se è tutta esaurita lo segnaliamo senza entrare nel dropdown orari
+                target_entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == target), None)
+                if target_entry and target_entry.get("tutto_esaurito"):
+                    return {
+                        "ok": True,
+                        "fase": "sede_esaurita",
+                        "pasto": pasto,
+                        "data": data,
+                        "orario": orario,
+                        "pax": pax,
+                        "sedi": sedi,
+                        "sede": target_entry.get("nome"),
+                        "tutto_esaurito": True,
+                    }
+
+                # 5) Altrimenti: entra nella sede e legge gli orari disponibili
+                await _click_sede(page, target)
+
+                options = await _read_orari_options(page)
+                # Filtra: solo orari nella stessa fascia (pranzo/cena) e +- 60 min intorno all'orario richiesto (se presente)
+                candidates = _rank_time_candidates(orario, options)
+
+                # Se in particolare l'orario richiesto è disponibile, mettilo in cima
+                exact_available = any(o.get("value", "").startswith(orario) for o in options)
+
                 return {
                     "ok": True,
                     "fase": "availability",
-                    "message": msg,
-                    "data": dati.data,
-                    "orario_richiesto": orario_req,
                     "pasto": pasto,
-                    "persone": int(dati.persone),
-                    "seggiolini": seggiolini,
+                    "data": data,
+                    "orario": orario,
+                    "pax": pax,
+                    "sede": target,
+                    "exact_available": exact_available,
+                    "orari_disponibili": [c["value"] for c in candidates],
                     "sedi": sedi,
-                    "sede_selezionata": sede_selezionata,
-                    "orari_disponibili": orari_disponibili,
-                    "orario_richiesto_disponibile": orario_richiesto_disponibile,
-                    "orario_suggerito": orario_suggerito,
-                    "time_read_error": time_read_error,
                 }
 
-            # STEP 4: sede
-            clicked = await _click_sede(page, sede_target)
-            if not clicked:
-                return {"ok": False, "status": "SOLD_OUT", "fase": "book", "message": "Sede esaurita"}
-            await _maybe_select_turn(page, pasto, orario_req)
+            # STEP 4: sede (la lista sedi è già visibile in STEP 4)
+                sedi = await _scrape_sedi_availability(page)
+
+                if not sede_target:
+                    return {
+                        "ok": True,
+                        "fase": "choose_sede",
+                        "pasto": pasto,
+                        "data": data,
+                        "orario": orario_req,
+                        "pax": pax,
+                        "sedi": sedi,
+                    }
+
+                target_entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == sede_target), None)
+                if target_entry and target_entry.get("tutto_esaurito"):
+                    return {
+                        "ok": False,
+                        "status": "SOLD_OUT",
+                        "fase": "book",
+                        "message": "Sede esaurita",
+                        "sede": target_entry.get("nome") or sede_target,
+                        "alternative": _suggest_alternative_sedi(target_entry.get("nome") or sede_target, sedi),
+                        "sedi": sedi,
+                    }
+
+                clicked = await _click_sede(page, sede_target)
+                if not clicked:
+                    return {
+                        "ok": False,
+                        "status": "SOLD_OUT",
+                        "fase": "book",
+                        "message": "Sede esaurita",
+                        "sede": sede_target,
+                        "alternative": _suggest_alternative_sedi(sede_target, sedi),
+                        "sedi": sedi,
+                    }
+
+                await _maybe_select_turn(page, pasto, orario_req)
 
 
             # STEP 5: orario (con retry intelligente)
