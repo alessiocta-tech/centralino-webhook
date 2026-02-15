@@ -1102,16 +1102,18 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     await _set_date(page, dati.data)
                     await _click_pasto(page, pasto)
                     clicked = await _click_sede(page, sede_target)
-            if not clicked:
-                return {"ok": False, "status": "SOLD_OUT", "fase": "book", "message": "Sede esaurita"}
-                    await page.locator("#OraPren").select_option(value=best)
+                    if not clicked:
+                        return {"ok": False, "status": "SOLD_OUT", "fase": "book", "message": "Sede esaurita"}
+
+                    ok_sel = await _select_orario_value(page, best)
+                    if not ok_sel:
+                        raise RuntimeError(f"Impossibile selezionare l'orario fallback: {best}")
                     selected_orario_value = best
                     used_fallback = True
                     await _fill_note_step5_strong(page, note_in)
                     await _click_conferma(page)
-                    await _fill_form(page, dati.nome, email, telefono)
+                    await _fill_form(page, dati.nome, "", email, telefono)
                     continue
-
                 # Alcuni siti rispondono con codici brevi (es. MS_PS) quando manca un consenso.
                 if ajax_txt and re.fullmatch(r"[A-Z_]{4,10}", ajax_txt) and submit_attempts <= (MAX_SUBMIT_RETRIES + 1):
                     # Prova a (ri)spuntare consensi e ripetere una volta
