@@ -178,6 +178,10 @@ def _get_data_type(data_str: str) -> str:
     except Exception:
         return "Altra"
 
+def _is_sold_out_text(txt: str) -> bool:
+    t = (txt or "").upper()
+    return ("TUTTO ESAURITO" in t) or ("ESAURITO" in t)
+
 def _normalize_sede(s: str) -> str:
     s0 = (s or "").strip().lower()
     mapping = {
@@ -219,6 +223,7 @@ class RichiestaPrenotazione(BaseModel):
 
     # In availability possono essere vuoti; in book sono obbligatori (validati a runtime)
     nome: Optional[str] = ""
+    cognome: Optional[str] = ""
     email: Optional[str] = ""
     telefono: Optional[str] = ""
 
@@ -279,7 +284,7 @@ class RichiestaPrenotazione(BaseModel):
 
         # email fallback (solo se proprio vuota)
         if not values.get("email"):
-            values["email"] = "prenotazione@prenotazione.com"
+            values["email"] = "default@prenotazioni.com"
 
         # nome fallback
         if values.get("nome") is None:
@@ -491,6 +496,50 @@ async def _click_sede(page, sede_target: str):
 
     raise RuntimeError(f"Sede non trovata: '{sede_target}'")
 
+async def _select_orario_value(page, hhmm: str) -> bool:
+    """Seleziona #OraPren accettando option con value o testo che inizia con HH:MM."""
+    await page.wait_for_selector("#OraPren", timeout=15000)
+    try:
+        await page.locator("#OraPren").scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        await page.click("#OraPren")
+    except Exception:
+        pass
+    await page.wait_for_timeout(200)
+
+    opts = await page.query_selector_all("#OraPren option")
+    target_val = None
+    target_label = None
+    for opt in opts:
+        try:
+            val = (await opt.get_attribute("value")) or ""
+            txt = (await opt.inner_text()) or ""
+        except Exception:
+            continue
+        val = val.strip()
+        txt = txt.strip()
+        if not val and "SCEGLI" in txt.upper():
+            continue
+        if val.startswith(hhmm) or txt.startswith(hhmm):
+            target_val = val
+            target_label = txt
+            break
+
+    if target_val is None and target_label is None:
+        return False
+
+    try:
+        if target_val:
+            await page.select_option("#OraPren", value=target_val)
+        else:
+            await page.select_option("#OraPren", label=target_label)
+    except Exception:
+        return False
+    await page.wait_for_timeout(150)
+    return True
+
 async def _get_orario_options(page) -> List[Tuple[str, str]]:
     """Return options from the time dropdown.
     Some deployments render <option value="">19:00</option>.
@@ -647,7 +696,7 @@ async def _click_conferma(page):
         return
     await page.locator("text=/CONFERMA/i").first.click(timeout=8000, force=True)
 
-async def _fill_form(page, nome: str, email: str, telefono: str):
+async def _fill_form(page, nome: str, cognome: str, email: str, telefono: str):
     parti = (nome or "").strip().split(" ", 1)
     nome1 = parti[0] if parti else (nome or "Cliente")
     cognome = parti[1] if len(parti) > 1 else "Cliente"
@@ -912,7 +961,16 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
                 if sede_target and sede_target.strip():
                     try:
-                        await _click_sede(page, sede_target)
+                        clicked = await _click_sede(page, sede_target)
+                        if not clicked:
+                            return {
+                                "ok": True,
+                                "fase": "availability",
+                                "sedi": [{"nome": sede_target, "sold_out": True}],
+                                "orari_disponibili": [],
+                                "orario_richiesto_disponibile": False,
+                                "orario_suggerito": "",
+                            }
                         # Porta in vista il selettore orario (alcune UI caricano le option solo dopo scroll/click)
                         try:
                             await page.locator('#OraPren').scroll_into_view_if_needed(timeout=3000)
@@ -965,7 +1023,9 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 }
 
             # STEP 4: sede
-            await _click_sede(page, sede_target)
+            clicked = await _click_sede(page, sede_target)
+            if not clicked:
+                return {"ok": False, "status": "SOLD_OUT", "fase": "book", "message": "Sede esaurita"}
             await _maybe_select_turn(page, pasto, orario_req)
 
 
@@ -1041,7 +1101,9 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     await _set_seggiolini(page, seggiolini)
                     await _set_date(page, dati.data)
                     await _click_pasto(page, pasto)
-                    await _click_sede(page, sede_target)
+                    clicked = await _click_sede(page, sede_target)
+            if not clicked:
+                return {"ok": False, "status": "SOLD_OUT", "fase": "book", "message": "Sede esaurita"}
                     await page.locator("#OraPren").select_option(value=best)
                     selected_orario_value = best
                     used_fallback = True
