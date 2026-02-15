@@ -492,22 +492,44 @@ async def _click_sede(page, sede_target: str):
     raise RuntimeError(f"Sede non trovata: '{sede_target}'")
 
 async def _get_orario_options(page) -> List[Tuple[str, str]]:
-    # returns [(value, text)]
+    """Return options from the time dropdown.
+    Some deployments render <option value="">19:00</option>.
+    We keep options even when value is empty, using text as a fallback.
+    Returns [(value_or_text, text)].
+    """
+    # Ensure the select exists and is populated
+    await page.wait_for_selector("#OraPren", state="visible", timeout=PW_TIMEOUT_MS)
+    try:
+        # Trigger possible lazy-population
+        await page.click("#OraPren", timeout=3000)
+    except Exception:
+        pass
+
+    try:
+        await page.wait_for_selector("#OraPren option", timeout=PW_TIMEOUT_MS)
+    except Exception:
+        # If options are not present, return empty list (caller decides)
+        return []
+
     opts = await page.evaluate(
         """() => {
           const sel = document.querySelector('#OraPren');
           if (!sel) return [];
           return Array.from(sel.options)
-            .filter(o => !o.disabled && (o.value || '').trim() !== '')
-            .map(o => ({value: o.value, text: (o.textContent||'').trim()}));
+            .filter(o => !o.disabled)
+            .map(o => ({value: (o.value||'').trim(), text: (o.textContent||'').trim()}));
         }"""
     )
+
     out: List[Tuple[str, str]] = []
     for o in opts:
         v = (o.get("value") or "").strip()
         t = (o.get("text") or "").strip()
-        if v:
-            out.append((v, t))
+        if not t:
+            continue
+        # Keep only time-like entries
+        if re.match(r"^\d{1,2}:\d{2}$", t):
+            out.append(((v or t).strip(), t))
     return out
 
 def _pick_closest_time(target_hhmm: str, options: List[Tuple[str, str]]) -> Optional[str]:
@@ -850,6 +872,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 orari_disponibili = []
                 orario_richiesto_disponibile = None
                 orario_suggerito = None
+                time_read_error = None
 
                 if sede_target and sede_target.strip():
                     try:
@@ -872,8 +895,12 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                                 options_for_pick = [(o, o) for o in orari_disponibili]
                                 best = _pick_closest_time(orario_req, options_for_pick)
                                 orario_suggerito = best
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        orari_disponibili = []
+                        orario_richiesto_disponibile = None
+                        orario_suggerito = None
+                        sede_selezionata = sede_target.strip()
+                        time_read_error = str(e)
 
                 msg = "Disponibilità rilevata."
                 payload_log = dati.model_dump()
@@ -893,6 +920,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     "orari_disponibili": orari_disponibili,
                     "orario_richiesto_disponibile": orario_richiesto_disponibile,
                     "orario_suggerito": orario_suggerito,
+                    "time_read_error": time_read_error,
                 }
 
             # STEP 4: sede
