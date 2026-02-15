@@ -955,8 +955,10 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             _log_booking(dati.model_dump(), False, msg)
             return {"ok": False, "message": msg}
 
-    sede_target = dati.sede
-    orario_req = dati.orario
+    sede_target = (dati.sede or "").strip()
+    orario_req = (dati.orario or "").strip()
+    data_req = (dati.data or "").strip()
+    pax_req = int(dati.persone)
     pasto = _calcola_pasto(orario_req)
 
     # NOTE: sanificazione richiesta
@@ -972,9 +974,10 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
     if cust and (email == "default@prenotazioni.com") and cust.get("email") and ("@" in cust["email"]):
         email = cust["email"]
 
+    # Log sintetico
     print(
-        f"🚀 BOOKING: {dati.nome} -> {sede_target} | {dati.data} {orario_req} | "
-        f"pax={dati.persone} | pasto={pasto} | seggiolini={seggiolini} | note='{note_in}'"
+        f"🚀 BOOKING: fase={fase} | sede='{sede_target or '-'}' | {data_req} {orario_req} | "
+        f"pax={pax_req} | pasto={pasto} | seggiolini={seggiolini}"
     )
 
     async with async_playwright() as p:
@@ -1031,33 +1034,37 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             await _set_seggiolini(page, seggiolini)
 
             # STEP 2: data
-            await _set_date(page, dati.data)
+            await _set_date(page, data_req)
 
             # STEP 3: pasto
             await _click_pasto(page, pasto)
 
+            # ============================================================
+            # MODALITÀ AVAILABILITY
+            # - Se sede NON indicata: torna subito la lista sedi (con flag TUTTO ESAURITO e info doppi turni)
+            # - Se sede indicata: entra nella sede, legge dropdown orari e torna orari disponibili
+            # ============================================================
             if fase == "availability":
-                # 1) Sempre: estrai lista sedi (con eventuale "TUTTO ESAURITO")
                 sedi = await _scrape_sedi_availability(page)
 
-                # 2) Arricchisci con info doppi turni (regole interne, indipendenti dal sito)
+                # Arricchisci con regole doppi turni (indipendenti dal sito)
+                weekday = None
                 try:
-                    dt = datetime.fromisoformat(data).date()
-                    weekday = dt.weekday()  # 0=lun ... 5=sab 6=dom
+                    weekday = datetime.fromisoformat(data_req).date().weekday()  # 0=lun ... 5=sab 6=dom
                 except Exception:
-                    weekday = None
+                    pass
 
-                def has_doppi_turni(nome: str) -> bool:
+                def _doppi_turni_previsti(nome: str) -> bool:
                     n = (nome or "").strip().lower()
                     # Ostia: mai doppi turni
                     if n in ("ostia", "ostia lido"):
                         return False
-                    # Talenti: ven/sab cena + sab/dom pranzo
+                    # Talenti: sab/dom pranzo + ven/sab cena
                     if n == "talenti":
                         if pasto == "PRANZO":
-                            return weekday in (5, 6)  # sab, dom
+                            return weekday in (5, 6)
                         if pasto == "CENA":
-                            return weekday in (4, 5)  # ven, sab
+                            return weekday in (4, 5)
                         return False
                     # Reggio Calabria / Palermo / Appia: sab/dom pranzo
                     if n in ("reggio calabria", "palermo", "appia"):
@@ -1065,98 +1072,101 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     return False
 
                 for s in sedi:
-                    s["doppi_turni_previsti"] = has_doppi_turni(s.get("nome"))
+                    s["doppi_turni_previsti"] = _doppi_turni_previsti(s.get("nome"))
 
-                # 3) Se non è stata indicata la sede: ritorna lista sedi subito (serve al bot per chiedere la sede)
-                target = _normalize_sede(sede)
-                if not target:
-                    return {
-                        "ok": True,
-                        "fase": "choose_sede",
-                        "pasto": pasto,
-                        "data": data,
-                        "orario": orario,
-                        "pax": pax,
-                        "sedi": sedi,
-                    }
-
-                # 4) Se sede indicata: se è tutta esaurita lo segnaliamo senza entrare nel dropdown orari
-                target_entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == target), None)
-                if target_entry and target_entry.get("tutto_esaurito"):
-                    return {
-                        "ok": True,
-                        "fase": "sede_esaurita",
-                        "pasto": pasto,
-                        "data": data,
-                        "orario": orario,
-                        "pax": pax,
-                        "sedi": sedi,
-                        "sede": target_entry.get("nome"),
-                        "tutto_esaurito": True,
-                    }
-
-                # 5) Altrimenti: entra nella sede e legge gli orari disponibili
-                await _click_sede(page, target)
-
-                options = await _read_orari_options(page)
-                # Filtra: solo orari nella stessa fascia (pranzo/cena) e +- 60 min intorno all'orario richiesto (se presente)
-                candidates = _rank_time_candidates(orario, options)
-
-                # Se in particolare l'orario richiesto è disponibile, mettilo in cima
-                exact_available = any(o.get("value", "").startswith(orario) for o in options)
-
-                return {
-                    "ok": True,
-                    "fase": "availability",
-                    "pasto": pasto,
-                    "data": data,
-                    "orario": orario,
-                    "pax": pax,
-                    "sede": target,
-                    "exact_available": exact_available,
-                    "orari_disponibili": [c["value"] for c in candidates],
-                    "sedi": sedi,
-                }
-
-            # STEP 4: sede (la lista sedi è già visibile in STEP 4)
-                sedi = await _scrape_sedi_availability(page)
-
+                # Se la sede non è stata ancora scelta, ritorna l'elenco (serve al bot)
                 if not sede_target:
                     return {
                         "ok": True,
                         "fase": "choose_sede",
                         "pasto": pasto,
-                        "data": data,
+                        "data": data_req,
                         "orario": orario_req,
-                        "pax": pax,
+                        "pax": pax_req,
                         "sedi": sedi,
                     }
 
-                target_entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == sede_target), None)
-                if target_entry and target_entry.get("tutto_esaurito"):
+                target = _normalize_sede(sede_target)
+                entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == target), None)
+                if entry and entry.get("tutto_esaurito"):
                     return {
-                        "ok": False,
-                        "status": "SOLD_OUT",
-                        "fase": "book",
-                        "message": "Sede esaurita",
-                        "sede": target_entry.get("nome") or sede_target,
-                        "alternative": _suggest_alternative_sedi(target_entry.get("nome") or sede_target, sedi),
+                        "ok": True,
+                        "fase": "sede_esaurita",
+                        "pasto": pasto,
+                        "data": data_req,
+                        "orario": orario_req,
+                        "pax": pax_req,
+                        "sede": entry.get("nome") or sede_target,
+                        "tutto_esaurito": True,
+                        "alternative": _suggest_alternative_sedi(entry.get("nome") or sede_target, sedi),
                         "sedi": sedi,
                     }
 
-                clicked = await _click_sede(page, sede_target)
+                clicked = await _click_sede(page, target)
                 if not clicked:
                     return {
-                        "ok": False,
-                        "status": "SOLD_OUT",
-                        "fase": "book",
-                        "message": "Sede esaurita",
+                        "ok": True,
+                        "fase": "sede_esaurita",
+                        "pasto": pasto,
+                        "data": data_req,
+                        "orario": orario_req,
+                        "pax": pax_req,
                         "sede": sede_target,
+                        "tutto_esaurito": True,
                         "alternative": _suggest_alternative_sedi(sede_target, sedi),
                         "sedi": sedi,
                     }
 
-                await _maybe_select_turn(page, pasto, orario_req)
+                options = await _read_orari_options(page)
+                candidates = _rank_time_candidates(orario_req, options)
+                exact_available = any((o.get("value") or "").startswith(orario_req) for o in options)
+                return {
+                    "ok": True,
+                    "fase": "availability",
+                    "pasto": pasto,
+                    "data": data_req,
+                    "orario": orario_req,
+                    "pax": pax_req,
+                    "sede": sede_target,
+                    "exact_available": exact_available,
+                    "orari_disponibili": [c["value"] for c in candidates],
+                    "sedi": sedi,
+                }
+
+            # ============================================================
+            # MODALITÀ BOOK (prenotazione completa)
+            # ============================================================
+
+            # STEP 4: sede
+            sedi = await _scrape_sedi_availability(page)
+            target_entry = next(
+                (x for x in sedi if _normalize_sede(x.get("nome")) == _normalize_sede(sede_target)),
+                None,
+            )
+            if target_entry and target_entry.get("tutto_esaurito"):
+                return {
+                    "ok": False,
+                    "status": "SOLD_OUT",
+                    "fase": "book",
+                    "message": "Sede esaurita",
+                    "sede": target_entry.get("nome") or sede_target,
+                    "alternative": _suggest_alternative_sedi(target_entry.get("nome") or sede_target, sedi),
+                    "sedi": sedi,
+                }
+
+            clicked = await _click_sede(page, _normalize_sede(sede_target))
+            if not clicked:
+                return {
+                    "ok": False,
+                    "status": "SOLD_OUT",
+                    "fase": "book",
+                    "message": "Sede esaurita",
+                    "sede": sede_target,
+                    "alternative": _suggest_alternative_sedi(sede_target, sedi),
+                    "sedi": sedi,
+                }
+
+            await _maybe_select_turn(page, pasto, orario_req)
 
 
             # STEP 5: orario (con retry intelligente)
