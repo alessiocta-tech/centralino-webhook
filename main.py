@@ -658,6 +658,42 @@ async def _fill_form(page, nome: str, email: str, telefono: str):
     await page.locator("#Email").fill(email, timeout=8000)
     await page.locator("#Telefono").fill(telefono, timeout=8000)
 
+    # Consensi/Privacy: alcuni form richiedono checkbox (termini/privacy/consenso)
+    try:
+        boxes = page.locator("#prenoForm input[type=checkbox]")
+        n = await boxes.count()
+        for i in range(n):
+            b = boxes.nth(i)
+            # se già spuntato, continua
+            try:
+                checked = await b.is_checked()
+            except Exception:
+                checked = False
+            if checked:
+                continue
+            # prova a capire se è rilevante (required / termini / privacy / consenso)
+            name = (await b.get_attribute("name") or "").lower()
+            _id = (await b.get_attribute("id") or "").lower()
+            req = await b.get_attribute("required")
+            is_relevant = bool(req) or any(k in (name + " " + _id) for k in ["privacy", "consenso", "termin", "gdpr", "policy"])
+            if not is_relevant:
+                continue
+            # click sul checkbox o sulla label associata
+            try:
+                await b.scroll_into_view_if_needed()
+                await b.click(timeout=2000, force=True)
+            except Exception:
+                try:
+                    if _id:
+                        lab = page.locator(f'label[for="{_id}"]').first
+                        if await lab.count() > 0:
+                            await lab.click(timeout=2000, force=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 async def _click_prenota(page):
     loc = page.locator('input[type="submit"][value="PRENOTA"]').first
     if await loc.count() > 0:
@@ -791,11 +827,11 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
     seggiolini = int(dati.seggiolini or 0)
     telefono = re.sub(r"[^\d]", "", dati.telefono or "")
-    email = dati.email or "prenotazione@prenotazione.com"
+    email = dati.email or "default@prenotazioni.com"
 
     # Memoria clienti: se email è quella di default e ho un’email reale salvata, usa quella
     cust = _get_customer(telefono) if telefono else None
-    if cust and (email == "prenotazione@prenotazione.com") and cust.get("email") and ("@" in cust["email"]):
+    if cust and (email == "default@prenotazioni.com") and cust.get("email") and ("@" in cust["email"]):
         email = cust["email"]
 
     print(
@@ -877,6 +913,11 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 if sede_target and sede_target.strip():
                     try:
                         await _click_sede(page, sede_target)
+                        # Porta in vista il selettore orario (alcune UI caricano le option solo dopo scroll/click)
+                        try:
+                            await page.locator('#OraPren').scroll_into_view_if_needed(timeout=3000)
+                        except Exception:
+                            pass
                         # Se esistono pulsanti I/II TURNO nella UI, scegli in base all'orario richiesto
                         await _maybe_select_turn(page, pasto, orario_req)
 
@@ -1007,6 +1048,40 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     await _fill_note_step5_strong(page, note_in)
                     await _click_conferma(page)
                     await _fill_form(page, dati.nome, email, telefono)
+                    continue
+
+                # Alcuni siti rispondono con codici brevi (es. MS_PS) quando manca un consenso.
+                if ajax_txt and re.fullmatch(r"[A-Z_]{4,10}", ajax_txt) and submit_attempts <= (MAX_SUBMIT_RETRIES + 1):
+                    # Prova a (ri)spuntare consensi e ripetere una volta
+                    try:
+                        boxes = page.locator("#prenoForm input[type=checkbox]")
+                        n = await boxes.count()
+                        for i in range(n):
+                            b = boxes.nth(i)
+                            try:
+                                if await b.is_checked():
+                                    continue
+                            except Exception:
+                                pass
+                            name = (await b.get_attribute("name") or "").lower()
+                            _id = (await b.get_attribute("id") or "").lower()
+                            req = await b.get_attribute("required")
+                            is_relevant = bool(req) or any(k in (name + " " + _id) for k in ["privacy", "consenso", "termin", "gdpr", "policy"])
+                            if not is_relevant:
+                                continue
+                            try:
+                                await b.scroll_into_view_if_needed()
+                                await b.click(timeout=2000, force=True)
+                            except Exception:
+                                try:
+                                    if _id:
+                                        lab = page.locator(f'label[for="{_id}"]').first
+                                        if await lab.count() > 0:
+                                            await lab.click(timeout=2000, force=True)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     continue
 
                 # Errore esplicito dal sito
