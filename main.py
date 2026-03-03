@@ -38,17 +38,33 @@ def _load_tz():
 TZ = _load_tz()
 
 MONTHS_IT = [
-    "", "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
-    "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
+    "",
+    "Gennaio",
+    "Febbraio",
+    "Marzo",
+    "Aprile",
+    "Maggio",
+    "Giugno",
+    "Luglio",
+    "Agosto",
+    "Settembre",
+    "Ottobre",
+    "Novembre",
+    "Dicembre",
 ]
 WEEKDAYS_IT = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
 
 WEEKDAY_MAP = {
-    "lunedi": 0, "lunedì": 0,
-    "martedi": 1, "martedì": 1,
-    "mercoledi": 2, "mercoledì": 2,
-    "giovedi": 3, "giovedì": 3,
-    "venerdi": 4, "venerdì": 4,
+    "lunedi": 0,
+    "lunedì": 0,
+    "martedi": 1,
+    "martedì": 1,
+    "mercoledi": 2,
+    "mercoledì": 2,
+    "giovedi": 3,
+    "giovedì": 3,
+    "venerdi": 4,
+    "venerdì": 4,
     "sabato": 5,
     "domenica": 6,
 }
@@ -223,6 +239,7 @@ def _get_customer(phone: str) -> Optional[Dict[str, Any]]:
 # NORMALIZZAZIONI
 # ============================================================
 
+
 def _norm_orario(s: str) -> str:
     s = (s or "").strip().lower().replace("ore", "").replace("alle", "").strip()
     s = s.replace(".", ":").replace(",", ":")
@@ -319,6 +336,7 @@ def _time_to_minutes(hhmm: str) -> Optional[int]:
 # MICROSERVIZIO: RISOLUZIONE DATE RELATIVE (ANTI-ERRORE LLM)
 # ============================================================
 
+
 class ResolveDateIn(BaseModel):
     input_text: str
 
@@ -365,6 +383,7 @@ def resolve_date(payload: ResolveDateIn):
     Risolve "stasera/domani/martedì/questo sabato/weekend" usando TZ locale.
     - "stasera/oggi" => NON richiede conferma (assoluto)
     - "domani/dopodomani/giorni settimana/weekend" => richiede conferma
+    - Se oggi è lo stesso weekday richiesto (es. oggi=martedì e chiedono "martedì") => richiede conferma e ritorna oggi.
     """
     text = (payload.input_text or "").strip().lower()
     if not text:
@@ -386,6 +405,9 @@ def resolve_date(payload: ResolveDateIn):
 
     for key, wd in WEEKDAY_MAP.items():
         if re.search(rf"\b{re.escape(key)}\b", t):
+            # Ambiguo: stesso giorno della settimana di oggi
+            if today.weekday() == wd:
+                return _format_out(today, True, f"weekday_today_ambiguous:{key}")
             d = _next_weekday(today, wd)
             return _format_out(d, True, f"weekday:{key}")
 
@@ -406,6 +428,7 @@ def time_now():
 # ============================================================
 # MODEL BOOKING
 # ============================================================
+
 
 class RichiestaPrenotazione(BaseModel):
     fase: str = Field("book", description='Fase: "availability" oppure "book"')
@@ -470,6 +493,7 @@ class RichiestaPrenotazione(BaseModel):
 # ============================================================
 # PLAYWRIGHT HELPERS
 # ============================================================
+
 
 async def _block_heavy(route):
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
@@ -861,6 +885,7 @@ def _looks_like_full_slot(msg: str) -> bool:
 # ROUTES
 # ============================================================
 
+
 @app.get("/")
 def home():
     return {
@@ -988,50 +1013,62 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
         f"pax={pax_req} | pasto={pasto} | seggiolini={seggiolini}"
     )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--single-process",
-                "--disable-gpu",
-            ],
-        )
-        context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
-        page = await context.new_page()
-        page.set_default_timeout(PW_TIMEOUT_MS)
-        page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
-        await page.route("**/*", _block_heavy)
+    # ============================================================
+    # PLAYWRIGHT (SAFE) — evita 500 se crasha prima del try
+    # ============================================================
+    browser = None
+    context = None
+    page = None
 
-        last_ajax_result = {"seen": False, "text": ""}
+    last_ajax_result = {"seen": False, "text": ""}
+    screenshot_path = None
 
-        async def on_response(resp):
-            try:
-                if "ajax.php" in (resp.url or "").lower():
-                    txt = await resp.text()
-                    last_ajax_result["seen"] = True
-                    last_ajax_result["text"] = (txt or "").strip()
-                    if last_ajax_result["text"]:
-                        print("🧩 AJAX_RESPONSE:", last_ajax_result["text"][:500])
-            except Exception:
-                pass
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--single-process",
+                    "--disable-gpu",
+                ],
+            )
+            context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
+            page = await context.new_page()
+            page.set_default_timeout(PW_TIMEOUT_MS)
+            page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+            await page.route("**/*", _block_heavy)
 
-        page.on("response", on_response)
-
-        if DEBUG_LOG_AJAX_POST:
-            async def on_request(req):
+            async def on_response(resp):
                 try:
-                    if "ajax.php" in req.url.lower() and req.method.upper() == "POST":
-                        print("🌐 AJAX_POST_URL:", req.url)
-                        print("🌐 AJAX_POST_BODY:", (req.post_data or "")[:2000])
+                    if "ajax.php" in (resp.url or "").lower():
+                        txt = await resp.text()
+                        last_ajax_result["seen"] = True
+                        last_ajax_result["text"] = (txt or "").strip()
+                        if last_ajax_result["text"]:
+                            print("🧩 AJAX_RESPONSE:", last_ajax_result["text"][:500])
                 except Exception:
                     pass
-            page.on("request", on_request)
 
-        screenshot_path = None
-        try:
+            page.on("response", on_response)
+
+            if DEBUG_LOG_AJAX_POST:
+
+                async def on_request(req):
+                    try:
+                        if "ajax.php" in req.url.lower() and req.method.upper() == "POST":
+                            print("🌐 AJAX_POST_URL:", req.url)
+                            print("🌐 AJAX_POST_BODY:", (req.post_data or "")[:2000])
+                    except Exception:
+                        pass
+
+                page.on("request", on_request)
+
+            # ============================================================
+            # FLOW
+            # ============================================================
             await page.goto(BOOKING_URL, wait_until="domcontentloaded")
             await _maybe_click_cookie(page)
             await _wait_ready(page)
@@ -1138,6 +1175,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     break
                 except Exception as e:
                     last_select_error = e
+
             if not selected_orario_value:
                 raise RuntimeError(str(last_select_error) if last_select_error else "Orario non disponibile")
 
@@ -1150,7 +1188,12 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 payload_log = dati.model_dump()
                 payload_log.update({"email": email, "note": note_in, "seggiolini": seggiolini})
                 _log_booking(payload_log, True, msg)
-                return {"ok": True, "message": msg, "fallback_time": used_fallback, "selected_time": selected_orario_value[:5]}
+                return {
+                    "ok": True,
+                    "message": msg,
+                    "fallback_time": used_fallback,
+                    "selected_time": selected_orario_value[:5],
+                }
 
             submit_attempts = 0
             while True:
@@ -1232,8 +1275,11 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
             return {"ok": True, "message": msg, "fallback_time": used_fallback, "selected_time": selected_orario_value[:5]}
 
-        except Exception as e:
-            err_str = str(e)
+    except Exception as e:
+        err_str = str(e)
+
+        # screenshot solo se page è disponibile
+        if page is not None:
             try:
                 ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S_%f")
                 screenshot_path = f"booking_error_{ts}.png"
@@ -1242,25 +1288,29 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
             except Exception:
                 screenshot_path = None
 
-            payload_log = dati.model_dump()
-            payload_log.update(
-                {
-                    "note": note_in if "note_in" in locals() else "",
-                    "seggiolini": seggiolini if "seggiolini" in locals() else 0,
-                }
-            )
-            _log_booking(payload_log, False, err_str)
-
-            # Risposta machine-readable per Eleven (distinguere disponibilità vs errore tecnico)
-            status = "TECH_ERROR" if _is_timeout_error(err_str) else "ERROR"
-            msg = "Errore tecnico nel verificare la disponibilità." if status == "TECH_ERROR" else "Errore durante la prenotazione."
-
-            return {
-                "ok": False,
-                "status": status,
-                "message": msg,
-                "error": err_str,
-                "screenshot": screenshot_path,
+        payload_log = dati.model_dump()
+        payload_log.update(
+            {
+                "note": note_in if "note_in" in locals() else "",
+                "seggiolini": seggiolini if "seggiolini" in locals() else 0,
             }
-        finally:
-            await browser.close()
+        )
+        _log_booking(payload_log, False, err_str)
+
+        status = "TECH_ERROR" if _is_timeout_error(err_str) else "ERROR"
+        msg = "Errore tecnico nel verificare la disponibilità." if status == "TECH_ERROR" else "Errore durante la prenotazione."
+
+        return {"ok": False, "status": status, "message": msg, "error": err_str, "screenshot": screenshot_path}
+
+    finally:
+        # chiusure safe: non esplodono se browser/context non esistono
+        try:
+            if context is not None:
+                await context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception:
+            pass
