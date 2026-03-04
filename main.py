@@ -1,7 +1,9 @@
+# main.py
 import os
 import re
 import json
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Union, List, Dict, Any, Tuple
 
@@ -94,6 +96,14 @@ RETRY_TIME_WINDOW_MIN = int(os.getenv("RETRY_TIME_WINDOW_MIN", "90"))
 AVAIL_SELECTOR_TIMEOUT_MS = int(os.getenv("AVAIL_SELECTOR_TIMEOUT_MS", str(PW_TIMEOUT_MS)))
 AVAIL_FUNCTION_TIMEOUT_MS = int(os.getenv("AVAIL_FUNCTION_TIMEOUT_MS", "60000"))
 AVAIL_POST_WAIT_MS = int(os.getenv("AVAIL_POST_WAIT_MS", "1200"))
+
+# AJAX wait (final response) — evita errore su MS_PS
+AJAX_FINAL_TIMEOUT_MS = int(os.getenv("AJAX_FINAL_TIMEOUT_MS", "12000"))
+PENDING_AJAX = set(
+    x.strip().upper()
+    for x in os.getenv("AJAX_PENDING_CODES", "MS_PS").split(",")
+    if x.strip()
+)
 
 IPHONE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -383,7 +393,7 @@ def resolve_date(payload: ResolveDateIn):
     Risolve "stasera/domani/martedì/questo sabato/weekend" usando TZ locale.
     - "stasera/oggi" => NON richiede conferma (assoluto)
     - "domani/dopodomani/giorni settimana/weekend" => richiede conferma
-    - Se oggi è lo stesso weekday richiesto (es. oggi=martedì e chiedono "martedì") => richiede conferma e ritorna oggi.
+    - Se oggi è lo stesso weekday richiesto => richiede conferma e ritorna oggi
     """
     text = (payload.input_text or "").strip().lower()
     if not text:
@@ -405,7 +415,6 @@ def resolve_date(payload: ResolveDateIn):
 
     for key, wd in WEEKDAY_MAP.items():
         if re.search(rf"\b{re.escape(key)}\b", t):
-            # Ambiguo: stesso giorno della settimana di oggi
             if today.weekday() == wd:
                 return _format_out(today, True, f"weekday_today_ambiguous:{key}")
             d = _next_weekday(today, wd)
@@ -881,6 +890,39 @@ def _looks_like_full_slot(msg: str) -> bool:
     return any(p in s for p in patterns)
 
 
+async def _wait_ajax_final(last_ajax_result: Dict[str, Any], timeout_ms: int = AJAX_FINAL_TIMEOUT_MS) -> str:
+    """
+    Aspetta una risposta AJAX finale.
+    Se arriva un codice intermedio (es. MS_PS) continua ad attendere.
+    Ritorna il testo finale (es. OK o messaggio errore).
+    """
+    start = datetime.now(TZ)
+    last_txt = ""
+
+    # attende la prima risposta
+    while not last_ajax_result.get("seen"):
+        await asyncio.sleep(0.05)
+        if (datetime.now(TZ) - start).total_seconds() * 1000 > timeout_ms:
+            raise RuntimeError("Prenotazione NON confermata: nessuna risposta AJAX intercettata (timeout).")
+
+    # poi attende la finalizzazione (OK o messaggio)
+    while True:
+        txt = (last_ajax_result.get("text") or "").strip()
+        txt_u = txt.upper()
+
+        # se è finale (non pending) ritorna
+        if txt and txt_u not in PENDING_AJAX:
+            return txt
+
+        # se resta uguale e pending, continua
+        last_txt = txt
+
+        await asyncio.sleep(0.05)
+        if (datetime.now(TZ) - start).total_seconds() * 1000 > timeout_ms:
+            # scaduto: ritorna comunque quello che abbiamo (utile per log)
+            return last_txt
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -922,7 +964,11 @@ def admin_dashboard(request: Request):
     cust = [dict(r) for r in cur.fetchall()]
     conn.close()
 
-    return {"stats": {"total": total, "ok": ok_sum, "ok_rate_pct": round(ok_rate, 2)}, "last_bookings": last, "customers": cust}
+    return {
+        "stats": {"total": total, "ok": ok_sum, "ok_rate_pct": round(ok_rate, 2)},
+        "last_bookings": last,
+        "customers": cust,
+    }
 
 
 @app.get("/_admin/customer/{phone}")
@@ -1014,13 +1060,13 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
     )
 
     # ============================================================
-    # PLAYWRIGHT (SAFE) — evita 500 se crasha prima del try
+    # PLAYWRIGHT (SAFE)
     # ============================================================
     browser = None
     context = None
     page = None
 
-    last_ajax_result = {"seen": False, "text": ""}
+    last_ajax_result: Dict[str, Any] = {"seen": False, "text": ""}
     screenshot_path = None
 
     try:
@@ -1045,10 +1091,12 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 try:
                     if "ajax.php" in (resp.url or "").lower():
                         txt = await resp.text()
+                        txt = (txt or "").strip()
+                        if not txt:
+                            return
                         last_ajax_result["seen"] = True
-                        last_ajax_result["text"] = (txt or "").strip()
-                        if last_ajax_result["text"]:
-                            print("🧩 AJAX_RESPONSE:", last_ajax_result["text"][:500])
+                        last_ajax_result["text"] = txt
+                        print("🧩 AJAX_RESPONSE:", txt[:500])
                 except Exception:
                     pass
 
@@ -1203,17 +1251,13 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
                 await _click_prenota(page)
 
-                for _ in range(12):
-                    if last_ajax_result["seen"]:
-                        break
-                    await page.wait_for_timeout(500)
+                ajax_txt = await _wait_ajax_final(last_ajax_result, timeout_ms=AJAX_FINAL_TIMEOUT_MS)
 
-                if not last_ajax_result["seen"]:
-                    raise RuntimeError("Prenotazione NON confermata: nessuna risposta AJAX intercettata.")
-
-                ajax_txt = (last_ajax_result["text"] or "").strip()
-                if ajax_txt == "OK":
+                if ajax_txt.strip().upper() == "OK":
                     break
+
+                if not ajax_txt:
+                    raise RuntimeError("Prenotazione NON confermata: risposta AJAX vuota.")
 
                 if _looks_like_full_slot(ajax_txt) and submit_attempts <= MAX_SUBMIT_RETRIES:
                     options = await _get_orario_options(page)
@@ -1278,7 +1322,6 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
     except Exception as e:
         err_str = str(e)
 
-        # screenshot solo se page è disponibile
         if page is not None:
             try:
                 ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S_%f")
@@ -1303,7 +1346,6 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
         return {"ok": False, "status": status, "message": msg, "error": err_str, "screenshot": screenshot_path}
 
     finally:
-        # chiusure safe: non esplodono se browser/context non esistono
         try:
             if context is not None:
                 await context.close()
