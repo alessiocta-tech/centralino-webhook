@@ -668,6 +668,23 @@ async def _click_sede(page, sede_target: str) -> bool:
     target = _normalize_sede(sede_target)
     await page.wait_for_selector(".ristoCont", state="visible", timeout=PW_TIMEOUT_MS)
 
+    known = ["Appia", "Talenti", "Ostia Lido", "Palermo", "Reggio Calabria"]
+    try:
+        await page.wait_for_function(
+            """(names)=>{
+              const root=document.querySelector('.ristoCont');
+              if(!root) return false;
+              const txt=(root.innerText||'').replace(/\\s+/g,' ').toLowerCase();
+              const hasName = names.some(n=>txt.includes(String(n).toLowerCase()));
+              const hasSpinner = root.querySelector('.spinner-border,.spinner-grow');
+              return hasName || (!hasSpinner && txt.trim().length>0);
+            }""",
+            known,
+            timeout=AVAIL_FUNCTION_TIMEOUT_MS,
+        )
+    except Exception:
+        await page.wait_for_timeout(AVAIL_POST_WAIT_MS)
+
     for cand in [target, target.replace(" - Roma", ""), target.replace(" - roma", "")]:
         try:
             loc = page.locator(f"text=/{re.escape(cand)}/i").first
