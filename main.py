@@ -111,7 +111,8 @@ IPHONE_UA = (
     "Mobile/15E148 Safari/604.1"
 )
 
-DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
+# FIX: allineato con prompt (era "default@prenotazioni.com")
+DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "prenotazione@prenotazione.com")
 
 app = FastAPI()
 
@@ -452,7 +453,7 @@ class RichiestaPrenotazione(BaseModel):
     data: str
     orario: str
     persone: Union[int, str] = Field(...)
-    seggiolini: Union[int, str] = 0  # clamp 0..3 (server). Prompt può imporre max 2.
+    seggiolini: Union[int, str] = 0  # clamp 0..3 (server). Prompt impone max 2.
     note: Optional[str] = Field("", alias="nota")
 
     model_config = {"validate_by_name": True, "extra": "ignore"}
@@ -679,7 +680,15 @@ async def _click_sede(page, sede_target: str) -> bool:
     return False
 
 
-async def _maybe_select_turn(page, pasto: str, orario_req: str):
+async def _maybe_select_turn(page, pasto: str, orario_req: str, sede: str = ""):
+    """
+    Seleziona il turno corretto (I o II) in base all'orario richiesto e alla sede.
+
+    Soglie per la cena (secondo turno):
+      - Talenti:                    >= 21:00
+      - Appia / Palermo / Reggio:  >= 21:30
+    Soglia per il pranzo (secondo turno): >= 13:30 (uguale per tutte le sedi)
+    """
     try:
         b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
         b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
@@ -692,7 +701,13 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
         mins = hh * 60 + mm
 
         if pasto.upper() == "CENA":
-            choose_second = mins >= (21 * 60)
+            sede_norm = _normalize_sede(sede).lower()
+            # Talenti: secondo turno dalle 21:00
+            # Appia, Palermo, Reggio Calabria: secondo turno dalle 21:30
+            if sede_norm == "talenti":
+                choose_second = mins >= (21 * 60)
+            else:
+                choose_second = mins >= (21 * 60 + 30)
         else:
             choose_second = mins >= (13 * 60 + 30)
 
@@ -1212,7 +1227,8 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     "sedi": sedi,
                 }
 
-            await _maybe_select_turn(page, pasto, orario_req)
+            # FIX: passa sede_target per applicare la soglia corretta per sede
+            await _maybe_select_turn(page, pasto, orario_req, sede_target)
 
             selected_orario_value = None
             used_fallback = False
@@ -1278,6 +1294,8 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     if not await _click_sede(page, sede_target):
                         return {"ok": False, "status": "SOLD_OUT", "message": "Sede esaurita", "sede": sede_target}
 
+                    # FIX: passa sede_target anche nel retry
+                    await _maybe_select_turn(page, pasto, best, sede_target)
                     await page.locator("#OraPren").select_option(value=best)
                     selected_orario_value = best
                     used_fallback = True
