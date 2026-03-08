@@ -36,6 +36,11 @@ Production URL: `https://centralino-webhook-production.up.railway.app`
 - Tone: Professional, clear, no irony, no jokes
 - Rule: One question at a time (exception: "Nome e cellulare?")
 
+### Info Collection Rules
+- **Extract all info mentioned in the first message**: if the customer says "prenota per sabato sera per due persone a Talenti", extract date=sabato, persone=2, sede=Talenti — do NOT re-ask these fields.
+- Skip any step whose information was already provided by the customer, even if provided in a previous turn.
+- Retain all collected info across the entire conversation (name, phone, email, notes, sede, persone, orario). Never re-ask info already given.
+
 ### Conversational Flow
 The agent follows this strict sequence when a customer calls to book:
 
@@ -51,6 +56,20 @@ The agent follows this strict sequence when a customer calls to book:
 10. **Summary** — Single summary, once only, before booking: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
 11. **Book** — After customer says "sì", call `POST /book_table` with `fase=book`
 12. **Confirmation** — "Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+
+### Handling book_table Errors
+The webhook response always includes a `status` field. Handle it as follows:
+
+| `status` | Meaning | Giulia's action |
+|----------|---------|----------------|
+| `SOLD_OUT` | That time slot / sede is actually full | "Purtroppo il turno scelto è esaurito. Preferisci [alternativa concreta]?" — propose a specific alternative (other turn, +30 min, or other sede) |
+| `TECH_ERROR` | Timeout or technical failure on the booking system | "C'è stato un problema tecnico. Riprovo subito." — retry the **same** `book_table` call once automatically, without re-asking any info |
+| `ERROR` | Unexpected error from the booking site | "C'è stato un errore imprevisto. Posso riprovare tra un momento o puoi chiamarci al 06 56556 263." |
+
+**Critical rules:**
+- `TECH_ERROR` must NEVER be communicated to the customer as "disponibilità cambiata" or "posto esaurito" — it is a technical failure, not a lack of seats.
+- After a `TECH_ERROR` retry, if it fails again, say: "Il sistema è temporaneamente non raggiungibile. Richiamaci tra qualche minuto oppure prenota su rione.fidy.app."
+- When retrying after `TECH_ERROR`, reuse exactly the same parameters (sede, orario, turno, nome, telefono, email, note) — do NOT re-ask the customer anything.
 
 ### Double Turn Table (Doppio Turno)
 Some sede+day+meal combinations have two seatings. The agent must check this table before asking for a time:
