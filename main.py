@@ -77,8 +77,8 @@ WEEKDAY_MAP = {
 
 BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?referer=AI")
 
-PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "15000"))
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "15000"))
+PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
 DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
 
 DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "false").lower() == "true"
@@ -839,14 +839,34 @@ async def _select_orario_or_retry(page, wanted_hhmm: str) -> Tuple[str, bool]:
         timeout=PW_TIMEOUT_MS,
     )
 
-    options = await _get_orario_options(page)
     wanted = wanted_hhmm.strip()
+    # Fidy usa "HH:MM:SS" come value — prova prima il formato lungo
+    wanted_val = wanted + ":00" if re.fullmatch(r"\d{2}:\d{2}", wanted) else wanted
+    try:
+        res = await page.locator("#OraPren").select_option(value=wanted_val)
+        if res:
+            return wanted_val, False
+    except Exception:
+        pass
 
-    exact = next((o for o in options if o.get("start_hhmm") == wanted), None)
-    if exact:
-        await page.locator("#OraPren").select_option(value=exact["value"])
-        return exact["value"], False
+    # Fallback JS: cerca per testo dell'opzione
+    ok = await page.evaluate(
+        """(hhmm) => {
+          const sel = document.querySelector('#OraPren');
+          if (!sel) return false;
+          const opt = Array.from(sel.options).find(o => (o.textContent || '').includes(hhmm));
+          if (!opt) return false;
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }""",
+        wanted,
+    )
+    if ok:
+        val = await page.locator("#OraPren").input_value()
+        return val, False
 
+    options = await _get_orario_options(page)
     best = _pick_closest_time(wanted, options)
     if best:
         await page.locator("#OraPren").select_option(value=best)
@@ -1159,8 +1179,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
                     page.on("request", on_request)
 
-                # "commit" torna non appena arrivano i primi byte — più veloce di domcontentloaded
-                await page.goto(BOOKING_URL, wait_until="commit")
+                await page.goto(BOOKING_URL, wait_until="domcontentloaded")
                 await _maybe_click_cookie(page)
                 await _wait_ready(page)
 
@@ -1235,8 +1254,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                 except Exception:
                     pass
 
-                # Il turno è selezionato direttamente tramite #OraPren in _select_orario_or_retry
-                # (i turni compaiono come opzioni nel dropdown, non come bottoni separati)
+                await _maybe_select_turn(page, pasto, orario_req)
 
                 selected_orario_value = None
                 used_fallback = False
@@ -1304,7 +1322,7 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                                 f"Slot pieno e nessun orario alternativo entro {RETRY_TIME_WINDOW_MIN} min. Msg: {ajax_txt}"
                             )
 
-                        await page.goto(BOOKING_URL, wait_until="commit")
+                        await page.goto(BOOKING_URL, wait_until="domcontentloaded")
                         await _maybe_click_cookie(page)
                         await _wait_ready(page)
                         await _click_persone(page, pax_req)
