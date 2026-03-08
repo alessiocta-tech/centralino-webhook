@@ -88,6 +88,8 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 DB_PATH = os.path.join(DATA_DIR, "centralino.sqlite3")
 
+PW_CHROMIUM_EXECUTABLE = os.getenv("PW_CHROMIUM_EXECUTABLE", "")
+
 MAX_SLOT_RETRIES = int(os.getenv("MAX_SLOT_RETRIES", "2"))
 MAX_SUBMIT_RETRIES = int(os.getenv("MAX_SUBMIT_RETRIES", "1"))
 RETRY_TIME_WINDOW_MIN = int(os.getenv("RETRY_TIME_WINDOW_MIN", "90"))
@@ -1091,16 +1093,19 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
+            launch_kwargs: Dict[str, Any] = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--single-process",
                     "--disable-gpu",
                 ],
-            )
+            }
+            if PW_CHROMIUM_EXECUTABLE:
+                launch_kwargs["executable_path"] = PW_CHROMIUM_EXECUTABLE
+            browser = await p.chromium.launch(**launch_kwargs)
             context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
             page = await context.new_page()
             page.set_default_timeout(PW_TIMEOUT_MS)
