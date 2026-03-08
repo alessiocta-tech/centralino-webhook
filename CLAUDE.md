@@ -2,9 +2,90 @@
 
 ## Overview
 
-This is a **restaurant table booking automation service** for the Italian restaurant chain **Rione**. It uses FastAPI to expose a webhook API and Playwright to drive a headless Chromium browser to interact with the booking website (`rione.fidy.app`). It handles availability checks and end-to-end form submission for restaurant reservations.
+This is the **backend webhook service** for the **deRione** restaurant chain's AI phone agent. A voice AI agent named **Giulia** answers incoming phone calls and handles table reservations by calling this webhook. The webhook uses FastAPI to expose the API and Playwright to drive a headless Chromium browser on the booking website (`rione.fidy.app`).
 
 The entire application lives in a single file: `main.py` (≈1400 lines).
+
+---
+
+## System Architecture
+
+```
+📞 Incoming phone call
+    ↓
+🤖 Giulia (voice AI agent — Italian, informal "tu")
+    ↓                         ↓
+POST /resolve_date       POST /book_table
+    ↓                         ↓
+🌐 centralino-webhook (this repo — FastAPI + Playwright)
+    ↓
+🖥️ rione.fidy.app (third-party booking platform by Fidy)
+```
+
+**Giulia** is the voice AI agent that speaks to customers on the phone. She collects reservation details (date, time, party size, sede, name, phone, email, notes) following a strict conversational flow, then calls this webhook to check availability and finalize bookings.
+
+Production URL: `https://centralino-webhook-production.up.railway.app`
+
+---
+
+## Voice Agent Integration (Giulia)
+
+### Agent Identity
+- Name: **Giulia**, assistente digitale di deRione
+- Language: Italian, informal ("tu")
+- Tone: Professional, clear, no irony, no jokes
+- Rule: One question at a time (exception: "Nome e cellulare?")
+
+### Conversational Flow
+The agent follows this strict sequence when a customer calls to book:
+
+1. **Date resolution** — Call `POST /resolve_date` to convert relative expressions ("sabato sera", "domani") to ISO date. Ask confirmation: "Per sicurezza intendi sabato 14 marzo, giusto?"
+2. **Party size** — "Quante persone?" (skip if already mentioned)
+3. **Sede** — "In quale sede preferisci?" (skip if already mentioned)
+4. **Double turn check** — Consult the double turn table (see below). If applicable, propose turns before asking for time
+5. **Time** — "A che ora preferisci?" (skip if double turn already determines it)
+6. **Notes** — "Allergie o richieste per il tavolo?"
+7. **Name & phone** — "Nome e cellulare?"
+8. **Email** — "Vuoi ricevere la conferma per email?"
+9. **Silent availability check** — Call `POST /book_table` with `fase=availability` (never announced to customer)
+10. **Summary** — Single summary, once only, before booking: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
+11. **Book** — After customer says "sì", call `POST /book_table` with `fase=book`
+12. **Confirmation** — "Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+
+### Double Turn Table (Doppio Turno)
+Some sede+day+meal combinations have two seatings. The agent must check this table before asking for a time:
+
+| Sede | Day | Meal | 1st Turn | 2nd Turn |
+|------|-----|------|----------|----------|
+| Talenti | Saturday | Lunch | 12:00–13:15 | 13:30+ |
+| Talenti | Sunday | Lunch | 12:00–13:15 | 13:30+ |
+| Talenti | Saturday | Dinner | 19:00–20:45 | 21:00+ |
+| Appia | Saturday | Lunch | 12:00–13:20 | 13:30+ |
+| Appia | Sunday | Lunch | 12:00–13:20 | 13:30+ |
+| Appia | Saturday | Dinner | 19:30–21:15 | 21:30+ |
+| Palermo | Saturday | Lunch | 12:00–13:20 | 13:30+ |
+| Palermo | Sunday | Lunch | 12:00–13:20 | 13:30+ |
+| Palermo | Saturday | Dinner | 19:30–21:15 | 21:30+ |
+| Reggio Calabria | Saturday | Dinner | 19:30–21:15 | 21:30+ |
+| Ostia Lido | — | — | Never has double turn | — |
+
+**Rules:**
+- If the customer's stated time already identifies a turn, use it directly without asking
+- In double turn, always send the official turn start time to the webhook (not the customer's internal time)
+- If >9 people, do NOT call the webhook — give the phone number 06 56556 263
+
+### Standard Time Slots
+When there is no double turn:
+
+| Lunch | Dinner |
+|-------|--------|
+| 12:00, 12:30, 13:00, 13:30, 14:00, 14:30 | 19:00, 19:30, 20:00, 20:30, 21:00, 21:30, 22:00 |
+
+### Meal Period Detection
+- `sera`, `stasera`, `domani sera` → cena (never ask "pranzo o cena?")
+- `pranzo`, `domani a pranzo` → pranzo
+- Time 12:00–16:00 → pranzo
+- Time 17:00–23:00 → cena
 
 ---
 
@@ -15,7 +96,9 @@ centralino-webhook/
 ├── main.py            # Entire application — API, DB, browser automation
 ├── requirements.txt   # Python dependencies (FastAPI, uvicorn, playwright)
 ├── Dockerfile         # Container build using Microsoft Playwright Python image
-└── railway.json       # Railway.app deployment configuration
+├── railway.json       # Railway.app deployment configuration
+├── .gitignore         # Excludes __pycache__, .pyc, .sqlite3
+└── CLAUDE.md          # This file — codebase documentation
 ```
 
 There are no test files, no separate modules, and no other source code.
@@ -118,6 +201,7 @@ Returns stored customer profile for a given phone number. Requires admin token.
 | `MAX_SUBMIT_RETRIES` | `1` | Max retries on final booking submission |
 | `RETRY_TIME_WINDOW_MIN` | `90` | Window (minutes) for searching alternative time slots |
 | `DEFAULT_EMAIL` | `default@prenotazioni.com` | Fallback email if none provided |
+| `PW_CHROMIUM_EXECUTABLE` | `""` (auto-detect) | Custom path to Chromium binary for Playwright |
 
 ---
 
