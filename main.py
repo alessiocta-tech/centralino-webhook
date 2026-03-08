@@ -88,13 +88,15 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 DATA_DIR = os.getenv("DATA_DIR", "/tmp")
 DB_PATH = os.path.join(DATA_DIR, "centralino.sqlite3")
 
+PW_CHROMIUM_EXECUTABLE = os.getenv("PW_CHROMIUM_EXECUTABLE", "")
+
 MAX_SLOT_RETRIES = int(os.getenv("MAX_SLOT_RETRIES", "2"))
 MAX_SUBMIT_RETRIES = int(os.getenv("MAX_SUBMIT_RETRIES", "1"))
 RETRY_TIME_WINDOW_MIN = int(os.getenv("RETRY_TIME_WINDOW_MIN", "90"))
 
 AVAIL_SELECTOR_TIMEOUT_MS = int(os.getenv("AVAIL_SELECTOR_TIMEOUT_MS", str(PW_TIMEOUT_MS)))
 AVAIL_FUNCTION_TIMEOUT_MS = int(os.getenv("AVAIL_FUNCTION_TIMEOUT_MS", "60000"))
-AVAIL_POST_WAIT_MS = int(os.getenv("AVAIL_POST_WAIT_MS", "1200"))
+AVAIL_POST_WAIT_MS = int(os.getenv("AVAIL_POST_WAIT_MS", "500"))
 
 # AJAX wait (final response)
 AJAX_FINAL_TIMEOUT_MS = int(os.getenv("AJAX_FINAL_TIMEOUT_MS", "20000"))
@@ -1091,16 +1093,19 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
+            launch_kwargs: Dict[str, Any] = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--single-process",
                     "--disable-gpu",
                 ],
-            )
+            }
+            if PW_CHROMIUM_EXECUTABLE:
+                launch_kwargs["executable_path"] = PW_CHROMIUM_EXECUTABLE
+            browser = await p.chromium.launch(**launch_kwargs)
             context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
             page = await context.new_page()
             page.set_default_timeout(PW_TIMEOUT_MS)
@@ -1194,28 +1199,13 @@ async def book_table(dati: RichiestaPrenotazione, request: Request):
                     "sedi": sedi,
                 }
 
-            sedi = await _scrape_sedi_availability(page)
-
-            entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == _normalize_sede(sede_target)), None)
-            if entry and entry.get("tutto_esaurito"):
-                return {
-                    "ok": False,
-                    "status": "SOLD_OUT",
-                    "message": "Sede esaurita",
-                    "sede": entry.get("nome") or sede_target,
-                    "alternative": _suggest_alternative_sedi(entry.get("nome") or sede_target, sedi),
-                    "sedi": sedi,
-                }
-
             clicked = await _click_sede(page, sede_target)
             if not clicked:
                 return {
                     "ok": False,
                     "status": "SOLD_OUT",
-                    "message": "Sede non cliccabile / non trovata",
+                    "message": "Sede non cliccabile / esaurita",
                     "sede": sede_target,
-                    "alternative": _suggest_alternative_sedi(sede_target, sedi),
-                    "sedi": sedi,
                 }
 
             await _maybe_select_turn(page, pasto, orario_req)
