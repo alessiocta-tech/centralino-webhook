@@ -115,7 +115,7 @@ IPHONE_UA = (
 DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
 
 # Timeout totale per l'intero flusso browser (deve stare sotto i 25s di Railway)
-BOOKING_TOTAL_TIMEOUT_S = float(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "22"))
+BOOKING_TOTAL_TIMEOUT_S = float(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "55"))
 
 app = FastAPI()
 
