@@ -1533,11 +1533,11 @@ class UpdateCoversIn(BaseModel):
 
 
 class AddNoteIn(BaseModel):
-    restaurant_id: Any
-    date: str
-    time: str
     phone: str
+    date: str
     note: str
+    restaurant_id: Any = None
+    time: Optional[str] = None
 
 
 # --- Endpoint proxy ---
@@ -1652,12 +1652,14 @@ async def update_covers(body: UpdateCoversIn):
 async def add_note(body: AddNoteIn):
     """Aggiunge una nota a una prenotazione esistente."""
     payload: Dict[str, Any] = {
-        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
-        "date": body.date,
-        "time": body.time,
         "phone": re.sub(r"[^\d+]", "", body.phone),
+        "date": body.date,
         "note": body.note,
     }
+    if body.restaurant_id is not None:
+        payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    if body.time is not None:
+        payload["time"] = body.time
 
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
