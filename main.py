@@ -79,8 +79,8 @@ WEEKDAY_MAP = {
 
 BOOKING_URL = os.getenv("BOOKING_URL", "https://rione.fidy.app/prenew.php?referer=AI")
 
-PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "60000"))
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "60000"))
+PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "25000"))
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "25000"))
 DISABLE_FINAL_SUBMIT = os.getenv("DISABLE_FINAL_SUBMIT", "false").lower() == "true"
 
 DEBUG_ECHO_PAYLOAD = os.getenv("DEBUG_ECHO_PAYLOAD", "false").lower() == "true"
@@ -93,11 +93,11 @@ DB_PATH = os.path.join(DATA_DIR, "centralino.sqlite3")
 MAX_SLOT_RETRIES = int(os.getenv("MAX_SLOT_RETRIES", "2"))
 MAX_SUBMIT_RETRIES = int(os.getenv("MAX_SUBMIT_RETRIES", "1"))
 RETRY_TIME_WINDOW_MIN = int(os.getenv("RETRY_TIME_WINDOW_MIN", "90"))
-BOOKING_TOTAL_TIMEOUT_S = int(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "120"))
+BOOKING_TOTAL_TIMEOUT_S = int(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "50"))
 
 # Timeout specifici scraping availability (evita 30s hard-coded)
 AVAIL_SELECTOR_TIMEOUT_MS = int(os.getenv("AVAIL_SELECTOR_TIMEOUT_MS", str(PW_TIMEOUT_MS)))
-AVAIL_FUNCTION_TIMEOUT_MS = int(os.getenv("AVAIL_FUNCTION_TIMEOUT_MS", "60000"))
+AVAIL_FUNCTION_TIMEOUT_MS = int(os.getenv("AVAIL_FUNCTION_TIMEOUT_MS", "20000"))
 AVAIL_POST_WAIT_MS = int(os.getenv("AVAIL_POST_WAIT_MS", "1200"))
 
 # AJAX wait (final response) — evita errore su MS_PS
