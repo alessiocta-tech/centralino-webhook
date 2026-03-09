@@ -556,7 +556,7 @@ async def _click_persone(page, n: int):
 
 
 async def _set_seggiolini(page, seggiolini: int):
-    seggiolini = max(0, min(3, int(seggiolini or 0)))
+    seggiolini = max(0, min(5, int(seggiolini or 0)))
 
     if seggiolini <= 0:
         try:
