@@ -259,9 +259,12 @@ With optional fields:
 
 **Giulia's cancellation flow (simplified):**
 1. Ask for `telefono` (if not already given)
-2. Ask for `data` (if not already given)
+2. Ask for `data` (if not already given) — convert to YYYY-MM-DD internally; **do NOT call `resolve_date`**
 3. Call `POST /cancel_reservation` directly with phone + date (+ sede/time if mentioned by customer)
 4. **Do NOT call `find_reservation_for_cancel` first** — it is unreliable and unnecessary
+5. **Do NOT ask for sede or time** — they are optional and only sent if the customer already mentioned them
+
+> **Note on date conversion for cancellations:** For cancellations, Giulia must convert the date herself (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
 ### `POST /update_covers`
 Updates the party size of an existing reservation. If response contains `requires_rebooking: true`, the reservation must be cancelled and re-created.
