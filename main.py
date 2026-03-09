@@ -1450,10 +1450,10 @@ class FindReservationForCancelIn(BaseModel):
 
 
 class CancelReservationIn(BaseModel):
-    restaurant_id: Any
-    date: str
-    time: str
     phone: str
+    date: str
+    restaurant_id: Optional[Any] = None
+    time: Optional[str] = None
     note: Optional[str] = None
 
 
@@ -1530,13 +1530,15 @@ async def find_reservation_for_cancel(body: FindReservationForCancelIn):
 
 @app.post("/cancel_reservation")
 async def cancel_reservation(body: CancelReservationIn):
-    """Annulla una prenotazione esistente."""
+    """Annulla una prenotazione esistente. Richiede phone + date; time e restaurant_id opzionali."""
     payload: Dict[str, Any] = {
-        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
-        "date": body.date,
-        "time": body.time,
         "phone": re.sub(r"[^\d+]", "", body.phone),
+        "date": body.date,
     }
+    if body.restaurant_id is not None:
+        payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    if body.time:
+        payload["time"] = body.time
     if body.note:
         payload["note"] = body.note
 

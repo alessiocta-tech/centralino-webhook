@@ -97,6 +97,7 @@ Some sede+day+meal combinations have two seatings. The agent must check this tab
 | Ostia Lido | — | — | Never has double turn | — |
 
 **Rules:**
+- **Only apply double turn logic on the days listed above** — do NOT mention turns on days not in the table (e.g., Monday–Friday, Sunday dinner, etc.)
 - If the customer's stated time already identifies a turn, use it directly without asking
 - In double turn, always send the official turn start time to the webhook (not the customer's internal time)
 - If >9 people, do NOT call the webhook — give the phone number 06 56556 263
@@ -246,11 +247,21 @@ Searches for a reservation to cancel. Returns the associated phone number for co
 All fields optional — provide as many as available. `reservation_code` takes priority.
 
 ### `POST /cancel_reservation`
-Cancels an existing reservation.
+Cancels an existing reservation. **Only `phone` and `date` are required** — `time` and `restaurant_id` are optional and sent only if available.
 
 ```json
-{ "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "note": "annullato dal cliente" }
+{ "phone": "3331234567", "date": "2026-03-14" }
 ```
+With optional fields:
+```json
+{ "phone": "3331234567", "date": "2026-03-14", "restaurant_id": 1, "time": "20:00", "note": "annullato dal cliente" }
+```
+
+**Giulia's cancellation flow (simplified):**
+1. Ask for `telefono` (if not already given)
+2. Ask for `data` (if not already given)
+3. Call `POST /cancel_reservation` directly with phone + date (+ sede/time if mentioned by customer)
+4. **Do NOT call `find_reservation_for_cancel` first** — it is unreliable and unnecessary
 
 ### `POST /update_covers`
 Updates the party size of an existing reservation. If response contains `requires_rebooking: true`, the reservation must be cancelled and re-created.
