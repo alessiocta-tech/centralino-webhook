@@ -1,7 +1,7 @@
 {
   "type": "webhook",
   "name": "book_table",
-  "description": "Verifica disponibilità (fase=availability) o registra una prenotazione (fase=book). SEQUENZA OBBLIGATORIA: 1) chiamare availability dopo aver raccolto sede+data+orario+persone, in modo silenzioso senza dirlo all'utente; 2) se la sede è SOLD_OUT proporre alternative; 3) solo dopo il sì al riepilogo, chiamare book. Data in ISO YYYY-MM-DD (già risolta e confermata). Orario in HH:MM (orario ufficiale del turno, non quello interno del cliente). Per più di 9 persone NON chiamare questo tool: comunicare il numero 06 56556 263.",
+  "description": "Registra una prenotazione (fase=book). Usare SOLO fase=book — il webhook verifica disponibilità internamente e restituisce SOLD_OUT se il turno è pieno. Chiamare solo dopo il sì al riepilogo. Data in ISO YYYY-MM-DD (già risolta e confermata). Orario in HH:MM (orario ufficiale del turno, non quello interno del cliente). Per più di 9 persone NON chiamare questo tool: comunicare il numero 06 56556 263.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
   "tool_call_sound": null,
@@ -22,11 +22,10 @@
           "id": "fase",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Fase dell'operazione. 'availability' per verifica silenziosa prima di raccogliere nome e telefono. 'book' per prenotazione finale, solo dopo il sì al riepilogo.",
+          "description": "Fase dell'operazione. Usare sempre 'book'. fase=availability è deprecato.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": [
-            "availability",
             "book"
           ],
           "is_system_provided": false,

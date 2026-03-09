@@ -22,12 +22,12 @@
           "id": "restaurant_id",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "ID del ristorante",
+          "description": "ID numerico del ristorante (opzionale): Talenti=1, Appia=2, Ostia=3, Reggio Calabria=4, Palermo=5. Inviare solo se l'utente lo ha menzionato.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,
           "is_system_provided": false,
-          "required": true
+          "required": false
         },
         {
           "id": "date",
@@ -44,12 +44,12 @@
           "id": "time",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Ora nel formato HH:MM",
+          "description": "Ora nel formato HH:MM (opzionale). Inviare solo se l'utente la conosce. Non usare mai 00:00 come default.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,
           "is_system_provided": false,
-          "required": true
+          "required": false
         },
         {
           "id": "phone",

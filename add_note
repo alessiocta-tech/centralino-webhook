@@ -1,7 +1,7 @@
 {
   "type": "webhook",
-  "name": "add_note_to_reservation",
-  "description": "Aggiunge una nota a una prenotazione esistente.",
+  "name": "add_note",
+  "description": "Aggiunge una nota a una prenotazione esistente. Richiede solo telefono, data e nota. Sede e orario sono opzionali.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
   "tool_call_sound": null,
@@ -22,12 +22,12 @@
           "id": "restaurant_id",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "ID del ristorante",
+          "description": "ID numerico del ristorante (opzionale): Talenti=1, Appia=2, Ostia=3, Reggio Calabria=4, Palermo=5. Inviare solo se l'utente lo ha fornito.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,
           "is_system_provided": false,
-          "required": true
+          "required": false
         },
         {
           "id": "date",
@@ -44,12 +44,12 @@
           "id": "time",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Ora prenotazione nel formato HH:MM",
+          "description": "Ora prenotazione nel formato HH:MM (opzionale). Inviare solo se l'utente lo ha fornito.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,
           "is_system_provided": false,
-          "required": true
+          "required": false
         },
         {
           "id": "phone",
