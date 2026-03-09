@@ -93,7 +93,7 @@ DB_PATH = os.path.join(DATA_DIR, "centralino.sqlite3")
 MAX_SLOT_RETRIES = int(os.getenv("MAX_SLOT_RETRIES", "2"))
 MAX_SUBMIT_RETRIES = int(os.getenv("MAX_SUBMIT_RETRIES", "1"))
 RETRY_TIME_WINDOW_MIN = int(os.getenv("RETRY_TIME_WINDOW_MIN", "90"))
-BOOKING_TOTAL_TIMEOUT_S = int(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "18"))
+BOOKING_TOTAL_TIMEOUT_S = int(os.getenv("BOOKING_TOTAL_TIMEOUT_S", "120"))
 
 # Timeout specifici scraping availability (evita 30s hard-coded)
 AVAIL_SELECTOR_TIMEOUT_MS = int(os.getenv("AVAIL_SELECTOR_TIMEOUT_MS", str(PW_TIMEOUT_MS)))
@@ -424,7 +424,7 @@ def resolve_date(payload: ResolveDateIn):
     t = re.sub(r"\s+", " ", text)
     today = _today_local()
 
-    if "stasera" in t or re.search(r"\boggi\b", t):
+    if "stasera" in t or "questa sera" in t or "questa notte" in t or "stanotte" in t or re.search(r"\boggi\b", t):
         return _format_out(today, requires=False, rule="stasera/oggi")
 
     if "dopodomani" in t:
