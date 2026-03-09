@@ -59,10 +59,11 @@ The agent follows this strict sequence when a customer calls to book:
 6. **Notes** — "Allergie o richieste per il tavolo?"
 7. **Name & phone** — "Nome e cellulare?"
 8. **Email** — "Vuoi ricevere la conferma per email?"
-9. **Silent availability check** — Call `POST /book_table` with `fase=availability` (never announced to customer)
-10. **Summary** — Single summary, once only, before booking: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
-11. **Book** — After customer says "sì", call `POST /book_table` with `fase=book`
-12. **Confirmation** — "Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+9. **Summary** — Single summary, once only, before booking: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
+10. **Book** — After customer says "sì", call `POST /book_table` with `fase=book` directly (no prior availability check — the booking call handles availability internally and returns `SOLD_OUT` if the slot is full)
+11. **Confirmation** — "Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+
+> **Note:** `fase=availability` is deprecated in the agent flow. Do NOT call it before booking. `fase=book` already checks availability internally and returns `SOLD_OUT` with alternative suggestions if the slot is full. Skipping the separate availability call saves one full browser session (~30–50s) and avoids HTTP 504 timeouts.
 
 ### Handling book_table Errors
 The webhook response always includes a `status` field. Handle it as follows:
@@ -182,16 +183,18 @@ Output:
 Returns current time in the configured timezone.
 
 ### `POST /book_table`
-Main booking endpoint. Operates in two phases controlled by the `fase` field:
+Main booking endpoint. The recommended flow uses **only `fase=book`** — it checks availability internally and returns `SOLD_OUT` if the slot is full, eliminating a redundant browser session.
 
-**Phase 1 — `"availability"`**: Checks available restaurants for the given date, time, and party size. Returns list of sedi with availability.
+`fase=availability` is still supported for backwards compatibility but is no longer used by the agent.
 
-**Phase 2 — `"book"`**: Completes the full booking flow for the selected restaurant.
+**`"book"`** (recommended): Checks availability and completes the full booking in a single browser session.
+
+**`"availability"`** (deprecated in agent flow): Returns list of sedi with availability without booking.
 
 Request body (`RichiestaPrenotazione`):
 ```json
 {
-  "fase": "availability" | "book",
+  "fase": "book",
   "nome": "Mario",
   "cognome": "Rossi",
   "email": "mario@example.com",
