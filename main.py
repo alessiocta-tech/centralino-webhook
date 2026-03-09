@@ -101,7 +101,7 @@ AVAIL_FUNCTION_TIMEOUT_MS = int(os.getenv("AVAIL_FUNCTION_TIMEOUT_MS", "60000"))
 AVAIL_POST_WAIT_MS = int(os.getenv("AVAIL_POST_WAIT_MS", "1200"))
 
 # AJAX wait (final response) — evita errore su MS_PS
-AJAX_FINAL_TIMEOUT_MS = int(os.getenv("AJAX_FINAL_TIMEOUT_MS", "12000"))
+AJAX_FINAL_TIMEOUT_MS = int(os.getenv("AJAX_FINAL_TIMEOUT_MS", "30000"))
 PENDING_AJAX = set(
     x.strip().upper()
     for x in os.getenv("AJAX_PENDING_CODES", "MS_PS").split(",")
@@ -1138,7 +1138,12 @@ async def _do_booking(
 
             async def on_response(resp):
                 try:
-                    if "ajax.php" in (resp.url or "").lower():
+                    url_lower = (resp.url or "").lower()
+                    method = (resp.request.method or "").upper()
+                    # logga tutti i POST verso fidy per diagnostica URL
+                    if method == "POST" and "fidy" in url_lower:
+                        print("🌐 POST_RESPONSE_URL:", resp.url, "status:", resp.status)
+                    if "ajax.php" in url_lower or ("fidy" in url_lower and method == "POST" and resp.status == 200):
                         txt = await resp.text()
                         txt = (txt or "").strip()
                         if not txt:
