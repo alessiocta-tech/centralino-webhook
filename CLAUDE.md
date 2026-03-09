@@ -4,7 +4,7 @@
 
 This is the **backend webhook service** for the **deRione** restaurant chain's AI phone agent. A voice AI agent named **Giulia** answers incoming phone calls and handles table reservations by calling this webhook. The webhook uses FastAPI to expose the API and Playwright to drive a headless Chromium browser on the booking website (`rione.fidy.app`).
 
-The entire application lives in a single file: `main.py` (≈1400 lines).
+The entire application lives in a single file: `main.py` (≈1550 lines).
 
 ---
 
@@ -14,15 +14,22 @@ The entire application lives in a single file: `main.py` (≈1400 lines).
 📞 Incoming phone call
     ↓
 🤖 Giulia (voice AI agent — Italian, informal "tu")
-    ↓                         ↓
-POST /resolve_date       POST /book_table
-    ↓                         ↓
-🌐 centralino-webhook (this repo — FastAPI + Playwright)
     ↓
-🖥️ rione.fidy.app (third-party booking platform by Fidy)
+    ├── POST /resolve_date          (date parsing)
+    ├── POST /book_table            (availability + booking via Playwright)
+    ├── GET  /check_reservation     (verify existing booking)
+    ├── POST /find_reservation_for_cancel  (search booking to cancel)
+    ├── POST /cancel_reservation    (cancel booking)
+    ├── POST /update_covers         (change party size)
+    └── POST /add_note              (add note to booking)
+         ↓
+🌐 centralino-webhook (this repo — FastAPI + Playwright + httpx)
+    ↓                          ↓
+🖥️ rione.fidy.app          🔌 api.fidy.app
+   (Playwright browser)       (Fidy REST API — check/cancel/update/note)
 ```
 
-**Giulia** is the voice AI agent that speaks to customers on the phone. She collects reservation details (date, time, party size, sede, name, phone, email, notes) following a strict conversational flow, then calls this webhook to check availability and finalize bookings.
+**Giulia** is the voice AI agent that speaks to customers on the phone. She handles new reservations, verification, cancellation, cover updates, and note additions by calling this webhook. The webhook either drives a headless browser (for new bookings) or proxies requests to the Fidy REST API (for all other operations).
 
 Production URL: `https://centralino-webhook-production.up.railway.app`
 
@@ -131,6 +138,7 @@ There are no test files, no separate modules, and no other source code.
 | Web framework | FastAPI 0.110.0 | REST API server |
 | ASGI server | uvicorn 0.27.1 | Runs FastAPI |
 | Browser automation | playwright 1.41.0 | Headless Chromium for booking form interaction |
+| HTTP client | httpx 0.27.0 | Async proxy calls to Fidy REST API |
 | Database | sqlite3 (stdlib) | Persists bookings and customer profiles |
 | Deployment | Railway.app | Cloud hosting |
 
@@ -148,7 +156,8 @@ The file is organized into logical sections (not separate modules):
 | 361–443 | Date Resolution | `/resolve_date` endpoint; Italian relative-date parser |
 | 451–509 | Pydantic Model | `RichiestaPrenotazione` — booking request model with validation |
 | 516–957 | Playwright Helpers | All browser automation functions (prefixed `_`) |
-| 958–1377 | API Routes | Health check, admin dashboard, `/book_table` endpoint |
+| 958–1408 | API Routes | Health check, admin dashboard, `/book_table` endpoint |
+| 1409–1550 | Fidy API Proxy | `/check_reservation`, `/find_reservation_for_cancel`, `/cancel_reservation`, `/update_covers`, `/add_note` |
 
 ---
 
@@ -204,6 +213,58 @@ Returns stored customer profile for a given phone number. Requires admin token.
 
 ---
 
+## Fidy API Proxy Endpoints
+
+These endpoints proxy requests to the Fidy REST API (`api.fidy.app`) with authentication. They handle operations on **existing** reservations (no Playwright involved).
+
+All Fidy proxy endpoints accept `restaurant_id` as either a numeric ID or a sede name string (auto-converted via `SEDE_ID_MAP`).
+
+**Sede ID mapping:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+
+### `GET /check_reservation`
+Verifies if a reservation exists for the given sede, date, time, and phone.
+
+Query params: `restaurant_id`, `date` (YYYY-MM-DD), `time` (HH:MM), `phone`
+
+### `POST /find_reservation_for_cancel`
+Searches for a reservation to cancel. Returns the associated phone number for confirmation before cancellation.
+
+```json
+{
+  "reservation_code": "ABC123",
+  "restaurant_id": 1,
+  "date": "2026-03-14",
+  "time": "20:00",
+  "phone": "3331234567",
+  "first_name": "Mario",
+  "last_name": "Rossi"
+}
+```
+All fields optional — provide as many as available. `reservation_code` takes priority.
+
+### `POST /cancel_reservation`
+Cancels an existing reservation.
+
+```json
+{ "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "note": "annullato dal cliente" }
+```
+
+### `POST /update_covers`
+Updates the party size of an existing reservation. If response contains `requires_rebooking: true`, the reservation must be cancelled and re-created.
+
+```json
+{ "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "new_covers": 4 }
+```
+
+### `POST /add_note`
+Adds a note (allergy, special request, etc.) to an existing reservation.
+
+```json
+{ "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "note": "allergia al glutine" }
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -221,6 +282,9 @@ Returns stored customer profile for a given phone number. Requires admin token.
 | `RETRY_TIME_WINDOW_MIN` | `90` | Window (minutes) for searching alternative time slots |
 | `DEFAULT_EMAIL` | `default@prenotazioni.com` | Fallback email if none provided |
 | `PW_CHROMIUM_EXECUTABLE` | `""` (auto-detect) | Custom path to Chromium binary for Playwright |
+| `FIDY_API_BASE` | `https://api.fidy.app/api` | Base URL for Fidy REST API |
+| `FIDY_API_KEY` | `derione_api_2026_super_secret` | API key sent as `X-API-Key` header to Fidy |
+| `FIDY_TIMEOUT_S` | `20` | Timeout in seconds for Fidy API calls |
 
 ---
 
@@ -359,3 +423,5 @@ There are currently no automated tests. When testing manually:
 - **No tests**: No testing framework is set up. Avoid breaking existing behavior without manual verification.
 - **Italian-only UI**: The booking website is in Italian. All field names, labels, and parsing logic assume Italian text.
 - **Ephemeral storage**: The SQLite database is stored in `/tmp` by default and will not persist across Railway deployments unless `DATA_DIR` is set to a persistent volume.
+- **Fidy API reachability**: The 5 proxy endpoints (`/check_reservation`, `/cancel_reservation`, etc.) require `api.fidy.app` to be reachable from Railway. They were not testable from the local dev sandbox (no internet). Verify connectivity in production.
+- **API key in config**: `FIDY_API_KEY` defaults to the hardcoded key from the ElevenLabs tool definitions. Set it via environment variable in Railway to avoid key exposure in source code.

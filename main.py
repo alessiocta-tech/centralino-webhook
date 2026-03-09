@@ -7,6 +7,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Union, List, Dict, Any, Tuple
 
+import httpx
+
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field, root_validator
 from playwright.async_api import async_playwright
@@ -113,6 +115,25 @@ IPHONE_UA = (
 )
 
 DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
+
+# ============================================================
+# FIDY API (check, cancel, update, note)
+# ============================================================
+
+FIDY_API_BASE = os.getenv("FIDY_API_BASE", "https://api.fidy.app/api")
+FIDY_API_KEY = os.getenv("FIDY_API_KEY", "derione_api_2026_super_secret")
+FIDY_TIMEOUT_S = int(os.getenv("FIDY_TIMEOUT_S", "20"))
+
+SEDE_ID_MAP: Dict[str, int] = {
+    "talenti": 1,
+    "appia": 2,
+    "ostia": 3,
+    "ostia lido": 3,
+    "reggio": 4,
+    "reggio calabria": 4,
+    "rc": 4,
+    "palermo": 5,
+}
 
 app = FastAPI()
 
@@ -1384,3 +1405,183 @@ async def _do_booking(
                 await browser.close()
         except Exception:
             pass
+
+
+# ============================================================
+# FIDY API PROXY — check, find, cancel, update_covers, add_note
+# ============================================================
+
+def _fidy_headers() -> Dict[str, str]:
+    return {"X-API-Key": FIDY_API_KEY, "Content-Type": "application/json"}
+
+
+def _resolve_restaurant_id(restaurant_id: Any) -> int:
+    """Accetta ID numerico (int/str) o nome sede testuale. Ritorna sempre int."""
+    if isinstance(restaurant_id, int):
+        return restaurant_id
+    s = str(restaurant_id).strip()
+    if s.isdigit():
+        return int(s)
+    return SEDE_ID_MAP.get(s.lower(), int(s) if s.isdigit() else 0)
+
+
+# --- Modelli Pydantic ---
+
+class CheckReservationIn(BaseModel):
+    restaurant_id: Any
+    date: str
+    time: str
+    phone: str
+
+
+class FindReservationForCancelIn(BaseModel):
+    reservation_code: Optional[str] = None
+    restaurant_id: Optional[Any] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    phone: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+class CancelReservationIn(BaseModel):
+    restaurant_id: Any
+    date: str
+    time: str
+    phone: str
+    note: Optional[str] = None
+
+
+class UpdateCoversIn(BaseModel):
+    restaurant_id: Any
+    date: str
+    time: str
+    phone: str
+    new_covers: int
+
+
+class AddNoteIn(BaseModel):
+    restaurant_id: Any
+    date: str
+    time: str
+    phone: str
+    note: str
+
+
+# --- Endpoint proxy ---
+
+@app.get("/check_reservation")
+async def check_reservation(
+    restaurant_id: str,
+    date: str,
+    time: str,
+    phone: str,
+):
+    """Verifica se esiste una prenotazione per sede+data+orario+telefono."""
+    params = {
+        "restaurant_id": _resolve_restaurant_id(restaurant_id),
+        "date": date,
+        "time": time,
+        "phone": re.sub(r"[^\d+]", "", phone),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.get(f"{FIDY_API_BASE}/check-reservation", params=params, headers=_fidy_headers())
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+
+
+@app.post("/find_reservation_for_cancel")
+async def find_reservation_for_cancel(body: FindReservationForCancelIn):
+    """Trova una prenotazione da cancellare. Ritorna anche il telefono associato per conferma."""
+    payload: Dict[str, Any] = {}
+    if body.reservation_code:
+        payload["reservation_code"] = body.reservation_code
+    if body.restaurant_id is not None:
+        payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    if body.date:
+        payload["date"] = body.date
+    if body.time:
+        payload["time"] = body.time
+    if body.phone:
+        payload["phone"] = re.sub(r"[^\d+]", "", body.phone)
+    if body.first_name:
+        payload["first_name"] = body.first_name
+    if body.last_name:
+        payload["last_name"] = body.last_name
+
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.post(f"{FIDY_API_BASE}/find-reservation-for-cancel", json=payload, headers=_fidy_headers())
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+
+
+@app.post("/cancel_reservation")
+async def cancel_reservation(body: CancelReservationIn):
+    """Annulla una prenotazione esistente."""
+    payload: Dict[str, Any] = {
+        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
+        "date": body.date,
+        "time": body.time,
+        "phone": re.sub(r"[^\d+]", "", body.phone),
+    }
+    if body.note:
+        payload["note"] = body.note
+
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+
+
+@app.post("/update_covers")
+async def update_covers(body: UpdateCoversIn):
+    """Aggiorna il numero di coperti di una prenotazione esistente."""
+    payload: Dict[str, Any] = {
+        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
+        "date": body.date,
+        "time": body.time,
+        "phone": re.sub(r"[^\d+]", "", body.phone),
+        "new_covers": body.new_covers,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.post(f"{FIDY_API_BASE}/update-covers", json=payload, headers=_fidy_headers())
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+
+
+@app.post("/add_note")
+async def add_note(body: AddNoteIn):
+    """Aggiunge una nota a una prenotazione esistente."""
+    payload: Dict[str, Any] = {
+        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
+        "date": body.date,
+        "time": body.time,
+        "phone": re.sub(r"[^\d+]", "", body.phone),
+        "note": body.note,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.post(f"{FIDY_API_BASE}/add-note", json=payload, headers=_fidy_headers())
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
