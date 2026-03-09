@@ -1,0 +1,163 @@
+{
+  "type": "webhook",
+  "name": "book_table",
+  "description": "Verifica disponibilità (fase=availability) o registra una prenotazione (fase=book). SEQUENZA OBBLIGATORIA: 1) chiamare availability dopo aver raccolto sede+data+orario+persone, in modo silenzioso senza dirlo all'utente; 2) se la sede è SOLD_OUT proporre alternative; 3) solo dopo il sì al riepilogo, chiamare book. Data in ISO YYYY-MM-DD (già risolta e confermata). Orario in HH:MM (orario ufficiale del turno, non quello interno del cliente). Per più di 9 persone NON chiamare questo tool: comunicare il numero 06 56556 263.",
+  "disable_interruptions": false,
+  "force_pre_tool_speech": "auto",
+  "tool_call_sound": null,
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "execution_mode": "immediate",
+  "api_schema": {
+    "url": "https://centralino-webhook-production.up.railway.app/book_table",
+    "method": "POST",
+    "path_params_schema": [],
+    "query_params_schema": [],
+    "request_body_schema": {
+      "id": "body",
+      "type": "object",
+      "description": "Dati per disponibilità o prenotazione",
+      "properties": [
+        {
+          "id": "fase",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Fase dell'operazione. 'availability' per verifica silenziosa prima di raccogliere nome e telefono. 'book' per prenotazione finale, solo dopo il sì al riepilogo.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [
+            "availability",
+            "book"
+          ],
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "data",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Data prenotazione in formato YYYY-MM-DD. Deve essere già risolta tramite resolve_date e confermata dall'utente se relativa.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "orario",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Orario in formato HH:MM. In caso di doppio turno usare l'orario ufficiale di inizio turno, non l'orario interno detto dal cliente. Esempi: '20:00', '21:00', '19:30'.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "persone",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero di persone (1–9). Se l'utente indica più di 9 persone non chiamare questo tool: comunicare il numero 06 56556 263 e terminare il flusso.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "sede",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Sede del ristorante. Obbligatoria per entrambe le fasi. Valori supportati: Talenti, Appia, Ostia Lido, Reggio Calabria, Palermo.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [
+            "Talenti",
+            "Appia",
+            "Ostia Lido",
+            "Reggio Calabria",
+            "Palermo"
+          ],
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "nome",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nome del cliente. Obbligatorio se fase=book.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "cognome",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Cognome del cliente. Opzionale. Se assente il server usa automaticamente 'Cliente'. Non chiedere mai il cognome all'utente.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "telefono",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero di cellulare del cliente (solo cifre, senza spazi o simboli). Obbligatorio se fase=book.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "email",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Indirizzo email del cliente. Se l'utente rifiuta di fornirlo, omettere il campo: il server usa un'email di default interna.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "seggiolini",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero di seggiolini (0–2). Compilare SOLO se l'utente cita bambini (bambino, bambina, bimbo, neonato, passeggino). Altrimenti omettere o inviare '0'.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "nota",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Allergie, intolleranze o richieste speciali per il tavolo. Omettere se non presenti.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": false
+        }
+      ],
+      "required": false,
+      "value_type": "llm_prompt"
+    },
+    "request_headers": [],
+    "auth_connection": null
+  },
+  "assignments": [],
+  "response_timeout_secs": 60,
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  }
+}

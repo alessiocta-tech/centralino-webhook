@@ -1,0 +1,110 @@
+{
+  "type": "webhook",
+  "name": "find_reservation_for_cancel",
+  "description": "Trova una prenotazione da cancellare usando numero prenotazione, oppure nome e data, oppure telefono e data. Restituisce anche il numero di telefono associato per conferma.",
+  "disable_interruptions": false,
+  "force_pre_tool_speech": "auto",
+  "tool_call_sound": null,
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "execution_mode": "immediate",
+  "api_schema": {
+    "url": "https://centralino-webhook-production.up.railway.app/find_reservation_for_cancel",
+    "method": "POST",
+    "path_params_schema": [],
+    "query_params_schema": [],
+    "request_body_schema": {
+      "id": "body",
+      "type": "object",
+      "description": "Dati per trovare una prenotazione da cancellare",
+      "properties": [
+        {
+          "id": "reservation_code",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero prenotazione ricevuto via WhatsApp o email",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "restaurant_id",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "ID numerico del ristorante: Talenti=1, Appia=2, Ostia=3, Reggio Calabria=4, Palermo=5",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "date",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Data della prenotazione nel formato YYYY-MM-DD",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "time",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Ora della prenotazione nel formato HH:MM. Usarla solo se il cliente la conosce. Non usare mai 00:00 come default.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "phone",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero di telefono del cliente",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "first_name",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nome della prenotazione",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "last_name",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Cognome della prenotazione, se disponibile",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        }
+      ],
+      "required": false,
+      "value_type": "llm_prompt"
+    },
+    "request_headers": [],
+    "auth_connection": null
+  },
+  "assignments": [],
+  "response_timeout_secs": 20,
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  }
+}

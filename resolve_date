@@ -1,0 +1,44 @@
+{
+  "type": "webhook",
+  "name": "resolve_date",
+  "description": "Risolve espressioni di data relative in italiano nella data ISO corrispondente e nei componenti parlati. Da chiamare SEMPRE prima di pronunciare qualsiasi giorno, numero o mese, quando l'utente usa espressioni come: stasera, oggi, domani, dopodomani, sabato, martedì, weekend, sabato sera, domenica pranzo, ecc. Se requires_confirmation=true, chiedere conferma all'utente con la frase: 'Per sicurezza intendi [weekday_spoken] [day_number] [month_spoken], giusto?' — e non proseguire finché non dice sì. Se requires_confirmation=false (stasera/oggi), procedere senza chiedere conferma.",
+  "disable_interruptions": false,
+  "force_pre_tool_speech": "auto",
+  "tool_call_sound": null,
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "execution_mode": "immediate",
+  "api_schema": {
+    "url": "https://centralino-webhook-production.up.railway.app/resolve_date",
+    "method": "POST",
+    "path_params_schema": [],
+    "query_params_schema": [],
+    "request_body_schema": {
+      "id": "body",
+      "type": "object",
+      "description": "Testo contenente l'espressione di data relativa da risolvere",
+      "properties": [
+        {
+          "id": "input_text",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Testo originale dell'utente contenente l'espressione di data relativa. Includere tutto il contesto utile. Esempi: 'sabato sera', 'domani a pranzo', 'dopodomani', 'questo weekend', 'martedì', 'domenica'.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": [],
+          "is_system_provided": false,
+          "required": true
+        }
+      ],
+      "required": false,
+      "value_type": "llm_prompt"
+    },
+    "request_headers": [],
+    "auth_connection": null
+  },
+  "assignments": [],
+  "response_timeout_secs": 10,
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  }
+}
