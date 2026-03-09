@@ -409,13 +409,75 @@ def _format_out(d: date, requires: bool, rule: str) -> ResolveDateOut:
     )
 
 
+_MONTH_NAME_MAP: Dict[str, int] = {
+    "gennaio": 1, "gen": 1,
+    "febbraio": 2, "feb": 2,
+    "marzo": 3, "mar": 3,
+    "aprile": 4, "apr": 4,
+    "maggio": 5, "mag": 5,
+    "giugno": 6, "giu": 6,
+    "luglio": 7, "lug": 7,
+    "agosto": 8, "ago": 8,
+    "settembre": 9, "set": 9, "sett": 9,
+    "ottobre": 10, "ott": 10,
+    "novembre": 11, "nov": 11,
+    "dicembre": 12, "dic": 12,
+}
+_MONTH_PAT = "|".join(sorted(_MONTH_NAME_MAP.keys(), key=len, reverse=True))
+
+
+def _parse_absolute_date(t: str, today: date) -> Optional[date]:
+    """Riconosce date assolute: '14 marzo', 'marzo 14', '14 marzo 2026', '14/03', '14-03'."""
+    # "14 marzo [2026]" o "marzo 14 [2026]"
+    m = re.search(rf"(\d{{1,2}})\s+({_MONTH_PAT})(?:\s+(\d{{4}}))?", t)
+    if not m:
+        m_rev = re.search(rf"({_MONTH_PAT})\s+(\d{{1,2}})(?:\s+(\d{{4}}))?", t)
+        if m_rev:
+            month_name = m_rev.group(1)
+            day = int(m_rev.group(2))
+            year_str = m_rev.group(3)
+        else:
+            m_rev = None
+        if not m_rev:
+            # "14/03" o "14-03"
+            m2 = re.search(r"\b(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{4}|\d{2}))?\b", t)
+            if m2:
+                day = int(m2.group(1))
+                month = int(m2.group(2))
+                year_str = m2.group(3)
+                year = int(year_str) if year_str else today.year
+                if len(str(year)) == 2:
+                    year += 2000
+                try:
+                    d = date(year, month, day)
+                    if d < today and not year_str:
+                        d = date(year + 1, month, day)
+                    return d
+                except ValueError:
+                    return None
+            return None
+        month = _MONTH_NAME_MAP[month_name]
+    else:
+        day = int(m.group(1))
+        month_name = m.group(2)
+        month = _MONTH_NAME_MAP[month_name]
+        year_str = m.group(3)
+
+    year = int(year_str) if year_str else today.year
+    try:
+        d = date(year, month, day)
+        if d < today and not year_str:
+            d = date(year + 1, month, day)
+        return d
+    except ValueError:
+        return None
+
+
 @app.post("/resolve_date", response_model=ResolveDateOut)
 def resolve_date(payload: ResolveDateIn):
     """
-    Risolve "stasera/domani/martedì/questo sabato/weekend" usando TZ locale.
-    - "stasera/oggi" => NON richiede conferma (assoluto)
-    - "domani/dopodomani/giorni settimana/weekend" => richiede conferma
-    - Se oggi è lo stesso weekday richiesto => richiede conferma e ritorna oggi
+    Risolve espressioni di data in italiano usando TZ locale.
+    Gestisce sia date relative (domani, sabato, weekend) sia assolute (14 marzo, 14/03).
     """
     text = (payload.input_text or "").strip().lower()
     if not text:
@@ -442,7 +504,12 @@ def resolve_date(payload: ResolveDateIn):
             d = _next_weekday(today, wd)
             return _format_out(d, True, f"weekday:{key}")
 
-    raise HTTPException(status_code=422, detail="Unrecognized relative date expression")
+    # Date assolute: "14 marzo", "14/03", "14 marzo 2026", ecc.
+    abs_date = _parse_absolute_date(t, today)
+    if abs_date is not None:
+        return _format_out(abs_date, requires=True, rule="absolute_date")
+
+    raise HTTPException(status_code=422, detail="Unrecognized date expression")
 
 
 @app.get("/time_now")
@@ -1466,11 +1533,11 @@ class UpdateCoversIn(BaseModel):
 
 
 class AddNoteIn(BaseModel):
-    restaurant_id: Any
-    date: str
-    time: str
     phone: str
+    date: str
     note: str
+    restaurant_id: Any = None
+    time: Optional[str] = None
 
 
 # --- Endpoint proxy ---
@@ -1545,7 +1612,15 @@ async def cancel_reservation(body: CancelReservationIn):
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
-        return resp.json()
+        try:
+            body_json = resp.json()
+        except Exception:
+            body_json = {"raw": resp.text}
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=body_json)
+        return body_json
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
     except Exception as e:
@@ -1577,12 +1652,14 @@ async def update_covers(body: UpdateCoversIn):
 async def add_note(body: AddNoteIn):
     """Aggiunge una nota a una prenotazione esistente."""
     payload: Dict[str, Any] = {
-        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
-        "date": body.date,
-        "time": body.time,
         "phone": re.sub(r"[^\d+]", "", body.phone),
+        "date": body.date,
         "note": body.note,
     }
+    if body.restaurant_id is not None:
+        payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    if body.time is not None:
+        payload["time"] = body.time
 
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
