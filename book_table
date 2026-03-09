@@ -156,7 +156,7 @@
     "auth_connection": null
   },
   "assignments": [],
-  "response_timeout_secs": 25,
+  "response_timeout_secs": 60,
   "dynamic_variables": {
     "dynamic_variable_placeholders": {}
   }

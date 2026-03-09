@@ -9,7 +9,7 @@
   "tool_error_handling_mode": "auto",
   "execution_mode": "immediate",
   "api_schema": {
-    "url": "https://api.fidy.app/api/cancel-reservation",
+    "url": "https://centralino-webhook-production.up.railway.app/cancel_reservation",
     "method": "POST",
     "path_params_schema": [],
     "query_params_schema": [],
@@ -77,18 +77,7 @@
       "required": false,
       "value_type": "llm_prompt"
     },
-    "request_headers": [
-      {
-        "type": "value",
-        "name": "X-API-Key",
-        "value": "derione_api_2026_super_secret"
-      },
-      {
-        "type": "value",
-        "name": "Content-Type",
-        "value": "application/json"
-      }
-    ],
+    "request_headers": [],
     "auth_connection": null
   },
   "assignments": [],

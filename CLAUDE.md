@@ -171,11 +171,11 @@ Converts Italian relative date expressions to ISO dates.
 
 Input:
 ```json
-{ "testo": "domani sera", "timezone": "Europe/Rome" }
+{ "input_text": "domani sera" }
 ```
 Output:
 ```json
-{ "data": "2026-03-09", "giorno": "Lunedì", "tipo": "Domani" }
+{ "date_iso": "2026-03-09", "weekday_spoken": "Lunedì", "day_number": 9, "month_spoken": "Marzo", "requires_confirmation": true, "matched_rule": "domani" }
 ```
 
 ### `GET /time_now`
