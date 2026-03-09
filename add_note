@@ -1,0 +1,99 @@
+{
+  "type": "webhook",
+  "name": "add_note_to_reservation",
+  "description": "Aggiunge una nota a una prenotazione esistente.",
+  "disable_interruptions": false,
+  "force_pre_tool_speech": "auto",
+  "tool_call_sound": null,
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "execution_mode": "immediate",
+  "api_schema": {
+    "url": "https://api.fidy.app/api/add-note",
+    "method": "POST",
+    "path_params_schema": [],
+    "query_params_schema": [],
+    "request_body_schema": {
+      "id": "body",
+      "type": "object",
+      "description": "Dati necessari per aggiungere una nota a una prenotazione esistente",
+      "properties": [
+        {
+          "id": "restaurant_id",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "ID del ristorante",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "date",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Data prenotazione nel formato YYYY-MM-DD",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "time",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Ora prenotazione nel formato HH:MM",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "phone",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Telefono del cliente",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "note",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nota da aggiungere alla prenotazione",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        }
+      ],
+      "required": false,
+      "value_type": "llm_prompt"
+    },
+    "request_headers": [
+      {
+        "type": "value",
+        "name": "X-API-Key",
+        "value": "derione_api_2026_super_secret"
+      },
+      {
+        "type": "value",
+        "name": "Content-Type",
+        "value": "application/json"
+      }
+    ],
+    "auth_connection": null
+  },
+  "assignments": [],
+  "response_timeout_secs": 20,
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  }
+}
