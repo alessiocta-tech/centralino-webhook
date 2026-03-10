@@ -426,8 +426,32 @@ _MONTH_NAME_MAP: Dict[str, int] = {
 _MONTH_PAT = "|".join(sorted(_MONTH_NAME_MAP.keys(), key=len, reverse=True))
 
 
+_IT_ORDINAL_DAY: Dict[str, str] = {
+    "primo": "1", "prima": "1", "l'uno": "1", "uno": "1",
+    "due": "2", "tre": "3", "quattro": "4", "cinque": "5",
+    "sei": "6", "sette": "7", "otto": "8", "nove": "9", "dieci": "10",
+    "undici": "11", "dodici": "12", "tredici": "13", "quattordici": "14",
+    "quindici": "15", "sedici": "16", "diciassette": "17", "diciotto": "18",
+    "diciannove": "19", "venti": "20", "ventuno": "21", "ventidue": "22",
+    "ventitre": "23", "ventitré": "23", "ventiquattro": "24",
+    "venticinque": "25", "ventisei": "26", "ventisette": "27",
+    "ventotto": "28", "ventotto": "28", "ventinove": "29",
+    "trenta": "30", "trentuno": "31",
+}
+_IT_ORDINAL_PAT = "|".join(sorted(_IT_ORDINAL_DAY.keys(), key=len, reverse=True))
+
+
+def _normalize_ordinal_days(t: str) -> str:
+    """Sostituisce ordinali italiani con il numero corrispondente prima del parsing."""
+    def _replace(m: re.Match) -> str:
+        word = m.group(1).lower()
+        return _IT_ORDINAL_DAY.get(word, m.group(0))
+    return re.sub(rf"\b({_IT_ORDINAL_PAT})\b", _replace, t)
+
+
 def _parse_absolute_date(t: str, today: date) -> Optional[date]:
     """Riconosce date assolute: '14 marzo', 'marzo 14', '14 marzo 2026', '14/03', '14-03'."""
+    t = _normalize_ordinal_days(t)
     # "14 marzo [2026]" o "marzo 14 [2026]"
     m = re.search(rf"(\d{{1,2}})\s+({_MONTH_PAT})(?:\s+(\d{{4}}))?", t)
     if not m:
