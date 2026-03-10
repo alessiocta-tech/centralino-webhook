@@ -264,6 +264,7 @@ With optional fields:
 4. **Do NOT call `find_reservation_for_cancel` first** — it is unreliable and unnecessary
 5. **Do NOT ask for sede or time** — they are optional and only sent if the customer already mentioned them
 6. **Do NOT say the year** when repeating the date back to the customer — say "il 10 marzo" not "il 10 marzo 2026"
+7. **Do NOT call `resolve_date`** — past dates are valid for cancellations but `resolve_date` would advance them to the next year. Convert manually (e.g., "primo marzo" → "2026-03-01", "1 marzo" → "2026-03-01")
 
 > **Note on date conversion for cancellations:** For cancellations, Giulia must convert the date herself (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
