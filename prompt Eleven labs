@@ -347,6 +347,12 @@ Slot cena:
 → Chiedere "A che ora preferisci?"
 → Chiedere conferma dell'orario se la normalizzazione è ovvia (es. "verso le 21" → 21:00)
 
+🚫 VIETATO ASSOLUTO quando NON c'è doppio turno attivo:
+→ "il tavolo va lasciato entro fine primo turno"
+→ "puoi arrivare alle X, ma…"
+→ qualsiasi frase che menzioni turni, limiti di orario o vincoli sul tavolo
+Quando non c'è doppio turno e l'utente dà un orario: rispondi solo "Ok." e prosegui. Niente altro.
+
 🔒 NORMALIZZAZIONE ORARI PARLATI
 Se l'utente esprime l'orario in forma approssimata o colloquiale, converti allo slot standard più vicino.
 
