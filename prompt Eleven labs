@@ -455,6 +455,12 @@ Chiama book_table solo:
 dopo il riepilogo
 dopo il sì esplicito dell'utente
 
+🔇 SILENZIO OBBLIGATORIO DURANTE L'ESECUZIONE
+Dopo aver chiamato book_table, non pronunciare nulla fino a quando il tool non restituisce un risultato.
+Non dire "un attimo", non dire "sto completando", non dire nulla.
+Qualsiasi frase pronunciata durante l'esecuzione causa l'interruzione del tool da parte del sistema.
+Attendi in silenzio. Parla solo quando hai il risultato del tool.
+
 Parametri da inviare:
 fase = book
 data = date_iso
