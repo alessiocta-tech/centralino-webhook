@@ -48,22 +48,63 @@ Production URL: `https://centralino-webhook-production.up.railway.app`
 - Skip any step whose information was already provided by the customer, even if provided in a previous turn.
 - Retain all collected info across the entire conversation (name, phone, email, notes, sede, persone, orario). Never re-ask info already given.
 
-### Conversational Flow
-The agent follows this strict sequence when a customer calls to book:
+### Conversational Flow — Sequenza Obbligatoria
 
-1. **Date resolution** — Call `POST /resolve_date` to convert relative expressions ("sabato sera", "domani") to ISO date. Ask confirmation: "Per sicurezza intendi sabato 14 marzo, giusto?"
-2. **Party size** — "Quante persone?" (skip if already mentioned)
-3. **Sede** — "In quale sede preferisci?" (skip if already mentioned)
-4. **Double turn check** — Consult the double turn table (see below). If applicable, propose turns before asking for time
-5. **Time** — "A che ora preferisci?" (skip if double turn already determines it)
-6. **Notes** — "Allergie o richieste per il tavolo?"
-7. **Name & phone** — "Nome e cellulare?"
-8. **Email** — "Vuoi ricevere la conferma per email?"
-9. **Summary** — Single summary, once only, before booking: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
-10. **Book** — After customer says "sì", call `POST /book_table` with `fase=book` directly (no prior availability check — the booking call handles availability internally and returns `SOLD_OUT` if the slot is full)
-11. **Confirmation** — "Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+Segui questo ordine **esatto** per ogni nuova prenotazione. Salta i passi per cui il dato è già noto dal messaggio del cliente.
 
-> **Note:** `fase=availability` is deprecated in the agent flow. Do NOT call it before booking. `fase=book` already checks availability internally and returns `SOLD_OUT` with alternative suggestions if the slot is full. Skipping the separate availability call saves one full browser session (~30–50s) and avoids HTTP 504 timeouts.
+**Passo 1 — DATA**
+Chiama `POST /resolve_date` per convertire espressioni relative ("sabato sera", "domani") in data ISO.
+Chiedi conferma solo se necessario: "Per sicurezza intendi sabato 14 marzo, giusto?"
+Non proseguire finché la data non è confermata.
+
+**Passo 2 — PERSONE**
+Se non già fornito: "Quante persone?"
+
+**Passo 3 — SEDE**
+Se non già fornita: "In quale sede preferisci?"
+
+**Passo 4 — ⚠️ CONTROLLO DOPPIO TURNO — OBBLIGATORIO**
+Appena sono noti sede + data + fascia (pranzo/cena), esegui i 3 passi in ordine **prima** di fare qualsiasi domanda sull'orario:
+
+> *Verifica 1* — Il giorno è sabato o domenica?
+> → Se NO: doppio turno non esiste. Vai al Passo 5.
+> → Se SÌ: vai alla Verifica 2.
+>
+> *Verifica 2* — La combinazione sede + giorno + fascia è nella tabella doppio turno (vedi sotto)?
+> → Se NO: doppio turno non esiste. Vai al Passo 5.
+> → Se SÌ: vai alla Verifica 3.
+>
+> *Verifica 3* — Il cliente ha già indicato un orario?
+> → Se NO: **NON chiedere "A che ora preferisci?"** — dì direttamente:
+>   "Qui c'è doppio turno: primo [range], secondo [range]. Quale preferisci?"
+>   Attendi la risposta. Assegna `orario_tool` = orario ufficiale di inizio turno. Vai al Passo 6.
+> → Se SÌ: determina il turno dall'orario dichiarato (vedi Caso B sotto). Vai al Passo 6.
+
+**⚠️ REGOLA CRITICA:** Il Passo 4 avviene SEMPRE prima del Passo 5. Se sede + data + fascia sono già noti dal primo messaggio del cliente, il controllo doppio turno si esegue **immediatamente** — senza aver fatto altre domande. Non è mai consentito chiedere "A che ora preferisci?" se il doppio turno si applica.
+
+**Passo 5 — ORARIO**
+Solo se non c'è doppio turno E il cliente non ha già indicato un orario: "A che ora preferisci?"
+Se il cliente ha già indicato un orario: normalizzalo e usalo direttamente. Non chiedere nulla.
+
+**Passo 6 — NOTE**
+"Allergie o richieste per il tavolo?"
+
+**Passo 7 — NOME E CELLULARE**
+"Nome e cellulare?"
+
+**Passo 8 — EMAIL**
+"Vuoi ricevere la conferma della prenotazione per email?"
+
+**Passo 9 — RIEPILOGO**
+Una sola volta, formato fisso: "Riepilogo: [Sede] [giorno] [numero] [mese] alle [orario], [persone] persone. Nome: [nome]. Confermi?"
+
+**Passo 10 — BOOK**
+Solo dopo il "sì". Chiama `POST /book_table` con `fase=book` direttamente (nessun controllo disponibilità separato — `fase=book` lo gestisce internamente e restituisce `SOLD_OUT` se il turno è pieno).
+
+**Passo 11 — CONFERMA**
+"Perfetto. Prenotazione confermata: [...]. Controlla WhatsApp per la conferma."
+
+> **Nota:** `fase=availability` è deprecato nel flusso agente. NON chiamarlo prima della prenotazione. `fase=book` controlla la disponibilità internamente e restituisce `SOLD_OUT` con alternative se il turno è pieno. Saltare la chiamata availability separata evita una sessione browser aggiuntiva (~30–50s) e timeout HTTP 504.
 
 ### Handling book_table Errors
 The webhook response always includes a `status` field. Handle it as follows:
@@ -80,27 +121,29 @@ The webhook response always includes a `status` field. Handle it as follows:
 - When retrying after `TECH_ERROR`, reuse exactly the same parameters (sede, orario, turno, nome, telefono, email, note) — do NOT re-ask the customer anything.
 
 ### Double Turn Table (Doppio Turno)
-Some sede+day+meal combinations have two seatings. The agent must check this table before asking for a time:
 
-| Sede | Day | Meal | 1st Turn | 2nd Turn |
-|------|-----|------|----------|----------|
-| Talenti | Saturday | Lunch | 12:00–13:15 | 13:30+ |
-| Talenti | Sunday | Lunch | 12:00–13:15 | 13:30+ |
-| Talenti | Saturday | Dinner | 19:00–20:45 | 21:00+ |
-| Appia | Saturday | Lunch | 12:00–13:20 | 13:30+ |
-| Appia | Sunday | Lunch | 12:00–13:20 | 13:30+ |
-| Appia | Saturday | Dinner | 19:30–21:15 | 21:30+ |
-| Palermo | Saturday | Lunch | 12:00–13:20 | 13:30+ |
-| Palermo | Sunday | Lunch | 12:00–13:20 | 13:30+ |
-| Palermo | Saturday | Dinner | 19:30–21:15 | 21:30+ |
-| Reggio Calabria | Saturday | Dinner | 19:30–21:15 | 21:30+ |
-| Ostia Lido | — | — | Never has double turn | — |
+Alcune combinazioni sede + giorno + pasto hanno due turni. Consultare questa tabella al Passo 4 del flusso di prenotazione.
 
-**Rules:**
-- **Only apply double turn logic on the days listed above** — do NOT mention turns on days not in the table (e.g., Monday–Friday, Sunday dinner, etc.)
-- If the customer's stated time already identifies a turn, use it directly without asking
-- In double turn, always send the official turn start time to the webhook (not the customer's internal time)
-- If >9 people, do NOT call the webhook — give the phone number 06 56556 263
+| Sede | Giorno | Pasto | 1° Turno | 2° Turno |
+|------|--------|-------|----------|----------|
+| Talenti | Sabato | Pranzo | 12:00–13:15 | 13:30+ |
+| Talenti | Domenica | Pranzo | 12:00–13:15 | 13:30+ |
+| Talenti | Sabato | Cena | 19:00–20:45 | 21:00+ |
+| Appia | Sabato | Pranzo | 12:00–13:20 | 13:30+ |
+| Appia | Domenica | Pranzo | 12:00–13:20 | 13:30+ |
+| Appia | Sabato | Cena | 19:30–21:15 | 21:30+ |
+| Palermo | Sabato | Pranzo | 12:00–13:20 | 13:30+ |
+| Palermo | Domenica | Pranzo | 12:00–13:20 | 13:30+ |
+| Palermo | Sabato | Cena | 19:30–21:15 | 21:30+ |
+| Reggio Calabria | Sabato | Cena | 19:30–21:15 | 21:30+ |
+| Ostia Lido | — | — | Mai doppio turno | — |
+
+**Regole doppio turno:**
+- Applicare la logica doppio turno **solo** per i giorni/fasce elencati — NON menzionare turni per i giorni non in tabella (es. lunedì–venerdì, domenica sera, ecc.)
+- **Caso A — cliente NON ha indicato orario:** NON chiedere "A che ora preferisci?" — presentare direttamente i turni: "Qui c'è doppio turno: primo [range], secondo [range]. Quale preferisci?" Usare l'orario ufficiale di inizio turno per il webhook.
+- **Caso B — cliente HA già indicato un orario:** determinare il turno dall'orario dichiarato (es. "20:00" ad Appia sabato cena → 1° turno 19:30–21:15 → `orario_tool = "19:30"`). Non chiedere nulla sul turno.
+- In doppio turno, inviare sempre al webhook l'orario ufficiale di inizio turno (non l'orario interno del cliente)
+- Se >9 persone, NON chiamare il webhook — fornire il numero 06 56556 263
 
 ### Standard Time Slots
 When there is no double turn:
