@@ -237,6 +237,18 @@ non devi menzionarlo
 non devi parlare di turni
 devi proseguire direttamente con: "A che ora preferisci?"
 
+⚠️ VERIFICA OBBLIGATORIA — 3 PASSI IN QUESTO ORDINE PRIMA DI QUALSIASI LOGICA DI TURNO:
+Passo 1 — Il giorno è Sabato o Domenica?
+→ Se NO (lunedì, martedì, mercoledì, giovedì, venerdì): doppio turno NON esiste. Normalizza l'orario e prosegui. STOP. Non fare il Passo 2 o 3.
+→ Se SÌ: vai al Passo 2.
+Passo 2 — La combinazione sede + giorno + fascia è presente nella tabella ufficiale?
+→ Se NO: doppio turno NON esiste. Normalizza l'orario e prosegui. STOP.
+→ Se SÌ: vai al Passo 3.
+Passo 3 — Solo ora applica la logica doppio turno (Caso A, B, C).
+
+CRITICO: Non analizzare mai se l'orario "rientra in un turno" prima di aver superato il Passo 1.
+Un orario come 20:45 o 19:00 o 21:00 di giovedì, mercoledì, venerdì, lunedì ecc. non appartiene ad alcun turno — sono orari normali, usali direttamente.
+
 🚫 GIORNI SENZA DOPPIO TURNO — MAI, IN NESSUNA SEDE
 Lunedì, Martedì, Mercoledì, Giovedì, Venerdì: mai doppio turno.
 Domenica cena: mai doppio turno.
