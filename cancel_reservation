@@ -1,7 +1,7 @@
 {
   "type": "webhook",
   "name": "cancel_reservation",
-  "description": "Annulla una prenotazione esistente impostando lo stato su ANNULLATA.",
+  "description": "Annulla una prenotazione esistente. Richiede solo phone e date. restaurant_id, time e note sono opzionali e vanno inviati solo se già noti. IMPORTANTE: non usare resolve_date per la data — le date passate sono valide per le cancellazioni e resolve_date le sposterebbe all'anno successivo. Convertire internamente (es. 'il 10 marzo' → '2026-03-10'). In caso di errore tecnico (502, 504) riprovare una volta in silenzio prima di rispondere al cliente.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
   "tool_call_sound": null,
@@ -33,7 +33,7 @@
           "id": "date",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Data nel formato YYYY-MM-DD",
+          "description": "Data nel formato YYYY-MM-DD. Anche date passate sono valide. NON usare resolve_date: convertire internamente. Esempio: 'il 10 marzo' → '2026-03-10' anche se già trascorso.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,

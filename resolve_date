@@ -1,7 +1,7 @@
 {
   "type": "webhook",
   "name": "resolve_date",
-  "description": "Risolve espressioni di data relative in italiano nella data ISO corrispondente e nei componenti parlati. Da chiamare SEMPRE prima di pronunciare qualsiasi giorno, numero o mese, quando l'utente usa espressioni come: stasera, oggi, domani, dopodomani, sabato, martedì, weekend, sabato sera, domenica pranzo, ecc. Se requires_confirmation=true, chiedere conferma all'utente con la frase: 'Per sicurezza intendi [weekday_spoken] [day_number] [month_spoken], giusto?' — e non proseguire finché non dice sì. Se requires_confirmation=false (stasera/oggi), procedere senza chiedere conferma.",
+  "description": "Risolve espressioni di data relative in italiano nella data ISO corrispondente e nei componenti parlati. Da chiamare SEMPRE prima di pronunciare qualsiasi giorno, numero o mese, quando l'utente usa espressioni come: stasera, oggi, domani, dopodomani, sabato, martedì, weekend, sabato sera, domenica pranzo, ecc. Se requires_confirmation=true, chiedere conferma all'utente con la frase: 'Per sicurezza intendi [weekday_spoken] [day_number] [month_spoken], giusto?' — e non proseguire finché non dice sì. Se requires_confirmation=false (stasera/oggi), procedere senza chiedere conferma. NON usare questo tool per le cancellazioni: per cancel_reservation la data va risolta internamente.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
   "tool_call_sound": null,

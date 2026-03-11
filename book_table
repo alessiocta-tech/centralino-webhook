@@ -16,7 +16,7 @@
     "request_body_schema": {
       "id": "body",
       "type": "object",
-      "description": "Dati per disponibilità o prenotazione",
+      "description": "Dati per la prenotazione",
       "properties": [
         {
           "id": "fase",
@@ -68,7 +68,7 @@
           "id": "sede",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Sede del ristorante. Obbligatoria per entrambe le fasi. Valori supportati: Talenti, Appia, Ostia Lido, Reggio Calabria, Palermo.",
+          "description": "Sede del ristorante. Valori supportati: Talenti, Appia, Ostia Lido, Reggio Calabria, Palermo.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": [
@@ -85,20 +85,20 @@
           "id": "nome",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Nome del cliente. Obbligatorio se fase=book.",
+          "description": "Nome del cliente.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": [],
           "is_system_provided": false,
-          "required": false
+          "required": true
         },
         {
           "id": "cognome",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Cognome del cliente. Opzionale. Se assente il server usa automaticamente 'Cliente'. Non chiedere mai il cognome all'utente.",
+          "description": "Cognome del cliente. Non chiedere mai all'utente. Inviare sempre 'Cliente'.",
           "dynamic_variable": "",
-          "constant_value": "",
+          "constant_value": "Cliente",
           "enum": [],
           "is_system_provided": false,
           "required": false
@@ -107,18 +107,18 @@
           "id": "telefono",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Numero di cellulare del cliente (solo cifre, senza spazi o simboli). Obbligatorio se fase=book.",
+          "description": "Numero di cellulare del cliente (solo cifre, senza spazi o simboli).",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": [],
           "is_system_provided": false,
-          "required": false
+          "required": true
         },
         {
           "id": "email",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Indirizzo email del cliente. Se l'utente rifiuta di fornirlo, omettere il campo: il server usa un'email di default interna.",
+          "description": "Indirizzo email del cliente. Inviare SOLO se l'utente l'ha fornita esplicitamente. Se l'utente non vuole ricevere conferme email, omettere completamente questo campo: il server usa un'email di default interna.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": [],

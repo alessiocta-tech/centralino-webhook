@@ -1,7 +1,7 @@
 {
   "type": "webhook",
   "name": "update_covers",
-  "description": "Aggiorna il numero di coperti di una prenotazione esistente. Se la variazione supera 5 coperti, la prenotazione va annullata e rifatta.",
+  "description": "Aggiorna il numero di coperti di una prenotazione esistente. Se la risposta contiene requires_rebooking=true, la prenotazione va annullata e rifatta. Se la data è relativa, usare resolve_date normalmente prima di chiamare questo tool.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
   "tool_call_sound": null,
