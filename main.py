@@ -1636,6 +1636,12 @@ async def cancel_reservation(body: CancelReservationIn):
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type or resp.text.lstrip().startswith("<"):
+            raise HTTPException(status_code=502, detail={
+                "error": "CAPTCHA_BLOCKED",
+                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato). Contatta Fidy per whitelistare l'IP del server.",
+            })
         try:
             body_json = resp.json()
         except Exception:
