@@ -136,6 +136,14 @@ SEDE_ID_MAP: Dict[str, int] = {
     "palermo": 5,
 }
 
+_ID_TO_SEDE_NAME: Dict[int, str] = {
+    1: "Talenti",
+    2: "Appia",
+    3: "Ostia Lido",
+    4: "Reggio Calabria",
+    5: "Palermo",
+}
+
 app = FastAPI()
 
 # ============================================================
@@ -263,6 +271,19 @@ def _get_customer(phone: str) -> Optional[Dict[str, Any]]:
     conn = _db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM customers WHERE phone = ?", (phone,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _lookup_last_booking(phone: str, data: str, orario: str) -> Optional[Dict[str, Any]]:
+    """Cerca l'ultima prenotazione riuscita per phone+data+orario nell'archivio locale."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM bookings WHERE phone=? AND data=? AND orario=? AND ok=1 ORDER BY id DESC LIMIT 1",
+        (phone, data, orario),
+    )
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -1760,37 +1781,112 @@ async def cancel_reservation(body: CancelReservationIn):
 
 @app.post("/update_covers")
 async def update_covers(body: UpdateCoversIn):
-    """Aggiorna il numero di coperti di una prenotazione esistente."""
-    payload: Dict[str, Any] = {
-        "restaurant_id": _resolve_restaurant_id(body.restaurant_id),
+    """Aggiorna il numero di coperti di una prenotazione esistente.
+
+    Strategia a due livelli:
+    1. Prova l'API Fidy /update-covers (veloce, ~1s).
+    2. Se fallisce o richiede rebooking → cancella e riprenota via Playwright
+       usando i dati dell'archivio locale (bookings + customers).
+    """
+    phone = re.sub(r"[^\d+]", "", body.phone)
+    rest_id = _resolve_restaurant_id(body.restaurant_id)
+    fidy_payload: Dict[str, Any] = {
+        "restaurant_id": rest_id,
         "date": body.date,
         "time": body.time,
-        "phone": re.sub(r"[^\d+]", "", body.phone),
+        "phone": phone,
         "new_covers": body.new_covers,
     }
 
+    # ── Tentativo 1: Fidy API ──────────────────────────────────────────────
+    needs_rebooking = False
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
-            resp = await client.post(f"{FIDY_API_BASE}/update-covers", json=payload, headers=_fidy_headers())
+            resp = await client.post(
+                f"{FIDY_API_BASE}/update-covers", json=fidy_payload, headers=_fidy_headers()
+            )
         content_type = resp.headers.get("content-type", "")
-        if "text/html" in content_type or resp.text.lstrip().startswith("<"):
-            raise HTTPException(status_code=502, detail={
-                "error": "CAPTCHA_BLOCKED",
-                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato).",
-            })
-        try:
-            body_json = resp.json()
-        except Exception:
-            body_json = {"raw": resp.text}
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=body_json)
-        return body_json
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+        is_html = "text/html" in content_type or resp.text.lstrip().startswith("<")
+        if not is_html:
+            try:
+                fidy_json = resp.json()
+            except Exception:
+                fidy_json = None
+            if resp.status_code < 400 and fidy_json and not fidy_json.get("requires_rebooking"):
+                return fidy_json  # ✅ successo diretto Fidy
+        needs_rebooking = True
+        print(f"⚠️ update_covers: Fidy API non disponibile (status={resp.status_code}), fallback cancel+rebook")
+    except Exception as exc:
+        needs_rebooking = True
+        print(f"⚠️ update_covers: eccezione Fidy API ({exc}), fallback cancel+rebook")
+
+    # ── Tentativo 2: cancel + rebook via Playwright ────────────────────────
+    # Recupera dati dalla prenotazione originale (archivio locale)
+    booking = _lookup_last_booking(phone, body.date, body.time)
+    customer = _get_customer(phone)
+
+    nome = (booking or {}).get("name") or (customer or {}).get("name") or "Cliente"
+    email = (customer or {}).get("email") or (booking or {}).get("email") or DEFAULT_EMAIL
+    if not email or "@" not in str(email):
+        email = DEFAULT_EMAIL
+    sede = (booking or {}).get("sede") or _ID_TO_SEDE_NAME.get(rest_id, "")
+    seggiolini = int((booking or {}).get("seggiolini") or 0)
+    note = (booking or {}).get("note") or ""
+
+    if not sede:
+        # Sede sconosciuta: non possiamo riprenota automaticamente
+        return {
+            "ok": False,
+            "requires_rebooking": True,
+            "message": "Sede non trovata nell'archivio. Cancella e riprenota manualmente.",
+        }
+
+    # Cancella la prenotazione esistente
+    cancel_payload: Dict[str, Any] = {"phone": phone, "date": body.date}
+    if rest_id:
+        cancel_payload["restaurant_id"] = rest_id
+    if body.time:
+        cancel_payload["time"] = body.time
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            await client.post(
+                f"{FIDY_API_BASE}/cancel-reservation", json=cancel_payload, headers=_fidy_headers()
+            )
+        print(f"✅ update_covers: cancellazione eseguita per {phone} {body.date} {body.time}")
+    except Exception as exc:
+        print(f"⚠️ update_covers: cancellazione fallita ({exc}), si tenta comunque il rebook")
+
+    # Riprenota con il nuovo numero di coperti
+    fake_dati = RichiestaPrenotazione.model_validate({
+        "fase": "book",
+        "nome": nome,
+        "cognome": "Cliente",
+        "email": email,
+        "telefono": phone,
+        "sede": sede,
+        "data": body.date,
+        "orario": body.time,
+        "persone": body.new_covers,
+        "seggiolini": seggiolini,
+        "nota": note,
+    })
+    pasto = _calcola_pasto(body.time)
+    print(f"🔄 update_covers: rebook {sede} {body.date} {body.time} pax={body.new_covers}")
+    try:
+        result = await asyncio.wait_for(
+            _do_booking(
+                fake_dati, "book", sede, body.time, body.date,
+                body.new_covers, pasto, note, seggiolini, phone, email, "Cliente",
+            ),
+            timeout=BOOKING_TOTAL_TIMEOUT_S,
+        )
+        if result.get("ok"):
+            result["update_method"] = "cancel_rebook"
+        return result
+    except (asyncio.TimeoutError, TimeoutError):
+        return {"ok": False, "status": "TECH_ERROR", "message": "Timeout durante il rebooking. Riprova tra qualche minuto."}
+    except Exception as exc:
+        return {"ok": False, "status": "ERROR", "message": f"Errore durante il rebooking: {exc}"}
 
 
 @app.post("/add_note")
