@@ -10,6 +10,7 @@ from typing import Optional, Union, List, Dict, Any, Tuple
 import httpx
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, root_validator
 from playwright.async_api import async_playwright
 
@@ -1049,6 +1050,106 @@ def home():
         "db": DB_PATH,
         "tz": str(getattr(TZ, "key", "LOCAL_OR_CET")),
     }
+
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_widget():
+    return """<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>deRione – Prenota con Giulia</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Georgia', serif;
+      background: #0d0d0d;
+      color: #f5f0e8;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 480px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2rem;
+    }
+
+    .logo {
+      font-size: 2.2rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #c8a96e;
+      font-weight: normal;
+    }
+
+    .tagline {
+      font-size: 0.95rem;
+      color: #a89b84;
+      letter-spacing: 0.06em;
+      text-align: center;
+    }
+
+    .divider {
+      width: 60px;
+      height: 1px;
+      background: #c8a96e44;
+    }
+
+    .intro {
+      text-align: center;
+      line-height: 1.7;
+      font-size: 0.97rem;
+      color: #d4cfc7;
+      max-width: 360px;
+    }
+
+    elevenlabs-convai {
+      --el-primary-color: #c8a96e;
+      --el-background-color: #1a1712;
+      width: 100%;
+    }
+
+    .footer {
+      margin-top: 1rem;
+      font-size: 0.78rem;
+      color: #5a5448;
+      text-align: center;
+      letter-spacing: 0.04em;
+    }
+
+    .footer a {
+      color: #7a6e5f;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">de Rione</div>
+    <div class="tagline">Assistente prenotazioni</div>
+    <div class="divider"></div>
+    <p class="intro">
+      Parla con <strong>Giulia</strong>, la nostra assistente digitale.<br/>
+      Ti aiuterà a prenotare un tavolo in pochi secondi.
+    </p>
+    <elevenlabs-convai agent-id="agent_2701kgrsp2gzec6rraa6bfgtrwfw"></elevenlabs-convai>
+    <div class="footer">
+      Per assistenza chiama <a href="tel:+390656556263">06 56556 263</a>
+    </div>
+  </div>
+  <script src="https://elevenlabs.io/convai-widget/index.js" async></script>
+</body>
+</html>"""
 
 
 def _require_admin(request: Request):
