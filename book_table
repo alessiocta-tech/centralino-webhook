@@ -21,10 +21,10 @@
         {
           "id": "fase",
           "type": "string",
-          "value_type": "llm_prompt",
-          "description": "Fase dell'operazione. Usare sempre 'book'. fase=availability è deprecato.",
+          "value_type": "constant",
+          "description": "Fase dell'operazione. Usare sempre 'book'.",
           "dynamic_variable": "",
-          "constant_value": "",
+          "constant_value": "book",
           "enum": [
             "book"
           ],
@@ -95,7 +95,7 @@
         {
           "id": "cognome",
           "type": "string",
-          "value_type": "llm_prompt",
+          "value_type": "constant",
           "description": "Cognome del cliente. Non chiedere mai all'utente. Inviare sempre 'Cliente'.",
           "dynamic_variable": "",
           "constant_value": "Cliente",

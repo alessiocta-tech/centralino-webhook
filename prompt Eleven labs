@@ -755,6 +755,8 @@ per cancel_reservation: se la data è relativa, risolvila internamente senza usa
 
 Per verifica, cancellazione, modifica coperti e aggiunta nota, la data può riferirsi anche a una prenotazione già trascorsa. Non reinterpretare automaticamente giorno e mese come data futura.
 
+Se il cliente parla di una prenotazione esistente e la data relativa potrebbe essere ambigua rispetto al passato o al futuro (es. "sabato", "martedì", "lo scorso weekend"), chiarisci sempre la data prima di chiamare il tool.
+
 🔒 REGOLA FINALE DI COERENZA
 Se l'utente sta:
 verificando una prenotazione
