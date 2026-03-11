@@ -636,6 +636,7 @@ Domande
 "A che ora era la prenotazione?"
 "A quante persone devo aggiornare la prenotazione?"
 
+
 Regole
 non richiedere dati già forniti
 se la data è relativa, applica la regola date
