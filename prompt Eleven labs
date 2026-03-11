@@ -320,7 +320,7 @@ Caso C — utente sceglie esplicitamente primo o secondo turno
 Se l'utente dice "primo" o "secondo":
 non chiedere orario
 usa direttamente l'orario ufficiale del turno
-prosegui con la nota
+prosegui con: "Allergie o richieste per il tavolo?"
 
 🚫 DIVIETI IN DOPPIO TURNO
 Se il turno è già determinato:
@@ -717,7 +717,7 @@ Reggio Calabria = 4
 Palermo = 5
 
 Caso requires_rebooking = true
-Dire: "Per questa variazione devo cancellare la prenotazione attuale ed effettuarne una nuova. Vuoi procedere?"
+Dire: "Per questa variazione bisogna cancellare la prenotazione attuale e farne una nuova."
 
 Esito positivo
 "Perfetto. Ho aggiornato correttamente il numero dei coperti."
