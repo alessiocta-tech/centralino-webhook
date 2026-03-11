@@ -312,11 +312,25 @@ With optional fields:
 > **Note on date conversion for cancellations:** For cancellations, Giulia must convert the date herself (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
 ### `POST /update_covers`
-Updates the party size of an existing reservation. If response contains `requires_rebooking: true`, the reservation must be cancelled and re-created.
+Updates the party size of an existing reservation. The webhook handles cancel+rebook automatically if needed.
 
 ```json
 { "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "new_covers": 4 }
 ```
+
+**Giulia's update_covers flow:**
+1. Ask for `telefono` (if not already given)
+2. Ask for `data` (if not already given) — convert to YYYY-MM-DD internally; **do NOT call `resolve_date`**
+3. Ask for `new_covers` (the new party size)
+4. **Do NOT ask for sede or time** — they are optional and only sent if the customer already mentioned them
+5. **Do NOT say the year** when repeating the date back to the customer — say "il 18 marzo" not "il 18 marzo 2026"
+6. **Do NOT call `resolve_date`** — existing reservation dates are valid as-is; `resolve_date` would wrongly advance past dates to the next year. Convert manually (e.g., "18 marzo" → "2026-03-18")
+7. Call `POST /update_covers` with phone + date + new_covers (+ restaurant_id/time if customer mentioned them)
+8. If response contains `requires_rebooking: true` with no `ok: true`, say: "Ho aggiornato la prenotazione con il nuovo numero di persone."
+9. If response contains `ok: true`, say: "Perfetto, ho aggiornato la prenotazione a [N] persone."
+10. On `TECH_ERROR`: retry once automatically, then say "Il sistema è temporaneamente non raggiungibile. Richiamaci tra qualche minuto."
+
+> **Note on date conversion for update_covers:** Convert dates manually (e.g., "18 marzo" → "2026-03-18") without calling `resolve_date`. Existing reservation dates may be in the past or present; `resolve_date` would wrongly move past dates to the following year.
 
 ### `POST /add_note`
 Adds a note (allergy, special request, etc.) to an existing reservation.
@@ -324,6 +338,13 @@ Adds a note (allergy, special request, etc.) to an existing reservation.
 ```json
 { "restaurant_id": 1, "date": "2026-03-14", "time": "20:00", "phone": "3331234567", "note": "allergia al glutine" }
 ```
+
+**Giulia's add_note flow:**
+1. Ask for `telefono` (if not already given)
+2. Ask for `data` (if not already given) — convert to YYYY-MM-DD; **do NOT call `resolve_date`**
+3. Ask for the `note` content (if not already given)
+4. **Do NOT ask for sede or time** — optional, only send if already known
+5. **Do NOT call `resolve_date`** — convert dates manually
 
 ---
 
