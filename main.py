@@ -1772,7 +1772,21 @@ async def update_covers(body: UpdateCoversIn):
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(f"{FIDY_API_BASE}/update-covers", json=payload, headers=_fidy_headers())
-        return resp.json()
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type or resp.text.lstrip().startswith("<"):
+            raise HTTPException(status_code=502, detail={
+                "error": "CAPTCHA_BLOCKED",
+                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato).",
+            })
+        try:
+            body_json = resp.json()
+        except Exception:
+            body_json = {"raw": resp.text}
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=body_json)
+        return body_json
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
     except Exception as e:
@@ -1795,7 +1809,21 @@ async def add_note(body: AddNoteIn):
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(f"{FIDY_API_BASE}/add-note", json=payload, headers=_fidy_headers())
-        return resp.json()
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type or resp.text.lstrip().startswith("<"):
+            raise HTTPException(status_code=502, detail={
+                "error": "CAPTCHA_BLOCKED",
+                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato).",
+            })
+        try:
+            body_json = resp.json()
+        except Exception:
+            body_json = {"raw": resp.text}
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=body_json)
+        return body_json
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
     except Exception as e:
