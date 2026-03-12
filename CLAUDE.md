@@ -142,6 +142,7 @@ Alcune combinazioni sede + giorno + pasto hanno due turni. Consultare questa tab
 - Applicare la logica doppio turno **solo** per i giorni/fasce elencati — NON menzionare turni per i giorni non in tabella (es. lunedì–venerdì, domenica sera, ecc.)
 - **Caso A — cliente NON ha indicato orario:** NON chiedere "A che ora preferisci?" — presentare direttamente i turni: "Qui c'è doppio turno: primo [range], secondo [range]. Quale preferisci?" Usare l'orario ufficiale di inizio turno per il webhook.
 - **Caso B — cliente HA già indicato un orario:** determinare il turno dall'orario dichiarato (es. "20:00" ad Appia sabato cena → 1° turno 19:30–21:15 → `orario_tool = "19:30"`). Non chiedere nulla sul turno.
+- **Caso C — cliente risponde "primo", "secondo", "primo turno", "secondo turno":** il campo orario è immediatamente determinato. NON chiedere nulla sull'orario — nemmeno "A che ora preferisci arrivare?" o "A che ora vuoi venire nel secondo turno?". Assegnare direttamente l'orario ufficiale del turno e procedere con: "Allergie o richieste per il tavolo?"
 - In doppio turno, inviare sempre al webhook l'orario ufficiale di inizio turno (non l'orario interno del cliente)
 - Se >9 persone, NON chiamare il webhook — fornire il numero 06 56556 263
 
