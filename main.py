@@ -11,7 +11,7 @@ import httpx
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, root_validator, validator
 from playwright.async_api import async_playwright
 
 # ============================================================
@@ -1669,6 +1669,16 @@ class CancelReservationIn(BaseModel):
     time: Optional[str] = None
     note: Optional[str] = None
 
+    @validator("date")
+    @classmethod
+    def validate_date_format(cls, v: str) -> str:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            raise ValueError(
+                f"Formato data non valido: '{v}'. Usare YYYY-MM-DD (es. 2026-03-10). "
+                "Non usare resolve_date per le cancellazioni: convertire internamente."
+            )
+        return v
+
 
 class UpdateCoversIn(BaseModel):
     restaurant_id: Any
@@ -1760,16 +1770,16 @@ async def cancel_reservation(body: CancelReservationIn):
             resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type or resp.text.lstrip().startswith("<"):
-            raise HTTPException(status_code=502, detail={
-                "error": "CAPTCHA_BLOCKED",
-                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato). Contatta Fidy per whitelistare l'IP del server.",
-            })
+            raise HTTPException(status_code=502, detail="CAPTCHA_BLOCKED: Fidy API ha risposto con HTML. IP probabilmente bloccato.")
         try:
             body_json = resp.json()
         except Exception:
             body_json = {"raw": resp.text}
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=body_json)
+        # Normalizza la risposta: garantisce sempre ok=true per status 2xx
+        if isinstance(body_json, dict) and "ok" not in body_json:
+            body_json["ok"] = True
         return body_json
     except HTTPException:
         raise

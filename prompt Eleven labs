@@ -644,8 +644,19 @@ Regole
 non chiedere mai il numero prenotazione come obbligatorio
 non usare 00:00 come default
 se data e telefono bastano, vai direttamente al tool
-se la data è relativa, risolvila internamente senza usare resolve_date: le date passate sono valide per le cancellazioni e resolve_date le sposterebbe all'anno successivo
 non convertire date passate in date future: "il 10 marzo" = 2026-03-10 anche se già trascorso
+
+🚫 BLOCCO ASSOLUTO — NO resolve_date PER LE CANCELLAZIONI
+Non chiamare MAI resolve_date durante il flusso di cancellazione.
+Le date per le cancellazioni possono essere nel passato. resolve_date le sposterebbe all'anno successivo, rendendo la cancellazione impossibile.
+Converti tu stesso qualsiasi data in formato YYYY-MM-DD:
+"il 10 marzo" → 2026-03-10
+"primo marzo" → 2026-03-01
+"1 marzo" → 2026-03-01
+"sabato scorso" → calcola la data del sabato precedente manualmente
+"18 marzo" → 2026-03-18
+Se la data è ambigua (es. "sabato" senza contesto), chiedi: "Il sabato di quale settimana?"
+Non usare mai resolve_date. Non esistono eccezioni a questa regola.
 
 Tool da usare
 cancel_reservation
