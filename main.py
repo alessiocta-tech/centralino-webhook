@@ -1731,11 +1731,13 @@ async def check_reservation(
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.get(f"{FIDY_API_BASE}/check-reservation", params=params, headers=_fidy_headers())
+        if "text/html" in resp.headers.get("content-type", "") or resp.text.lstrip().startswith("<"):
+            return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema temporaneamente non raggiungibile."}
         return resp.json()
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+        return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+        return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
 
 
 @app.post("/find_reservation_for_cancel")
@@ -1760,11 +1762,13 @@ async def find_reservation_for_cancel(body: FindReservationForCancelIn):
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(f"{FIDY_API_BASE}/find-reservation-for-cancel", json=payload, headers=_fidy_headers())
+        if "text/html" in resp.headers.get("content-type", "") or resp.text.lstrip().startswith("<"):
+            return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema temporaneamente non raggiungibile."}
         return resp.json()
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+        return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+        return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
 
 
 @app.post("/cancel_reservation")
@@ -1786,23 +1790,21 @@ async def cancel_reservation(body: CancelReservationIn):
             resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type or resp.text.lstrip().startswith("<"):
-            raise HTTPException(status_code=502, detail="CAPTCHA_BLOCKED: Fidy API ha risposto con HTML. IP probabilmente bloccato.")
+            return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema di prenotazione temporaneamente non raggiungibile."}
         try:
             body_json = resp.json()
         except Exception:
             body_json = {"raw": resp.text}
         if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=body_json)
+            return {"ok": False, "status": "ERROR", "message": f"Errore dal sistema: {resp.status_code}", "detail": body_json}
         # Normalizza la risposta: garantisce sempre ok=true per status 2xx
         if isinstance(body_json, dict) and "ok" not in body_json:
             body_json["ok"] = True
         return body_json
-    except HTTPException:
-        raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+        return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+        return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
 
 
 @app.post("/update_covers")
@@ -1933,20 +1935,15 @@ async def add_note(body: AddNoteIn):
             resp = await client.post(f"{FIDY_API_BASE}/add-note", json=payload, headers=_fidy_headers())
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type or resp.text.lstrip().startswith("<"):
-            raise HTTPException(status_code=502, detail={
-                "error": "CAPTCHA_BLOCKED",
-                "message": "Fidy API ha risposto con una pagina HTML (CAPTCHA o IP bloccato).",
-            })
+            return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema di prenotazione temporaneamente non raggiungibile."}
         try:
             body_json = resp.json()
         except Exception:
             body_json = {"raw": resp.text}
         if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=body_json)
+            return {"ok": False, "status": "ERROR", "message": f"Errore dal sistema: {resp.status_code}", "detail": body_json}
         return body_json
-    except HTTPException:
-        raise
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timeout contattando Fidy API")
+        return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Fidy API: {e}")
+        return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
