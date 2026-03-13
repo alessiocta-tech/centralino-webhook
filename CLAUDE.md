@@ -113,11 +113,11 @@ The webhook response always includes a `status` field. Handle it as follows:
 |----------|---------|----------------|
 | `SOLD_OUT` | That time slot / sede is actually full | "Purtroppo il turno scelto è esaurito. Preferisci [alternativa concreta]?" — propose a specific alternative (other turn, +30 min, or other sede) |
 | `TECH_ERROR` | Timeout or technical failure on the booking system | "C'è stato un problema tecnico. Riprovo subito." — retry the **same** `book_table` call once automatically, without re-asking any info |
-| `ERROR` | Unexpected error from the booking site | "C'è stato un errore imprevisto. Posso riprovare tra un momento o puoi chiamarci al 06 56556 263." |
+| `ERROR` | Unexpected error from the booking site | "C'è stato un errore imprevisto. Puoi richiamarci al 06 5655 6263 oppure prenotare su www.derione.com." |
 
 **Critical rules:**
 - `TECH_ERROR` must NEVER be communicated to the customer as "disponibilità cambiata" or "posto esaurito" — it is a technical failure, not a lack of seats.
-- After a `TECH_ERROR` retry, if it fails again, say: "Il sistema è temporaneamente non raggiungibile. Richiamaci tra qualche minuto oppure prenota su rione.fidy.app."
+- After a `TECH_ERROR` retry, if it fails again, say: "Il sistema è momentaneamente non raggiungibile. Richiamaci tra qualche minuto al 06 5655 6263 oppure prenota su www.derione.com."
 - When retrying after `TECH_ERROR`, reuse exactly the same parameters (sede, orario, turno, nome, telefono, email, note) — do NOT re-ask the customer anything.
 
 ### Double Turn Table (Doppio Turno)
@@ -144,7 +144,7 @@ Alcune combinazioni sede + giorno + pasto hanno due turni. Consultare questa tab
 - **Caso B — cliente HA già indicato un orario:** determinare il turno dall'orario dichiarato (es. "20:00" ad Appia sabato cena → 1° turno 19:30–21:15 → `orario_tool = "19:30"`). Non chiedere nulla sul turno.
 - **Caso C — cliente risponde "primo", "secondo", "primo turno", "secondo turno":** il campo orario è immediatamente determinato. NON chiedere nulla sull'orario — nemmeno "A che ora preferisci arrivare?" o "A che ora vuoi venire nel secondo turno?". Assegnare direttamente l'orario ufficiale del turno e procedere con: "Allergie o richieste per il tavolo?"
 - In doppio turno, inviare sempre al webhook l'orario ufficiale di inizio turno (non l'orario interno del cliente)
-- Se >9 persone, NON chiamare il webhook — fornire il numero 06 56556 263
+- Se >9 persone, NON chiamare il webhook — fornire il numero 06 5655 6263
 
 ### Standard Time Slots
 When there is no double turn:
