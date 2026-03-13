@@ -1629,8 +1629,24 @@ async def _do_booking(
 # FIDY API PROXY — check, find, cancel, update_covers, add_note
 # ============================================================
 
+FIDY_UA = os.getenv(
+    "FIDY_UA",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.2 "
+    "Mobile/15E148 Safari/604.1",
+)
+
+
 def _fidy_headers() -> Dict[str, str]:
-    return {"X-API-Key": FIDY_API_KEY, "Content-Type": "application/json"}
+    return {
+        "X-API-Key": FIDY_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": FIDY_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://rione.fidy.app",
+        "Referer": "https://rione.fidy.app/",
+    }
 
 
 def _resolve_restaurant_id(restaurant_id: Any) -> int:
