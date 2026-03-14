@@ -295,6 +295,19 @@ def _lookup_last_booking(phone: str, data: str, orario: str) -> Optional[Dict[st
     return dict(row) if row else None
 
 
+def _lookup_last_booking_by_date(phone: str, data: str) -> Optional[Dict[str, Any]]:
+    """Cerca l'ultima prenotazione riuscita per phone+data (senza orario) nell'archivio locale."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM bookings WHERE phone=? AND data=? AND ok=1 ORDER BY id DESC LIMIT 1",
+        (phone, data),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 # ============================================================
 # NORMALIZZAZIONI
 # ============================================================
@@ -1799,10 +1812,10 @@ def _resolve_restaurant_id(restaurant_id: Any) -> int:
 # --- Modelli Pydantic ---
 
 class CheckReservationIn(BaseModel):
-    restaurant_id: Any
     date: str
-    time: str
     phone: str
+    restaurant_id: Optional[Any] = None
+    time: Optional[str] = None
 
 
 class FindReservationForCancelIn(BaseModel):
@@ -1836,11 +1849,11 @@ class CancelReservationIn(BaseModel):
 
 
 class UpdateCoversIn(BaseModel):
-    restaurant_id: Any
     date: str
-    time: str
     phone: str
     new_covers: int
+    restaurant_id: Optional[Any] = None
+    time: Optional[str] = None
 
 
 class AddNoteIn(BaseModel):
@@ -1855,18 +1868,20 @@ class AddNoteIn(BaseModel):
 
 @app.get("/check_reservation")
 async def check_reservation(
-    restaurant_id: str,
     date: str,
-    time: str,
     phone: str,
+    restaurant_id: Optional[str] = None,
+    time: Optional[str] = None,
 ):
-    """Verifica se esiste una prenotazione per sede+data+orario+telefono."""
-    params = {
-        "restaurant_id": _resolve_restaurant_id(restaurant_id),
+    """Verifica se esiste una prenotazione per data+telefono (+ sede e orario opzionali)."""
+    params: Dict[str, Any] = {
         "date": date,
-        "time": time,
         "phone": re.sub(r"[^\d+]", "", phone),
     }
+    if restaurant_id is not None:
+        params["restaurant_id"] = _resolve_restaurant_id(restaurant_id)
+    if time is not None:
+        params["time"] = time
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.get(f"{FIDY_API_BASE}/check-reservation", params=params, headers=_fidy_headers())
@@ -2016,14 +2031,16 @@ async def update_covers(body: UpdateCoversIn):
        usando i dati dell'archivio locale (bookings + customers).
     """
     phone = re.sub(r"[^\d+]", "", body.phone)
-    rest_id = _resolve_restaurant_id(body.restaurant_id)
+    rest_id = _resolve_restaurant_id(body.restaurant_id) if body.restaurant_id is not None else None
     fidy_payload: Dict[str, Any] = {
-        "restaurant_id": rest_id,
         "date": body.date,
-        "time": body.time,
         "phone": phone,
         "new_covers": body.new_covers,
     }
+    if rest_id is not None:
+        fidy_payload["restaurant_id"] = rest_id
+    if body.time is not None:
+        fidy_payload["time"] = body.time
 
     # ── Tentativo 1: Fidy API ──────────────────────────────────────────────
     needs_rebooking = False
@@ -2049,14 +2066,21 @@ async def update_covers(body: UpdateCoversIn):
 
     # ── Tentativo 2: cancel + rebook via Playwright ────────────────────────
     # Recupera dati dalla prenotazione originale (archivio locale)
-    booking = _lookup_last_booking(phone, body.date, body.time)
+    time_val = body.time
+    booking = (
+        _lookup_last_booking(phone, body.date, time_val)
+        if time_val
+        else _lookup_last_booking_by_date(phone, body.date)
+    )
+    if booking and not time_val:
+        time_val = (booking or {}).get("orario")
     customer = _get_customer(phone)
 
     nome = (booking or {}).get("name") or (customer or {}).get("name") or "Cliente"
     email = (customer or {}).get("email") or (booking or {}).get("email") or DEFAULT_EMAIL
     if not email or "@" not in str(email):
         email = DEFAULT_EMAIL
-    sede = (booking or {}).get("sede") or _ID_TO_SEDE_NAME.get(rest_id, "")
+    sede = (booking or {}).get("sede") or (_ID_TO_SEDE_NAME.get(rest_id, "") if rest_id else "")
     seggiolini = int((booking or {}).get("seggiolini") or 0)
     note = (booking or {}).get("note") or ""
 
@@ -2068,18 +2092,25 @@ async def update_covers(body: UpdateCoversIn):
             "message": "Sede non trovata nell'archivio. Cancella e riprenota manualmente.",
         }
 
+    if not time_val:
+        return {
+            "ok": False,
+            "requires_rebooking": True,
+            "message": "Orario non trovato nell'archivio. Cancella e riprenota manualmente.",
+        }
+
     # Cancella la prenotazione esistente
     cancel_payload: Dict[str, Any] = {"phone": phone, "date": body.date}
     if rest_id:
         cancel_payload["restaurant_id"] = rest_id
-    if body.time:
-        cancel_payload["time"] = body.time
+    if time_val:
+        cancel_payload["time"] = time_val
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             await client.post(
                 f"{FIDY_API_BASE}/cancel-reservation", json=cancel_payload, headers=_fidy_headers()
             )
-        print(f"✅ update_covers: cancellazione eseguita per {phone} {body.date} {body.time}")
+        print(f"✅ update_covers: cancellazione eseguita per {phone} {body.date} {time_val}")
     except Exception as exc:
         print(f"⚠️ update_covers: cancellazione fallita ({exc}), si tenta comunque il rebook")
 
@@ -2092,17 +2123,17 @@ async def update_covers(body: UpdateCoversIn):
         "telefono": phone,
         "sede": sede,
         "data": body.date,
-        "orario": body.time,
+        "orario": time_val,
         "persone": body.new_covers,
         "seggiolini": seggiolini,
         "nota": note,
     })
-    pasto = _calcola_pasto(body.time)
-    print(f"🔄 update_covers: rebook {sede} {body.date} {body.time} pax={body.new_covers}")
+    pasto = _calcola_pasto(time_val)
+    print(f"🔄 update_covers: rebook {sede} {body.date} {time_val} pax={body.new_covers}")
     try:
         result = await asyncio.wait_for(
             _do_booking(
-                fake_dati, "book", sede, body.time, body.date,
+                fake_dati, "book", sede, time_val, body.date,
                 body.new_covers, pasto, note, seggiolini, phone, email, "Cliente",
             ),
             timeout=BOOKING_TOTAL_TIMEOUT_S,
