@@ -817,10 +817,57 @@ async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
     return out
 
 
-async def _click_sede(page, sede_target: str) -> bool:
+async def _click_sede(page, sede_target: str, pasto: str = "", orario_req: str = "") -> bool:
     target = _normalize_sede(sede_target)
     await page.wait_for_selector(".ristoCont", state="visible", timeout=PW_TIMEOUT_MS)
 
+    # --- NEW LAYOUT: click I/II TURNO button directly in the sede row ---
+    if pasto and orario_req:
+        try:
+            parts = (orario_req + ":00").split(":")
+            hh, mm = int(parts[0]), int(parts[1])
+            mins = hh * 60 + mm
+            want_second = mins >= (21 * 60) if pasto.upper() == "CENA" else mins >= (13 * 60 + 30)
+            turno_label = "II TURNO" if want_second else "I TURNO"
+
+            clicked = await page.evaluate(
+                """([sedeName, turnoLabel]) => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                    const ristoCont = document.querySelector('.ristoCont');
+                    if (!ristoCont) return false;
+                    const allEls = Array.from(ristoCont.querySelectorAll('*'));
+                    // Find leaf-ish elements whose full text equals the turno label
+                    const turnoBtns = allEls.filter(el => {
+                        const t = norm(el.innerText || '');
+                        return t === norm(turnoLabel) && t.length < 20;
+                    });
+                    for (const btn of turnoBtns) {
+                        // Walk up to find a container that includes the sede name
+                        let el = btn.parentElement;
+                        for (let i = 0; i < 8; i++) {
+                            if (!el) break;
+                            if (norm(el.innerText || '').includes(norm(sedeName))) {
+                                btn.click();
+                                return true;
+                            }
+                            el = el.parentElement;
+                        }
+                    }
+                    return false;
+                }""",
+                [target, turno_label],
+            )
+            if clicked:
+                try:
+                    await page.wait_for_selector("#OraPren", state="visible", timeout=8000)
+                    print(f"✅ _click_sede new layout: clicked {turno_label} for {target}")
+                    return True
+                except Exception:
+                    print(f"⚠️ _click_sede new layout: clicked {turno_label} for {target} but #OraPren not visible")
+        except Exception as e:
+            print(f"⚠️ _click_sede new layout attempt failed: {e}")
+
+    # --- OLD LAYOUT: click on the sede name text / ancestor link ---
     for cand in [target, target.replace(" - Roma", ""), target.replace(" - roma", "")]:
         try:
             loc = page.locator(f"text=/{re.escape(cand)}/i").first
@@ -850,23 +897,28 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
             choose_second = mins >= (13 * 60 + 30)
 
         # --- Approccio 1: pulsanti "I TURNO" / "II TURNO" ---
-        b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
-        b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
-        has1 = await b1.count() > 0
-        has2 = await b2.count() > 0
-        print(f"🔀 turn: pasto={pasto} orario={orario_req} choose2={choose_second} has1={has1} has2={has2}")
+        # Salta se #OraPren è già visibile (new layout: _click_sede ha già cliccato il turno corretto)
+        orario_already_visible = await page.locator("#OraPren").is_visible()
+        if not orario_already_visible:
+            b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
+            b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
+            has1 = await b1.count() > 0
+            has2 = await b2.count() > 0
+            print(f"🔀 turn: pasto={pasto} orario={orario_req} choose2={choose_second} has1={has1} has2={has2}")
 
-        if has1 and has2:
-            target = b2 if choose_second else b1
-            await target.first.click(timeout=5000, force=True)
-            await page.wait_for_timeout(500)
-            # verifica che il click abbia funzionato
-            try:
-                await page.wait_for_selector("#OraPren", state="visible", timeout=4000)
-                print("🔀 turn: #OraPren appeared after button click ✓")
-                return
-            except Exception:
-                print("🔀 turn: #OraPren NOT appeared after button click — fallback")
+            if has1 and has2:
+                target = b2 if choose_second else b1
+                await target.first.click(timeout=5000, force=True)
+                await page.wait_for_timeout(500)
+                # verifica che il click abbia funzionato
+                try:
+                    await page.wait_for_selector("#OraPren", state="visible", timeout=4000)
+                    print("🔀 turn: #OraPren appeared after button click ✓")
+                    return
+                except Exception:
+                    print("🔀 turn: #OraPren NOT appeared after button click — fallback")
+        else:
+            print(f"🔀 turn: #OraPren già visibile (new layout), skip Approccio 1")
 
         # --- Approccio 2: <select> con opzioni "TURNO" (layout Chrome) ---
         found = await page.evaluate(
@@ -1539,7 +1591,7 @@ async def _do_booking(
                     "sedi": sedi,
                 }
 
-            clicked = await _click_sede(page, sede_target)
+            clicked = await _click_sede(page, sede_target, pasto, orario_req)
             if not clicked:
                 return {
                     "ok": False,
@@ -1614,7 +1666,7 @@ async def _do_booking(
                     await _set_seggiolini(page, seggiolini)
                     await _set_date(page, data_req)
                     await _click_pasto(page, pasto)
-                    if not await _click_sede(page, sede_target):
+                    if not await _click_sede(page, sede_target, pasto, orario_req):
                         return {"ok": False, "status": "SOLD_OUT", "message": "Sede esaurita", "sede": sede_target}
 
                     await page.locator("#OraPren").select_option(value=best)
