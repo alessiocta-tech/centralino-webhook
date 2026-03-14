@@ -115,9 +115,9 @@ PENDING_AJAX = set(
 )
 
 IPHONE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-    "Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "CriOS/146.0.7680.42 Mobile/15E148 Safari/604.1"
 )
 
 DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
@@ -1649,9 +1649,9 @@ async def _do_booking(
 
 FIDY_UA = os.getenv(
     "FIDY_UA",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.2 "
-    "Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "CriOS/146.0.7680.42 Mobile/15E148 Safari/604.1",
 )
 
 
