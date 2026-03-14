@@ -1379,7 +1379,7 @@ async def _do_booking(
                     "--disable-gpu",
                 ],
             )
-            context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 1280, "height": 800})
+            context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
             page = await context.new_page()
             if _STEALTH_AVAILABLE:
                 await _stealth_async(page)
