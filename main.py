@@ -114,10 +114,11 @@ PENDING_AJAX = set(
     if x.strip()
 )
 
-IPHONE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "CriOS/146.0.7680.42 Mobile/15E148 Safari/604.1"
+IPHONE_UA = os.getenv(
+    "PLAYWRIGHT_UA",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 Safari/537.36",
 )
 
 DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
@@ -1378,7 +1379,7 @@ async def _do_booking(
                     "--disable-gpu",
                 ],
             )
-            context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
+            context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 1280, "height": 800})
             page = await context.new_page()
             if _STEALTH_AVAILABLE:
                 await _stealth_async(page)
@@ -1683,9 +1684,9 @@ async def _do_booking(
 
 FIDY_UA = os.getenv(
     "FIDY_UA",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "CriOS/146.0.7680.42 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 Safari/537.36",
 )
 
 
