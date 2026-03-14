@@ -897,23 +897,28 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
             choose_second = mins >= (13 * 60 + 30)
 
         # --- Approccio 1: pulsanti "I TURNO" / "II TURNO" ---
-        b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
-        b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
-        has1 = await b1.count() > 0
-        has2 = await b2.count() > 0
-        print(f"🔀 turn: pasto={pasto} orario={orario_req} choose2={choose_second} has1={has1} has2={has2}")
+        # Salta se #OraPren è già visibile (new layout: _click_sede ha già cliccato il turno corretto)
+        orario_already_visible = await page.locator("#OraPren").is_visible()
+        if not orario_already_visible:
+            b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
+            b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
+            has1 = await b1.count() > 0
+            has2 = await b2.count() > 0
+            print(f"🔀 turn: pasto={pasto} orario={orario_req} choose2={choose_second} has1={has1} has2={has2}")
 
-        if has1 and has2:
-            target = b2 if choose_second else b1
-            await target.first.click(timeout=5000, force=True)
-            await page.wait_for_timeout(500)
-            # verifica che il click abbia funzionato
-            try:
-                await page.wait_for_selector("#OraPren", state="visible", timeout=4000)
-                print("🔀 turn: #OraPren appeared after button click ✓")
-                return
-            except Exception:
-                print("🔀 turn: #OraPren NOT appeared after button click — fallback")
+            if has1 and has2:
+                target = b2 if choose_second else b1
+                await target.first.click(timeout=5000, force=True)
+                await page.wait_for_timeout(500)
+                # verifica che il click abbia funzionato
+                try:
+                    await page.wait_for_selector("#OraPren", state="visible", timeout=4000)
+                    print("🔀 turn: #OraPren appeared after button click ✓")
+                    return
+                except Exception:
+                    print("🔀 turn: #OraPren NOT appeared after button click — fallback")
+        else:
+            print(f"🔀 turn: #OraPren già visibile (new layout), skip Approccio 1")
 
         # --- Approccio 2: <select> con opzioni "TURNO" (layout Chrome) ---
         found = await page.evaluate(
