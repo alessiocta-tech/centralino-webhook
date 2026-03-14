@@ -662,6 +662,25 @@ async def _maybe_click_cookie(page):
             pass
 
 
+class CaptchaBlockedError(Exception):
+    pass
+
+
+async def _check_captcha_page(page):
+    """Rileva immediatamente se il server ha restituito la pagina CAPTCHA invece del form."""
+    url = page.url or ""
+    if ".well-known/captcha" in url:
+        raise CaptchaBlockedError(f"CAPTCHA page detected: {url}")
+    try:
+        content = await page.content()
+        if ".well-known/captcha" in content or "captcha" in url.lower():
+            raise CaptchaBlockedError("CAPTCHA page detected in content")
+    except CaptchaBlockedError:
+        raise
+    except Exception:
+        pass
+
+
 async def _wait_ready(page):
     await page.wait_for_selector(".nCoperti", state="visible", timeout=PW_TIMEOUT_MS)
 
@@ -1404,6 +1423,7 @@ async def _do_booking(
             # ============================================================
             await page.goto(BOOKING_URL, wait_until="domcontentloaded")
             await _maybe_click_cookie(page)
+            await _check_captcha_page(page)
             await _wait_ready(page)
 
             # STEP 1 persone + seggiolini
@@ -1555,6 +1575,7 @@ async def _do_booking(
 
                     await page.goto(BOOKING_URL, wait_until="domcontentloaded")
                     await _maybe_click_cookie(page)
+                    await _check_captcha_page(page)
                     await _wait_ready(page)
                     await _click_persone(page, pax_req)
                     await _set_seggiolini(page, seggiolini)
@@ -1603,6 +1624,19 @@ async def _do_booking(
             _log_booking(payload_log, True, msg)
 
             return {"ok": True, "message": msg, "fallback_time": used_fallback, "selected_time": selected_orario_value[:5]}
+
+    except CaptchaBlockedError as e:
+        err_str = str(e)
+        print(f"🚫 CAPTCHA rilevato, interrompo immediatamente: {err_str}")
+        payload_log = dati.model_dump()
+        payload_log.update(
+            {
+                "note": note_in if "note_in" in locals() else "",
+                "seggiolini": seggiolini if "seggiolini" in locals() else 0,
+            }
+        )
+        _log_booking(payload_log, False, err_str)
+        return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema di prenotazione temporaneamente non raggiungibile.", "error": err_str}
 
     except Exception as e:
         err_str = str(e)
