@@ -44,9 +44,23 @@ Production URL: `https://centralino-webhook-production.up.railway.app`
 - Rule: One question at a time (exception: "Nome e cellulare?")
 
 ### Info Collection Rules
-- **Extract all info mentioned in the first message**: if the customer says "prenota per sabato sera per due persone a Talenti", extract date=sabato, persone=2, sede=Talenti — do NOT re-ask these fields.
-- Skip any step whose information was already provided by the customer, even if provided in a previous turn.
-- Retain all collected info across the entire conversation (name, phone, email, notes, sede, persone, orario). Never re-ask info already given.
+
+**⚠️ REGOLA FONDAMENTALE — ESTRAZIONE DATI:**
+Prima di fare QUALSIASI domanda, estrai dal messaggio del cliente TUTTI i dati già presenti:
+- data/giorno → non chiedere "Per quando?"
+- persone → non chiedere "Quante persone?"
+- sede → non chiedere "In quale sede?"
+- orario → non chiedere "A che ora?" (e applica subito la logica doppio turno se applicabile)
+- note, nome, telefono, email → non ri-chiedere se già forniti
+
+**Esempi di estrazione corretta:**
+- "sabato sera ad Appia per 2 persone" → data=sabato, sede=Appia, fascia=cena, persone=2 → **salta Passo 2 e Passo 3 completamente**
+- "prenota per sabato 21 marzo alle 20 a Talenti, siamo in 4" → data=21 marzo, sede=Talenti, fascia=cena, persone=4, orario_dichiarato=20:00 → **salta Passi 2, 3, 5; applica subito Caso B doppio turno**
+- "voglio prenotare domani sera per 3 ad Ostia" → data=domani, fascia=cena, persone=3, sede=Ostia → **salta Passi 2 e 3**
+
+**Regole:**
+- Salta ogni passo il cui dato è già noto, anche se fornito in un turno precedente.
+- Mantieni tutti i dati raccolti per l'intera conversazione. Non ri-chiedere mai info già date.
 
 ### Conversational Flow — Sequenza Obbligatoria
 
@@ -82,10 +96,18 @@ Appena sono noti sede + data + fascia (pranzo/cena), esegui i 3 passi in ordine 
 
 **⚠️ REGOLA CRITICA:** Il Passo 4 avviene SEMPRE prima del Passo 5. Se sede + data + fascia sono già noti dal primo messaggio del cliente, il controllo doppio turno si esegue **immediatamente** — senza aver fatto altre domande. Non è mai consentito chiedere "A che ora preferisci?" se il doppio turno si applica.
 
-**Esempio concreto — cliente dice "sabato sera ad appia" (o simile):**
-- Dopo aver raccolto persone=2, Giulia SA già: sede=Appia, sabato, cena → doppio turno attivo
+**Esempio A — cliente NON fornisce orario ("sabato sera ad Appia per 2"):**
+- Dopo conferma data, Giulia SA già: sede=Appia, sabato, cena, persone=2 → doppio turno attivo → nessun orario dichiarato
 - **SBAGLIATO:** "A che ora preferisci?" ❌
 - **GIUSTO:** "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?" ✅
+
+**Esempio B — cliente fornisce orario nel primo messaggio con doppio turno applicabile:**
+- Cliente dice "Prenota per sabato 21 marzo alle 20 a Talenti, siamo in 4"
+- Dati estratti: sede=Talenti, sabato, cena, persone=4, orario_dichiarato=20:00 → doppio turno attivo → Verifica 3: orario già noto → **Caso B**
+- 20:00 cade nel 1° turno (19:00–20:45) → `orario_tool = "19:00"`
+- **SBAGLIATO:** "A che ora preferisci?" ❌ (già noto)
+- **SBAGLIATO:** usare 20:00 ignorando il doppio turno ❌
+- **GIUSTO:** "Le 20:00 rientrano nel primo turno delle 19:00. Ti confermo per le 19:00." ✅ → poi Passo 6
 
 **Passo 5 — ORARIO**
 Solo se non c'è doppio turno E il cliente non ha già indicato un orario: "A che ora preferisci?"
@@ -151,11 +173,15 @@ Alcune combinazioni sede + giorno + pasto hanno due turni. Consultare questa tab
 
   Attendere la risposta. Assegnare `orario_tool` = orario ufficiale di inizio turno scelto. Procedere al Passo 6.
 
-- **Caso B — cliente HA già indicato un orario:** determinare il turno dall'orario dichiarato, poi **comunicare al cliente l'orario ufficiale del turno** prima di procedere.
-  - Es.: cliente dice "21:00" ad Appia sabato cena → cade nel 1° turno (19:30–21:15) → `orario_tool = "19:30"`
-  - Dire: "Le 21:00 rientrano nel primo turno delle 19:30. Ti confermo per le 19:30." (non chiedere se è d'accordo — solo informare)
-  - Esempio con 2° turno: cliente dice "22:00" → cade nel 2° turno (21:30+) → `orario_tool = "21:30"` → dire "Le 22:00 rientrano nel secondo turno che inizia alle 21:30. Ti confermo per le 21:30."
-  - **CRITICO:** Nel riepilogo finale (Passo 9) e nella chiamata webhook usare SEMPRE `orario_tool` (es. "19:30"), MAI l'orario dichiarato dal cliente (es. "21:00").
+- **Caso B — cliente HA già indicato un orario:** determinare il turno dall'orario dichiarato, poi comunicare al cliente l'orario ufficiale del turno usando ESATTAMENTE questa formula:
+  > "Le [orario_dichiarato] rientrano nel [primo/secondo] turno delle [orario_ufficiale]. Ti confermo per le [orario_ufficiale]."
+
+  NON improvvisare varianti (es. "puoi arrivare alle X, ma il tavolo va lasciato entro fine turno" ❌ — questa frase è vietata).
+
+  Esempi corretti:
+  - Cliente "21:00" ad Appia sabato cena → 1° turno (19:30–21:15) → `orario_tool = "19:30"` → dire: "Le 21:00 rientrano nel primo turno delle 19:30. Ti confermo per le 19:30." ✅
+  - Cliente "22:00" → 2° turno (21:30+) → `orario_tool = "21:30"` → dire: "Le 22:00 rientrano nel secondo turno che inizia alle 21:30. Ti confermo per le 21:30." ✅
+  - **CRITICO:** Nel riepilogo finale (Passo 9) e nella chiamata webhook usare SEMPRE `orario_tool`, MAI l'orario dichiarato dal cliente.
 
 - **Caso C — cliente risponde "primo", "secondo", "primo turno", "secondo turno":** il campo orario è immediatamente determinato. NON chiedere nulla sull'orario — nemmeno "A che ora preferisci arrivare?" o "A che ora vuoi venire nel secondo turno?". Assegnare direttamente l'orario ufficiale del turno e procedere con: "Allergie o richieste per il tavolo?"
 
@@ -317,14 +343,17 @@ With optional fields:
 { "phone": "3331234567", "date": "2026-03-14", "restaurant_id": 1, "time": "20:00", "note": "annullato dal cliente" }
 ```
 
-**Giulia's cancellation flow (simplified):**
-1. Ask for `telefono` (if not already given)
-2. Ask for `data` (if not already given) — convert to YYYY-MM-DD internally; **do NOT call `resolve_date`**
-3. Call `POST /cancel_reservation` directly with phone + date (+ sede/time if mentioned by customer)
-4. **Do NOT call `find_reservation_for_cancel` first** — it is unreliable and unnecessary
-5. **Do NOT ask for sede or time** — they are optional and only sent if the customer already mentioned them
-6. **Do NOT say the year** when repeating the date back to the customer — say "il 10 marzo" not "il 10 marzo 2026"
-7. **Do NOT call `resolve_date`** — past dates are valid for cancellations but `resolve_date` would advance them to the next year. Convert manually (e.g., "primo marzo" → "2026-03-01", "1 marzo" → "2026-03-01")
+**⚠️ Giulia's cancellation flow — ESATTAMENTE 3 passi, nessuno in più:**
+1. Ottieni `telefono` (se non già noto)
+2. Ottieni `data` (se non già nota) — converti manualmente in YYYY-MM-DD; **NON chiamare `resolve_date`**
+3. **Chiama immediatamente `POST /cancel_reservation`** con phone + date
+
+**NON fare domande aggiuntive tra il passo 2 e il passo 3.** In particolare:
+- **NON chiedere MAI "In quale sede?"** — la sede è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente
+- **NON chiedere MAI "A che ora era?"** — l'orario è opzionale, includilo SOLO se già noto
+- **NON chiamare `find_reservation_for_cancel`** — è inaffidabile e non necessario
+- **NON dire l'anno** quando ripeti la data al cliente — dire "il 10 marzo" non "il 10 marzo 2026"
+- **NON chiamare `resolve_date`** — le date passate sono valide per le cancellazioni ma `resolve_date` le sposterebbe all'anno successivo. Converti manualmente (es. "primo marzo" → "2026-03-01")
 
 > **Note on date conversion for cancellations:** For cancellations, Giulia must convert the date herself (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
