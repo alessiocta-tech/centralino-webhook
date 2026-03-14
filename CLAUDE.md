@@ -150,7 +150,7 @@ Appena sono noti sede + data + fascia, **prima di fare qualsiasi altra cosa** (i
 **⛔ ERRORE TIPICO DA NON RIPETERE MAI:**
 > Cliente: "voglio prenotare per stasera ad Appia" → sede=Appia, data=sabato, fascia=cena → **doppio turno attivo**
 > SBAGLIATO: "Quante persone?" poi "A che ora preferisci?" ❌
-> GIUSTO: "Quante persone?" poi → check doppio turno → "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:00 alle 21:00, secondo dalle 21:15 in poi. Quale preferisci?" ✅
+> GIUSTO: "Quante persone?" poi → check doppio turno → "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?" ✅
 
 ---
 
@@ -163,7 +163,7 @@ Appena sono noti sede + data + fascia, **prima di fare qualsiasi altra cosa** (i
 | Talenti | Sabato | Cena | 19:00–20:45 | `19:00` | 21:00+ | `21:00` |
 | Appia | Sabato | Pranzo | 12:00–13:20 | `12:00` | 13:30+ | `13:30` |
 | Appia | Domenica | Pranzo | 12:00–13:20 | `12:00` | 13:30+ | `13:30` |
-| **Appia** | **Sabato** | **Cena** | **19:00–21:00** | **`19:00`** | **21:15+** | **`21:15`** |
+| Appia | Sabato | Cena | 19:30–21:15 | `19:30` | 21:30+ | `21:30` |
 | Palermo | Sabato | Pranzo | 12:00–13:20 | `12:00` | 13:30+ | `13:30` |
 | Palermo | Domenica | Pranzo | 12:00–13:20 | `12:00` | 13:30+ | `13:30` |
 | Palermo | Sabato | Cena | 19:30–21:15 | `19:30` | 21:30+ | `21:30` |
@@ -176,21 +176,21 @@ Appena sono noti sede + data + fascia, **prima di fare qualsiasi altra cosa** (i
 
 ### 📍 APPIA — sabato cena
 
-1° turno: 19:00–20:59 → `orario_tool = "19:00"`
-2° turno: 21:15+ → `orario_tool = "21:15"`
-Confine ambiguo: 21:00–21:14
+1° turno: 19:30–21:15 → `orario_tool = "19:30"`
+2° turno: 21:30+ → `orario_tool = "21:30"`
+Confine ambiguo: 21:16–21:29
 
 **Caso A** (nessun orario indicato):
-> "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:00 alle 21:00, secondo dalle 21:15 in poi. Quale preferisci?"
+> "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
 
 **Caso B** (orario già indicato):
 | Orario cliente | Risposta | Webhook orario |
 |---------------|---------|----------------|
-| 19:00–20:59 | "Ok: puoi arrivare alle [X], ma il tavolo va lasciato entro le 21:00." | `19:00` |
-| 21:00–21:14 | "Qui c'è doppio turno: primo dalle 19:00 alle 21:00, secondo dalle 21:15 in poi. Quale preferisci?" | attendi risposta |
-| 21:15+ | "Ok: arrivo dalle 21:15 in poi." | `21:15` |
+| 19:30–21:15 | "Ok: puoi arrivare alle [X], ma il tavolo va lasciato entro le 21:15." | `19:30` |
+| 21:16–21:29 | "Qui c'è doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?" | attendi risposta |
+| 21:30+ | "Ok: arrivo dalle 21:30 in poi." | `21:30` |
 
-**Caso C** (sceglie il turno): "primo" → `19:00` / "secondo" → `21:15`
+**Caso C** (sceglie il turno): "primo" → `19:30` / "secondo" → `21:30`
 
 ---
 
