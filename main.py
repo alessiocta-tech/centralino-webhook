@@ -13,6 +13,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, root_validator, validator
 from playwright.async_api import async_playwright
+try:
+    from playwright_stealth import stealth_async as _stealth_async
+    _STEALTH_AVAILABLE = True
+except ImportError:
+    _STEALTH_AVAILABLE = False
 
 # ============================================================
 # TIMEZONE (CRASH-PROOF) — CRITICO PER "OGGI/DOMANI/STASERA"
@@ -1073,6 +1078,17 @@ def home():
     }
 
 
+@app.get("/ip")
+async def get_outbound_ip():
+    """Ritorna l'IP pubblico in uscita del container Railway. Usare per whitelist SiteGround."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://api.ipify.org?format=json")
+            return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/chat", response_class=HTMLResponse)
 def chat_widget():
     return """<!DOCTYPE html>
@@ -1345,6 +1361,8 @@ async def _do_booking(
             )
             context = await browser.new_context(user_agent=IPHONE_UA, viewport={"width": 390, "height": 844})
             page = await context.new_page()
+            if _STEALTH_AVAILABLE:
+                await _stealth_async(page)
             page.set_default_timeout(PW_TIMEOUT_MS)
             page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
             await page.route("**/*", _block_heavy)
