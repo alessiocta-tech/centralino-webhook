@@ -841,13 +841,6 @@ async def _click_sede(page, sede_target: str) -> bool:
 
 async def _maybe_select_turn(page, pasto: str, orario_req: str):
     try:
-        b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
-        b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
-        has1 = await b1.count() > 0
-        has2 = await b2.count() > 0
-        if not (has1 and has2):
-            return
-
         hh, mm = [int(x) for x in orario_req.split(":")]
         mins = hh * 60 + mm
 
@@ -856,10 +849,49 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
         else:
             choose_second = mins >= (13 * 60 + 30)
 
-        target = b2 if choose_second else b1
-        await target.first.click(timeout=5000, force=True)
-        await page.wait_for_timeout(250)
-    except Exception:
+        # --- Approccio 1: pulsanti "I TURNO" / "II TURNO" ---
+        b1 = page.locator("text=/^\\s*I\\s*TURNO\\s*$/i")
+        b2 = page.locator("text=/^\\s*II\\s*TURNO\\s*$/i")
+        has1 = await b1.count() > 0
+        has2 = await b2.count() > 0
+        print(f"🔀 turn: pasto={pasto} orario={orario_req} choose2={choose_second} has1={has1} has2={has2}")
+
+        if has1 and has2:
+            target = b2 if choose_second else b1
+            await target.first.click(timeout=5000, force=True)
+            await page.wait_for_timeout(500)
+            # verifica che il click abbia funzionato
+            try:
+                await page.wait_for_selector("#OraPren", state="visible", timeout=4000)
+                print("🔀 turn: #OraPren appeared after button click ✓")
+                return
+            except Exception:
+                print("🔀 turn: #OraPren NOT appeared after button click — fallback")
+
+        # --- Approccio 2: <select> con opzioni "TURNO" (layout Chrome) ---
+        found = await page.evaluate(
+            """(choose_second) => {
+              const selects = Array.from(document.querySelectorAll('select'));
+              for (const sel of selects) {
+                const opts = Array.from(sel.options).filter(o =>
+                  (o.textContent || '').toUpperCase().includes('TURNO')
+                );
+                if (opts.length >= 1) {
+                  const t = choose_second ? opts[Math.min(1, opts.length - 1)] : opts[0];
+                  sel.value = t.value;
+                  sel.dispatchEvent(new Event('change', { bubbles: true }));
+                  return { found: true, id: sel.id, value: t.value, text: t.textContent.trim() };
+                }
+              }
+              return { found: false };
+            }""",
+            choose_second,
+        )
+        print(f"🔀 turn fallback select: {found}")
+        if found.get("found"):
+            await page.wait_for_timeout(1200)
+    except Exception as e:
+        print(f"🔀 turn exception: {e}")
         return
 
 
@@ -1733,14 +1765,16 @@ class FindReservationForCancelIn(BaseModel):
 
 class CancelReservationIn(BaseModel):
     phone: str
-    date: str
+    date: Optional[str] = None
     restaurant_id: Optional[Any] = None
     time: Optional[str] = None
     note: Optional[str] = None
 
     @validator("date")
     @classmethod
-    def validate_date_format(cls, v: str) -> str:
+    def validate_date_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
             raise ValueError(
                 f"Formato data non valido: '{v}'. Usare YYYY-MM-DD (es. 2026-03-10). "
@@ -1826,21 +1860,81 @@ async def find_reservation_for_cancel(body: FindReservationForCancelIn):
 
 @app.post("/cancel_reservation")
 async def cancel_reservation(body: CancelReservationIn):
-    """Annulla una prenotazione esistente. Richiede phone + date; time e restaurant_id opzionali."""
-    payload: Dict[str, Any] = {
-        "phone": re.sub(r"[^\d+]", "", body.phone),
-        "date": body.date,
-    }
-    if body.restaurant_id is not None:
-        payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
-    if body.time:
-        payload["time"] = body.time
-    if body.note:
-        payload["note"] = body.note
+    """Annulla una prenotazione esistente.
 
+    Richiede phone + almeno uno tra date e restaurant_id.
+    Chiama sempre find-reservation-for-cancel prima per ottenere i dettagli
+    esatti della prenotazione (incluso eventuale ID interno), poi esegue il cancel.
+    """
+    phone = re.sub(r"[^\d+]", "", body.phone)
+
+    # ── Step 1: trova la prenotazione tramite find-reservation-for-cancel ──
+    find_payload: Dict[str, Any] = {"phone": phone}
+    if body.restaurant_id is not None:
+        find_payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    if body.date:
+        find_payload["date"] = body.date
+    if body.time:
+        find_payload["time"] = body.time
+
+    reservation_info: Dict[str, Any] = {}
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
-            resp = await client.post(f"{FIDY_API_BASE}/cancel-reservation", json=payload, headers=_fidy_headers())
+            find_resp = await client.post(
+                f"{FIDY_API_BASE}/find-reservation-for-cancel",
+                json=find_payload,
+                headers=_fidy_headers(),
+            )
+        ct = find_resp.headers.get("content-type", "")
+        if "text/html" not in ct and not find_resp.text.lstrip().startswith("<"):
+            if find_resp.status_code == 200:
+                reservation_info = find_resp.json() or {}
+                print(f"[cancel] find-reservation-for-cancel → {reservation_info}")
+    except Exception as exc:
+        print(f"[cancel] find step error (ignorato): {exc}")
+
+    # ── Step 2: costruisci payload cancel integrando i dati trovati ──────
+    cancel_payload: Dict[str, Any] = {"phone": phone}
+
+    # data: body > trovata
+    date = body.date or reservation_info.get("date")
+    if date:
+        cancel_payload["date"] = date
+
+    # restaurant_id: body > trovato
+    if body.restaurant_id is not None:
+        cancel_payload["restaurant_id"] = _resolve_restaurant_id(body.restaurant_id)
+    elif reservation_info.get("restaurant_id"):
+        cancel_payload["restaurant_id"] = reservation_info["restaurant_id"]
+
+    # time: body > trovato
+    time = body.time or reservation_info.get("time")
+    if time:
+        cancel_payload["time"] = time
+
+    # ID/codice prenotazione se restituito da find
+    for key in ("id", "reservation_id", "booking_id", "reservation_code", "code"):
+        if reservation_info.get(key):
+            cancel_payload[key] = reservation_info[key]
+            break
+
+    if body.note:
+        cancel_payload["note"] = body.note
+
+    # Se ancora non abbiamo la data, non possiamo procedere
+    if "date" not in cancel_payload:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "Prenotazione non trovata. Fornire almeno la data oppure verificare numero di telefono e sede.",
+        }
+
+    # ── Step 3: cancella ──────────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
+            resp = await client.post(
+                f"{FIDY_API_BASE}/cancel-reservation", json=cancel_payload, headers=_fidy_headers()
+            )
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type or resp.text.lstrip().startswith("<"):
             return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema di prenotazione temporaneamente non raggiungibile."}

@@ -427,20 +427,20 @@ Se l'utente parla di una prenotazione già esistente: non usare il flusso di nuo
 
 ### ❌ CANCELLAZIONE PRENOTAZIONE
 
-**Dati minimi obbligatori:** telefono + data. Sede e orario: opzionali, aggiungi solo se già noti.
+**Dati minimi obbligatori:** telefono + sede. Data e orario: opzionali, includili SOLO se già noti spontaneamente dal cliente.
 
 **🚫 BLOCCO ASSOLUTO — NO `resolve_date` PER LE CANCELLAZIONI.** Le date possono essere nel passato. Converti manualmente:
 - "il 10 marzo" → `2026-03-10`
 - "primo marzo" → `2026-03-01`
 - "sabato scorso" → calcola manualmente la data del sabato precedente
 
-**Tool:** `cancel_reservation` con `phone` + `date` (+ `restaurant_id`/`time` se disponibili)
+**Tool:** `cancel_reservation` con `phone` + `restaurant_id` (+ `date`/`time` se già noti)
 
-**🚫 NON chiamare mai `find_reservation_for_cancel`.**
+**🚫 NON chiamare mai `find_reservation_for_cancel`** — il webhook lo gestisce internamente.
 **🚫 NON dire mai l'anno** quando ripeti la data — dire "il 10 marzo" non "il 10 marzo 2026".
 
 **Esito positivo:** "Perfetto. La prenotazione è stata cancellata correttamente."
-**Esito negativo (404):** "Non riesco a trovare la prenotazione con questi dati. Possiamo ricontrollare numero di telefono o data?"
+**Esito negativo (404):** "Non riesco a trovare la prenotazione con questi dati. Possiamo ricontrollare numero di telefono o sede?"
 
 **⚠️ GESTIONE ERRORI — CANCELLAZIONE:**
 Se errore tecnico (502, 504 o non-404): riprova immediatamente in silenzio con gli stessi parametri. Solo se fallisce anche al secondo tentativo: "C'è stato un problema tecnico. Puoi annullare direttamente su rione.fidy.app oppure richiamarci al 06 56556 263."
@@ -625,29 +625,29 @@ Searches for a reservation to cancel. Returns the associated phone number for co
 All fields optional — provide as many as available. `reservation_code` takes priority.
 
 ### `POST /cancel_reservation`
-Cancels an existing reservation. **Only `phone` and `date` are required** — `time` and `restaurant_id` are optional and sent only if available.
+Cancels an existing reservation. **`phone` and `restaurant_id` are the primary required fields** — the webhook internally calls `find-reservation-for-cancel` first to locate the reservation, then proceeds with cancellation. `date` and `time` are optional and only sent if already known.
 
 ```json
-{ "phone": "3331234567", "date": "2026-03-14" }
+{ "phone": "3331234567", "restaurant_id": 2 }
 ```
 With optional fields:
 ```json
-{ "phone": "3331234567", "date": "2026-03-14", "restaurant_id": 1, "time": "20:00", "note": "annullato dal cliente" }
+{ "phone": "3331234567", "restaurant_id": 2, "date": "2026-03-14", "time": "13:30", "note": "annullato dal cliente" }
 ```
 
 **⚠️ Giulia's cancellation flow — ESATTAMENTE 3 passi, nessuno in più:**
 1. Ottieni `telefono` (se non già noto)
-2. Ottieni `data` (se non già nota) — converti manualmente in YYYY-MM-DD; **NON chiamare `resolve_date`**
-3. **Chiama immediatamente `POST /cancel_reservation`** con phone + date
+2. Ottieni `sede` (se non già nota) — converti in `restaurant_id` usando la mappa standard
+3. **Chiama immediatamente `POST /cancel_reservation`** con phone + restaurant_id (+ date/time se già noti)
 
 **NON fare domande aggiuntive tra il passo 2 e il passo 3.** In particolare:
-- **NON chiedere MAI "In quale sede?"** — la sede è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente
+- **NON chiedere MAI "Che data era?"** — la data è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente
 - **NON chiedere MAI "A che ora era?"** — l'orario è opzionale, includilo SOLO se già noto
-- **NON chiamare `find_reservation_for_cancel`** — è inaffidabile e non necessario
+- **NON chiamare `find_reservation_for_cancel`** — il webhook lo gestisce internamente
 - **NON dire l'anno** quando ripeti la data al cliente — dire "il 10 marzo" non "il 10 marzo 2026"
-- **NON chiamare `resolve_date`** — le date passate sono valide per le cancellazioni ma `resolve_date` le sposterebbe all'anno successivo. Converti manualmente (es. "primo marzo" → "2026-03-01")
+- **NON chiamare `resolve_date`** — le date passate sono valide per le cancellazioni. Converti manualmente (es. "primo marzo" → "2026-03-01")
 
-> **Note on date conversion for cancellations:** For cancellations, Giulia must convert the date herself (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
+> **Note on date conversion for cancellations:** If the customer mentions a date, convert it manually (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
 ### `POST /update_covers`
 Updates the party size of an existing reservation. The webhook handles cancel+rebook automatically if needed.
