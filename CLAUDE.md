@@ -231,18 +231,18 @@ Caso C: "primo" → `12:00` / "secondo" → `13:30`
 
 #### 10C. Appia — sabato cena
 
-- 1° turno: 19:30–21:15 → `orario_tool = 19:30`
-- 2° turno: 21:30+ → `orario_tool = 21:30`
-- Zona ambigua: 21:16–21:29
+- 1° turno: 19:00–21:00 → `orario_tool = 19:00`
+- 2° turno: 21:15+ → `orario_tool = 21:15`
+- Zona ambigua: 21:01–21:14
 
-Caso A: "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
+Caso A: "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:00 alle 21:00, secondo dalle 21:15 in poi. Quale preferisci?"
 
 Caso B:
 | Orario cliente | Risposta | orario_tool |
 |---------------|---------|:---:|
-| 19:30–21:15 | "Ok: puoi arrivare alle [X], ma il tavolo va lasciato entro le 21:15." | `19:30` |
-| 21:16–21:29 | presenta entrambi i turni | attendi risposta |
-| 21:30+ | "Ok: arrivo dalle 21:30 in poi." | `21:30` |
+| 19:00–21:00 | "Ok: puoi arrivare alle [X], ma il tavolo va lasciato entro le 21:00." | `19:00` |
+| 21:01–21:14 | presenta entrambi i turni | attendi risposta |
+| 21:15+ | "Ok: arrivo dalle 21:15 in poi." | `21:15` |
 
 Caso C: "primo" → `19:30` / "secondo" → `21:30`
 
