@@ -1,5 +1,5 @@
 # Usiamo l'immagine ufficiale Microsoft con Python e i Browser già pronti
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.51.0-jammy
 
 WORKDIR /app
 
