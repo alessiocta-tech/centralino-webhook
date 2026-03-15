@@ -744,7 +744,11 @@ async def _set_date(page, data_iso: str):
         """(val) => {
           const el = document.querySelector('#DataPren') || document.querySelector('input[type="date"]');
           if (!el) return false;
-          el.value = val;
+          const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+          nativeSetter.call(el, val);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
           return true;
         }""",
@@ -767,10 +771,66 @@ async def _scrape_sedi_availability(page) -> List[Dict[str, Any]]:
     - nessun timeout hardcoded a 30000
     - wait_for_function con timeout configurabile
     - attesa breve post-fallback per far popolarsi il DOM
+    - retry se .ristoCont resta hidden (click pasto di nuovo)
     """
     known = ["Appia", "Talenti", "Ostia Lido", "Palermo", "Reggio Calabria"]
 
-    await page.wait_for_selector(".ristoCont", state="visible", timeout=AVAIL_SELECTOR_TIMEOUT_MS)
+    # Primo tentativo di attesa .ristoCont visibile
+    try:
+        await page.wait_for_selector(".ristoCont", state="visible", timeout=AVAIL_SELECTOR_TIMEOUT_MS)
+    except Exception as first_err:
+        # .ristoCont esiste ma resta hidden: probabilmente il click pasto
+        # non ha triggerato il caricamento. Proviamo a ri-cliccare i bottoni pasto.
+        print(f"⚠️ .ristoCont hidden dopo {AVAIL_SELECTOR_TIMEOUT_MS}ms, tentativo retry...")
+        # Diagnostica: logga stato DOM
+        try:
+            dom_info = await page.evaluate("""() => {
+                const rc = document.querySelector('.ristoCont');
+                const pasti = Array.from(document.querySelectorAll('.tipoBtn')).map(
+                    b => ({rel: b.getAttribute('rel'), cls: b.className, vis: b.offsetParent !== null})
+                );
+                return {
+                    ristoCont_exists: !!rc,
+                    ristoCont_display: rc ? getComputedStyle(rc).display : null,
+                    ristoCont_visibility: rc ? getComputedStyle(rc).visibility : null,
+                    ristoCont_classes: rc ? rc.className : null,
+                    pasti_buttons: pasti
+                };
+            }""")
+            print(f"🔍 DOM diagnostics: {json.dumps(dom_info, default=str)}")
+        except Exception:
+            pass
+
+        # Retry: ri-clicca il bottone pasto attivo (forza il caricamento)
+        try:
+            for patto in ["PRANZO", "CENA"]:
+                loc = page.locator(f'.tipoBtn[rel="{patto}"]').first
+                if await loc.count() > 0:
+                    is_active = await loc.evaluate("el => el.classList.contains('active') || el.classList.contains('selected')")
+                    if is_active:
+                        await loc.click(timeout=5000, force=True)
+                        break
+            # Prova anche a cliccare il primo bottone pasto con testo visibile
+            else:
+                for pasto_txt in ["PRANZO", "CENA", "pranzo", "cena", "Pranzo", "Cena"]:
+                    try:
+                        loc = page.locator(f"text=/{pasto_txt}/i").first
+                        if await loc.count() > 0:
+                            await loc.click(timeout=5000, force=True)
+                            break
+                    except Exception:
+                        continue
+        except Exception as re_click_err:
+            print(f"⚠️ Retry click pasto fallito: {re_click_err}")
+
+        # Secondo tentativo di attesa
+        try:
+            await page.wait_for_selector(".ristoCont", state="visible", timeout=AVAIL_SELECTOR_TIMEOUT_MS)
+            print("✅ .ristoCont diventato visibile dopo retry")
+        except Exception:
+            # Ultimo tentativo: reload completo della pagina
+            print("⚠️ .ristoCont ancora hidden dopo retry, ultimo tentativo impossibile senza reload")
+            raise first_err
 
     try:
         await page.wait_for_function(
@@ -1591,7 +1651,20 @@ async def _do_booking(
             # ----------------------------
             # BOOK
             # ----------------------------
-            sedi = await _scrape_sedi_availability(page)
+            try:
+                sedi = await _scrape_sedi_availability(page)
+            except Exception as avail_err:
+                # Retry: ricaricare la pagina e ripetere tutti gli step
+                print(f"⚠️ Availability scrape fallito ({avail_err}), retry con reload...")
+                await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+                await _maybe_click_cookie(page)
+                await _check_captcha_page(page)
+                await _wait_ready(page)
+                await _click_persone(page, pax_req)
+                await _set_seggiolini(page, seggiolini)
+                await _set_date(page, data_req)
+                await _click_pasto(page, pasto)
+                sedi = await _scrape_sedi_availability(page)
 
             entry = next((x for x in sedi if _normalize_sede(x.get("nome")) == _normalize_sede(sede_target)), None)
             if entry and entry.get("tutto_esaurito"):
