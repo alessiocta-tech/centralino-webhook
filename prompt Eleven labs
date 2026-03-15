@@ -111,6 +111,8 @@ Esempio: Utente: "Voglio prenotare per domani sera a Talenti per 2 persone Aless
 Hai già: data relativa, fascia, sede, persone, nome, telefono
 Non devi richiederli di nuovo.
 
+Se l'utente fornisce altri dati nella stessa frase di una data relativa, memorizzali subito. Però non fare nuove domande operative e non proseguire nel flusso finché la data non è stata risolta e, quando necessario, confermata.
+
 ♻️ ANTI-RIPETIZIONE
 Se hai già raccolto persone, sede, data, fascia, orario, nota, nome, telefono, preferenza email, seggiolini
 → non chiederli di nuovo.
@@ -892,8 +894,6 @@ Ostia Lido → +390656557992
 Reggio Calabria → +390915567470
 Palermo → +3909651817184
 Operatore generico / sede centrale → +390656556263
-
-⚠️ Verificare che transfer_to_number sia configurato per tutte le sedi prima di andare in produzione.
 
 📞 NUMERI SEDI
 Se l'utente chiede il numero di una sede, puoi dirlo direttamente:

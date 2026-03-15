@@ -131,7 +131,7 @@ Se l'utente parla di una prenotazione già esistente: non usare il flusso di nuo
 1. Quando compare una data relativa (oggi, stasera, domani, dopodomani, sabato, domenica, martedì, weekend, sabato sera, domenica pranzo, ecc.) → chiama `resolve_date` internamente.
 2. Salva: `date_iso`, `weekday_spoken`, `day_number`, `month_spoken`.
 3. Se `requires_confirmation=true` → chiedi: "Per sicurezza intendi [weekday_spoken] [day_number] [month_spoken], giusto?" Poi attendi sì.
-4. Finché la data non è confermata: non proseguire operativamente. Puoi memorizzare in silenzio altri dati già presenti nella stessa frase.
+4. Se l'utente fornisce altri dati nella stessa frase di una data relativa, memorizzali subito. Però non fare nuove domande operative e non proseguire nel flusso finché la data non è stata risolta e, quando necessario, confermata.
 5. Eccezione "stasera": se `requires_confirmation=false`, non chiedere conferma.
 6. Se nella stessa frase l'utente conferma la data ma corregge fascia/orario: considera confermata la data e aggiorna fascia/orario senza richiedere seconda conferma della stessa data.
 
@@ -500,8 +500,6 @@ Se l'utente chiede esplicitamente un operatore, una sede, o di parlare con qualc
 | Ostia Lido | +390656557992 |
 | Reggio Calabria | +390915567470 |
 | Palermo | +3909651817184 |
-
-> ⚠️ **Gap noto:** verificare che `transfer_to_number` sia configurato per tutte le sedi prima di usare questa sezione in produzione.
 
 ---
 
