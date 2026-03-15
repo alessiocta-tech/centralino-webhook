@@ -1907,6 +1907,7 @@ class CancelReservationIn(BaseModel):
     restaurant_id: Optional[Any] = None
     time: Optional[str] = None
     note: Optional[str] = None
+    first_name: Optional[str] = None  # Nome del cliente, se noto (aumenta il match su Fidy)
 
     @validator("date")
     @classmethod
@@ -2017,13 +2018,18 @@ async def cancel_reservation(body: CancelReservationIn):
     if body.time:
         find_payload["time"] = body.time
 
-    # Arricchisci con il nome dal DB locale: aumenta le chance di match su Fidy
-    customer = _get_customer(phone)
-    if customer and customer.get("name"):
-        name_parts = customer["name"].strip().split()
-        find_payload["first_name"] = name_parts[0] if name_parts else ""
-        find_payload["last_name"] = name_parts[1] if len(name_parts) > 1 else "Cliente"
+    # Arricchisci con il nome: prima dall'argomento esplicito, poi dal DB locale
+    if body.first_name:
+        find_payload["first_name"] = body.first_name.strip()
+        find_payload["last_name"] = "Cliente"
+    else:
+        customer = _get_customer(phone)
+        if customer and customer.get("name"):
+            name_parts = customer["name"].strip().split()
+            find_payload["first_name"] = name_parts[0] if name_parts else ""
+            find_payload["last_name"] = name_parts[1] if len(name_parts) > 1 else "Cliente"
 
+    print(f"[cancel] find payload → {find_payload}")
     reservation_info: Dict[str, Any] = {}
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
@@ -2033,10 +2039,10 @@ async def cancel_reservation(body: CancelReservationIn):
                 headers=_fidy_headers(),
             )
         ct = find_resp.headers.get("content-type", "")
+        print(f"[cancel] find-reservation-for-cancel status={find_resp.status_code} body={find_resp.text[:500]}")
         if "text/html" not in ct and not find_resp.text.lstrip().startswith("<"):
             if find_resp.status_code == 200:
                 reservation_info = find_resp.json() or {}
-                print(f"[cancel] find-reservation-for-cancel → {reservation_info}")
     except Exception as exc:
         print(f"[cancel] find step error (ignorato): {exc}")
 
@@ -2077,11 +2083,13 @@ async def cancel_reservation(body: CancelReservationIn):
         }
 
     # ── Step 3: cancella ──────────────────────────────────────────────────
+    print(f"[cancel] cancel payload → {cancel_payload}")
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
             resp = await client.post(
                 f"{FIDY_API_BASE}/cancel-reservation", json=cancel_payload, headers=_fidy_headers()
             )
+        print(f"[cancel] cancel-reservation status={resp.status_code} body={resp.text[:500]}")
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type or resp.text.lstrip().startswith("<"):
             return {"ok": False, "status": "CAPTCHA_BLOCKED", "message": "Sistema di prenotazione temporaneamente non raggiungibile."}
