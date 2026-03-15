@@ -118,7 +118,7 @@ IPHONE_UA = os.getenv(
     "PLAYWRIGHT_UA",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/146.0.0.0 Safari/537.36",
+    "Chrome/133.0.0.0 Safari/537.36",
 )
 
 DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
@@ -1783,7 +1783,7 @@ FIDY_UA = os.getenv(
     "FIDY_UA",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/146.0.0.0 Safari/537.36",
+    "Chrome/133.0.0.0 Safari/537.36",
 )
 
 
