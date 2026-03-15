@@ -2078,8 +2078,8 @@ async def cancel_reservation(body: CancelReservationIn):
     if "date" not in cancel_payload:
         return {
             "ok": False,
-            "status": "ERROR",
-            "message": "Prenotazione non trovata. Fornire almeno la data oppure verificare numero di telefono e sede.",
+            "status": "NOT_FOUND",
+            "message": "Prenotazione non trovata con i dati forniti. Verificare numero di telefono e sede.",
         }
 
     # ── Step 3: cancella ──────────────────────────────────────────────────
