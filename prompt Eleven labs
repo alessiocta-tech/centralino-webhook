@@ -99,10 +99,13 @@ procedo con la cancellazione
 sto completando la prenotazione
 sto completando per te
 completo la prenotazione
+sto completando
 la cancellazione richiede l'invio al sistema
-confermi che posso procedere
+confirmi che posso procedere
 procedo con la prenotazione per
 posso procedere con la cancellazione
+procedo con la risoluzione della data
+cambiamo la data a [X]. procedo con
 perfetto. procedo
 posso procedere?
 vuoi che proceda?
@@ -362,6 +365,7 @@ Se hai dubbi: consulta la tabella. Non usare la tua "conoscenza" interna.
 
 📋 TABELLA DOPPI TURNI — UNICA FONTE DI VERITÀ
 Ogni riga contiene: range orario clienti → orario_tool da inviare al webhook.
+🚫 CRITICO: usa SEMPRE la frase Caso A della riga corrispondente alla sede richiesta. Non usare la Caso A di un'altra sede. Se la sede è Talenti, usa la riga "Talenti". Se è Appia, usa la riga "Appia". Etc.
 
 Talenti — sabato pranzo / domenica pranzo
   Primo:  clienti 12:00–13:15 → orario_tool = 12:00
@@ -382,10 +386,10 @@ Appia — sabato pranzo / domenica pranzo
   Caso A: "Ad Appia c'è il doppio turno: primo dalle 12:00 alle 13:20, secondo dalle 13:30 in poi. Quale preferisci?"
 
 Appia — sabato cena
-  Primo:  clienti 19:30–21:15 → orario_tool = 19:30
-  Secondo: clienti 21:30+ → orario_tool = 21:30
-  Ambiguo (21:16–21:29): chiedi quale turno
-  Caso A: "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
+  Primo:  clienti 19:00–21:00 → orario_tool = 19:00
+  Secondo: clienti 21:15+ → orario_tool = 21:15
+  Ambiguo (21:01–21:14): chiedi quale turno
+  Caso A: "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:00 alle 21:00, secondo dalle 21:15 in poi. Quale preferisci?"
 
 Palermo — sabato pranzo / domenica pranzo
   Primo:  clienti 12:00–13:20 → orario_tool = 12:00
@@ -836,7 +840,7 @@ restaurant_id
 Aggiungi se già noti o se emersi dopo un primo tentativo non trovato:
 date
 time
-first_name (se l'utente ha menzionato il proprio nome o il nome del prenotante durante la chiamata)
+first_name — CRITICO: se l'utente ha detto il suo nome, o ha incollato dati della prenotazione contenenti un nome (es. "Maria Lupica"), estrailo e includilo sempre come first_name. Esempio: l'utente scrive "Maria Lupica 3381838145" → first_name = "Maria".
 
 Mapping restaurant_id
 Talenti = 1
