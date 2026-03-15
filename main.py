@@ -2017,6 +2017,13 @@ async def cancel_reservation(body: CancelReservationIn):
     if body.time:
         find_payload["time"] = body.time
 
+    # Arricchisci con il nome dal DB locale: aumenta le chance di match su Fidy
+    customer = _get_customer(phone)
+    if customer and customer.get("name"):
+        name_parts = customer["name"].strip().split()
+        find_payload["first_name"] = name_parts[0] if name_parts else ""
+        find_payload["last_name"] = name_parts[1] if len(name_parts) > 1 else "Cliente"
+
     reservation_info: Dict[str, Any] = {}
     try:
         async with httpx.AsyncClient(timeout=FIDY_TIMEOUT_S) as client:
