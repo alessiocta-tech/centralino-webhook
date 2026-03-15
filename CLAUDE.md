@@ -408,7 +408,7 @@ Se `selected_time` è diverso da quello inviato: usa `selected_time` nel messagg
 
 ### 16. VERIFICA PRENOTAZIONE ESISTENTE
 
-**Dati minimi:** telefono + data + orario (+ sede se non chiara)
+**Dati obbligatori:** telefono + data. Opzionali: sede (restaurant_id), orario — includi solo se già noti o se servono per disambiguare.
 
 **Tool:** `check_reservation`
 
