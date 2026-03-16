@@ -1464,6 +1464,163 @@ def admin_customer(phone: str, request: Request):
     return {"customer": c}
 
 
+@app.get("/_admin/fidy_api_probe")
+async def fidy_api_probe(
+    request: Request,
+    date: str = "2026-03-17",
+    service: str = "cena",
+    persone: int = 2,
+    sede: str = "Talenti",
+):
+    """Intercetta tutte le chiamate di rete verso Fidy durante una sessione Playwright.
+
+    Naviga il form di prenotazione fino alla selezione della sede (senza prenotare),
+    catturando URL, metodo, body e risposta di ogni chiamata verso api.fidy.app o ajax.php.
+    Usare per scoprire gli endpoint esatti dell'API Fidy per availability e create-reservation.
+
+    Params: date (YYYY-MM-DD), service (pranzo|cena), persone, sede
+    """
+    _require_admin(request)
+
+    captured: List[Dict[str, Any]] = []
+    pasto = "PRANZO" if service.lower() == "pranzo" else "CENA"
+    sede_norm = _normalize_sede(sede)
+
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--single-process",
+                    "--disable-gpu",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=IPHONE_UA, viewport={"width": 390, "height": 844}
+            )
+            page = await context.new_page()
+            page.set_default_timeout(PW_TIMEOUT_MS)
+            page.set_default_navigation_timeout(PW_NAV_TIMEOUT_MS)
+            await page.route("**/*", _block_heavy)
+
+            async def _capture_request(req):
+                url = req.url or ""
+                if "fidy" not in url.lower() and "ajax.php" not in url.lower():
+                    return
+                entry: Dict[str, Any] = {
+                    "direction": "request",
+                    "method": req.method,
+                    "url": url,
+                }
+                try:
+                    body = req.post_data
+                    if body:
+                        try:
+                            entry["body"] = json.loads(body)
+                        except Exception:
+                            entry["body_raw"] = body[:2000]
+                    headers_raw = await req.all_headers()
+                    entry["headers"] = {
+                        k: v for k, v in headers_raw.items()
+                        if k.lower() in ("content-type", "x-api-key", "authorization", "accept", "origin", "referer")
+                    }
+                except Exception as e:
+                    entry["capture_error"] = str(e)
+                captured.append(entry)
+
+            async def _capture_response(resp):
+                url = resp.url or ""
+                if "fidy" not in url.lower() and "ajax.php" not in url.lower():
+                    return
+                entry: Dict[str, Any] = {
+                    "direction": "response",
+                    "status": resp.status,
+                    "url": url,
+                }
+                try:
+                    ct = resp.headers.get("content-type", "")
+                    txt = await resp.text()
+                    if "json" in ct or txt.lstrip().startswith("{") or txt.lstrip().startswith("["):
+                        try:
+                            entry["body"] = json.loads(txt)
+                        except Exception:
+                            entry["body_raw"] = txt[:3000]
+                    else:
+                        entry["body_raw"] = txt[:500]
+                except Exception as e:
+                    entry["capture_error"] = str(e)
+                captured.append(entry)
+
+            page.on("request", _capture_request)
+            page.on("response", _capture_response)
+
+            # Naviga e compila il form
+            await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+            await _maybe_click_cookie(page)
+            await _check_captcha_page(page)
+            await _wait_ready(page)
+            await _click_persone(page, persone)
+            await _set_date(page, date)
+            await _click_pasto(page, pasto)
+
+            # Aspetta che la lista sedi si carichi (trigger availability)
+            try:
+                await page.wait_for_selector(".ristoCont", state="visible", timeout=15000)
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Prova anche a cliccare la sede per triggerare ulteriori chiamate API
+            try:
+                await _click_sede(page, sede_norm, pasto, "20:00")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "captured_so_far": captured,
+        }
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    # Raggruppa request+response per URL
+    pairs: List[Dict[str, Any]] = []
+    req_map: Dict[str, Dict[str, Any]] = {}
+    for entry in captured:
+        url = entry["url"]
+        if entry["direction"] == "request":
+            req_map[url] = entry
+            pairs.append({"request": entry, "response": None})
+        else:
+            # associa alla request corrispondente se esiste
+            matched = False
+            for pair in reversed(pairs):
+                if pair["request"]["url"] == url and pair["response"] is None:
+                    pair["response"] = entry
+                    matched = True
+                    break
+            if not matched:
+                pairs.append({"request": None, "response": entry})
+
+    return {
+        "ok": True,
+        "probe_params": {"date": date, "service": service, "persone": persone, "sede": sede},
+        "total_calls": len(pairs),
+        "calls": pairs,
+    }
+
+
 def _is_timeout_error(err: str) -> bool:
     s = (err or "").lower()
     return ("timeout" in s) or ("exceeded" in s)

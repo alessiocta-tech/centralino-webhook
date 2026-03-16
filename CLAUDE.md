@@ -691,6 +691,25 @@ Admin dashboard showing booking stats and customer history. Requires `Authorizat
 ### `GET /_admin/customer/{phone}`
 Returns stored customer profile for a given phone number. Requires admin token.
 
+### `GET /_admin/fidy_api_probe`
+Launches a headless Playwright session, navigates the booking form, and intercepts **all network calls** to `api.fidy.app` and `ajax.php`. Returns the full list of requests and responses captured during the session — useful for discovering the exact Fidy API endpoints for availability and reservation creation without Playwright.
+
+Query params: `date` (YYYY-MM-DD), `service` (pranzo|cena), `persone` (int), `sede` (string). Requires admin token.
+
+```json
+{
+  "ok": true,
+  "probe_params": { "date": "2026-03-17", "service": "cena", "persone": 2, "sede": "Talenti" },
+  "total_calls": 3,
+  "calls": [
+    {
+      "request": { "direction": "request", "method": "POST", "url": "https://api.fidy.app/api/...", "body": {...} },
+      "response": { "direction": "response", "status": 200, "url": "...", "body": {...} }
+    }
+  ]
+}
+```
+
 ---
 
 ## Fidy API Proxy Endpoints
