@@ -134,11 +134,11 @@ FIDY_TIMEOUT_S = int(os.getenv("FIDY_TIMEOUT_S", "20"))
 # ============================================================
 # ESERCIZI DB — connessione MySQL al database dei ristoranti
 # ============================================================
-ESERCIZI_DB_HOST = os.getenv("ESERCIZI_DB_HOST", "")
-ESERCIZI_DB_PORT = int(os.getenv("ESERCIZI_DB_PORT", "3306"))
-ESERCIZI_DB_NAME = os.getenv("ESERCIZI_DB_NAME", "")
-ESERCIZI_DB_USER = os.getenv("ESERCIZI_DB_USER", "")
-ESERCIZI_DB_PASS = os.getenv("ESERCIZI_DB_PASS", "")
+ESERCIZI_DB_HOST = os.getenv("DB_HOST", os.getenv("ESERCIZI_DB_HOST", ""))
+ESERCIZI_DB_PORT = int(os.getenv("DB_PORT", os.getenv("ESERCIZI_DB_PORT", "3306")))
+ESERCIZI_DB_NAME = os.getenv("DB_NAME", os.getenv("ESERCIZI_DB_NAME", ""))
+ESERCIZI_DB_USER = os.getenv("DB_USER", os.getenv("ESERCIZI_DB_USER", ""))
+ESERCIZI_DB_PASS = os.getenv("DB_PASSWORD", os.getenv("DB_PASS", os.getenv("ESERCIZI_DB_PASS", "")))
 
 SEDE_ID_MAP: Dict[str, int] = {
     "talenti": 1,
@@ -2340,8 +2340,7 @@ async def _get_esercizi_pool():
         if not ESERCIZI_DB_HOST:
             raise HTTPException(
                 status_code=503,
-                detail="Database Esercizi non configurato. Impostare ESERCIZI_DB_HOST, "
-                       "ESERCIZI_DB_NAME, ESERCIZI_DB_USER, ESERCIZI_DB_PASS.",
+                detail="Database non configurato. Impostare DB_HOST, DB_NAME, DB_USER, DB_PASSWORD.",
             )
         import aiomysql
         _esercizi_pool = await aiomysql.create_pool(
