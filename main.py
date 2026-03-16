@@ -131,6 +131,15 @@ FIDY_API_BASE = os.getenv("FIDY_API_BASE", "https://api.fidy.app/api")
 FIDY_API_KEY = os.getenv("FIDY_API_KEY", "derione_api_2026_super_secret")
 FIDY_TIMEOUT_S = int(os.getenv("FIDY_TIMEOUT_S", "20"))
 
+# ============================================================
+# ESERCIZI DB — connessione MySQL al database dei ristoranti
+# ============================================================
+ESERCIZI_DB_HOST = os.getenv("ESERCIZI_DB_HOST", "")
+ESERCIZI_DB_PORT = int(os.getenv("ESERCIZI_DB_PORT", "3306"))
+ESERCIZI_DB_NAME = os.getenv("ESERCIZI_DB_NAME", "")
+ESERCIZI_DB_USER = os.getenv("ESERCIZI_DB_USER", "")
+ESERCIZI_DB_PASS = os.getenv("ESERCIZI_DB_PASS", "")
+
 SEDE_ID_MAP: Dict[str, int] = {
     "talenti": 1,
     "appia": 2,
@@ -2309,3 +2318,208 @@ async def add_note(body: AddNoteIn):
         return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
         return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
+
+
+# ============================================================
+# ESERCIZI — parser calendario e disponibilità settimanale
+# ============================================================
+
+_GIORNI_SETTIMANA = ["lunedi", "martedi", "mercoledi", "giovedi", "venerdi", "sabato", "domenica"]
+_GIORNI_SETTIMANA_IT = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+
+_esercizi_pool = None
+
+
+async def _get_esercizi_pool():
+    """
+    Ritorna il pool di connessioni MySQL al database Esercizi (lazy init).
+    Lancia HTTPException 503 se le credenziali non sono configurate.
+    """
+    global _esercizi_pool
+    if _esercizi_pool is None:
+        if not ESERCIZI_DB_HOST:
+            raise HTTPException(
+                status_code=503,
+                detail="Database Esercizi non configurato. Impostare ESERCIZI_DB_HOST, "
+                       "ESERCIZI_DB_NAME, ESERCIZI_DB_USER, ESERCIZI_DB_PASS.",
+            )
+        import aiomysql
+        _esercizi_pool = await aiomysql.create_pool(
+            host=ESERCIZI_DB_HOST,
+            port=ESERCIZI_DB_PORT,
+            db=ESERCIZI_DB_NAME,
+            user=ESERCIZI_DB_USER,
+            password=ESERCIZI_DB_PASS,
+            charset="utf8mb4",
+            autocommit=True,
+            minsize=1,
+            maxsize=5,
+        )
+    return _esercizi_pool
+
+
+def _parse_calendario(calendario: Optional[str], coperti: int) -> List[Dict]:
+    """
+    Parsa il campo Calendario della tabella Esercizi.
+
+    Formato: 14 valori separati da virgola che rappresentano 7 giorni × 2 pasti.
+    Ordine: lun_pranzo, lun_cena, mar_pranzo, mar_cena, ... dom_pranzo, dom_cena.
+
+    Se un valore contiene '|' indica doppio turno:
+      es. "30|50" → primo turno 30 posti, secondo turno 50 posti.
+
+    Se Calendario è vuoto/None → usa coperti per tutti i 14 slot (no doppio turno).
+
+    Ogni elemento restituito:
+      - senza doppio turno: {giorno, giorno_it, pasto, doppio_turno: false, coperti}
+      - con doppio turno:   {giorno, giorno_it, pasto, doppio_turno: true,
+                             primo_turno_coperti, secondo_turno_coperti}
+    """
+    result = []
+    pasti = ["pranzo", "cena"]
+
+    if not calendario or not calendario.strip():
+        # Calendario vuoto → stesso valore coperti per tutti i 14 slot
+        for i, giorno in enumerate(_GIORNI_SETTIMANA):
+            for pasto in pasti:
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": False,
+                    "coperti": coperti,
+                })
+        return result
+
+    slots = [s.strip() for s in calendario.strip().split(",")]
+    idx = 0
+    for i, giorno in enumerate(_GIORNI_SETTIMANA):
+        for pasto in pasti:
+            slot = slots[idx] if idx < len(slots) else str(coperti)
+            if "|" in slot:
+                parts = slot.split("|", 1)
+                try:
+                    primo = int(parts[0].strip())
+                    secondo = int(parts[1].strip())
+                except ValueError:
+                    primo = coperti
+                    secondo = coperti
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": True,
+                    "primo_turno_coperti": primo,
+                    "secondo_turno_coperti": secondo,
+                })
+            else:
+                try:
+                    c = int(slot)
+                except ValueError:
+                    c = coperti
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": False,
+                    "coperti": c,
+                })
+            idx += 1
+
+    return result
+
+
+@app.get("/esercizi")
+async def get_esercizi():
+    """Lista tutti gli esercizi con dati base (ID, nome, telefono, città, coperti, attivo)."""
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Telefono, Email, Citta, Coperti, Attivo "
+                    "FROM Esercizi ORDER BY ID"
+                )
+                rows = await cur.fetchall()
+        return {"ok": True, "esercizi": [dict(r) for r in rows]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
+
+
+@app.get("/esercizi/disponibilita")
+async def get_disponibilita_tutti():
+    """
+    Restituisce la disponibilità settimanale (pranzo/cena) per tutti gli esercizi attivi.
+
+    Per ogni esercizio e per ogni giorno/pasto indica:
+    - se c'è doppio turno (doppio_turno: true) con i posti disponibili per ciascun turno
+    - altrimenti il numero di coperti disponibili per quel giorno/pasto
+
+    Se il campo Calendario è vuoto, usa il valore Coperti come default per tutti i turni.
+    """
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario "
+                    "FROM Esercizi WHERE Attivo = 'SI' ORDER BY ID"
+                )
+                rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            row = dict(row)
+            disponibilita = _parse_calendario(row.get("Calendario"), int(row.get("Coperti") or 0))
+            result.append({
+                "esercizio_id": row["ID"],
+                "nome": row["NomeRapp"],
+                "coperti_default": row["Coperti"],
+                "disponibilita": disponibilita,
+            })
+        return {"ok": True, "esercizi": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
+
+
+@app.get("/esercizi/{esercizio_id}/disponibilita")
+async def get_disponibilita_esercizio(esercizio_id: int):
+    """
+    Restituisce la disponibilità settimanale (pranzo/cena) per un singolo esercizio.
+
+    Per ogni giorno/pasto indica:
+    - se c'è doppio turno (doppio_turno: true) con i posti disponibili per ciascun turno
+    - altrimenti il numero di coperti disponibili
+
+    Se il campo Calendario è vuoto, usa il valore Coperti come default per tutti i turni.
+    """
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                    (esercizio_id,),
+                )
+                row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Esercizio {esercizio_id} non trovato.")
+        row = dict(row)
+        disponibilita = _parse_calendario(row.get("Calendario"), int(row.get("Coperti") or 0))
+        return {
+            "ok": True,
+            "esercizio_id": row["ID"],
+            "nome": row["NomeRapp"],
+            "coperti_default": row["Coperti"],
+            "disponibilita": disponibilita,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
