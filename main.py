@@ -2754,13 +2754,18 @@ async def _build_remaining_payload(
 @app.get("/_health/mysql")
 async def mysql_healthcheck():
     """Health check connessione MySQL (database Esercizi)."""
-    pool = await _get_esercizi_pool()
-    import aiomysql
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT 1 AS ok")
-            row = await cur.fetchone()
-    return {"ok": True, "mysql": dict(row)}
+    try:
+        pool = await _get_esercizi_pool()
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute("SELECT 1 AS ok")
+                row = await cur.fetchone()
+        return {"ok": True, "mysql": dict(row)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MySQL connection error: {e}")
 
 
 @app.get("/availability/capacity")
@@ -2778,8 +2783,8 @@ async def availability_capacity(
     if service not in ("pranzo", "cena"):
         raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
 
-    pool = await _get_esercizi_pool()
     try:
+        pool = await _get_esercizi_pool()
         import aiomysql
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -2825,8 +2830,8 @@ async def availability_remaining(
     if service not in ("pranzo", "cena"):
         raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
 
-    pool = await _get_esercizi_pool()
     try:
+        pool = await _get_esercizi_pool()
         import aiomysql
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -2862,8 +2867,8 @@ async def availability_remaining_all(
     if service not in ("pranzo", "cena"):
         raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
 
-    pool = await _get_esercizi_pool()
     try:
+        pool = await _get_esercizi_pool()
         import aiomysql
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
