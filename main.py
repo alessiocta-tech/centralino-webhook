@@ -3048,3 +3048,241 @@ async def availability_remaining_all(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore DB: {e}")
+
+
+# ============================================================
+# DIRECT BOOK — prenotazione diretta su MySQL (senza Playwright)
+# ============================================================
+
+import secrets as _secrets
+
+_DIRECT_BOOK_SOURCE = os.getenv("DIRECT_BOOKING_SOURCE", "AI")
+_DIRECT_BOOK_STATUS = os.getenv("DIRECT_BOOKING_STATUS", "APERTA")
+
+
+class DirectBookIn(BaseModel):
+    nome: str = Field(..., min_length=1)
+    telefono: str
+    sede: Optional[str] = None
+    restaurant_id: Optional[int] = None
+    data: str = Field(..., description="YYYY-MM-DD")
+    orario: str = Field(..., description="HH:MM")
+    coperti: int = Field(..., ge=1, le=50)
+    cognome: Optional[str] = None
+    email: Optional[str] = None
+    nota: Optional[str] = None
+    seggiolini: int = Field(0, ge=0, le=3)
+
+    @validator("data")
+    @classmethod
+    def validate_data(cls, v):
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError("data deve essere in formato YYYY-MM-DD")
+        return v
+
+    @validator("orario")
+    @classmethod
+    def validate_orario(cls, v):
+        if not re.fullmatch(r"\d{2}:\d{2}", (v or "").strip()):
+            raise ValueError("orario deve essere in formato HH:MM")
+        return v.strip()
+
+    @validator("telefono")
+    @classmethod
+    def normalize_phone(cls, v):
+        digits = re.sub(r"[^\d+]", "", v or "")
+        if len(re.sub(r"\D", "", digits)) < 6:
+            raise ValueError("telefono non valido")
+        return digits
+
+    @validator("cognome", pre=True, always=True)
+    @classmethod
+    def default_cognome(cls, v):
+        return (v or "Cliente").strip() or "Cliente"
+
+    @validator("nota", pre=True, always=True)
+    @classmethod
+    def normalize_nota(cls, v):
+        return (v or "").strip()[:500]
+
+    @validator("email", pre=True, always=True)
+    @classmethod
+    def normalize_email(cls, v):
+        if not v:
+            return None
+        v = v.strip()
+        if v and "@" not in v:
+            raise ValueError("email non valida")
+        return v or None
+
+
+def _resolve_restaurant_id_direct(sede: Optional[str], restaurant_id: Optional[int]) -> int:
+    if restaurant_id:
+        return int(restaurant_id)
+    if sede:
+        rid = SEDE_ID_MAP.get(sede.strip().lower())
+        if rid:
+            return rid
+    raise HTTPException(status_code=400, detail="Devi fornire sede oppure restaurant_id valido")
+
+
+def _parse_time_hhmm(orario: str) -> time:
+    try:
+        return datetime.strptime(orario, "%H:%M").time()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="orario deve essere in formato HH:MM")
+
+
+def _double_turn_error_msg(restaurant_id: int, service: str) -> str:
+    windows = _DOUBLE_TURN_WINDOWS.get(restaurant_id, {}).get(service, [])
+    if len(windows) >= 2:
+        primo_start = windows[0][0].strftime("%H:%M")
+        primo_end = windows[0][1].strftime("%H:%M")
+        secondo_start = windows[1][0].strftime("%H:%M")
+        return (
+            f"Orario ambiguo per servizio con doppio turno: "
+            f"primo {primo_start}-{primo_end}, secondo dalle {secondo_start}"
+        )
+    return "Orario ambiguo in un servizio con doppio turno"
+
+
+@app.post("/direct_book")
+async def direct_book(body: DirectBookIn):
+    """
+    Prenotazione diretta su MySQL: verifica disponibilità residua e inserisce in Prenotazioni.
+    Non usa Playwright. Fonte=AI, Stato=APERTA per default.
+    Campi richiesti: nome, telefono, sede o restaurant_id, data, orario, coperti.
+    Facoltativi: cognome, email, nota, seggiolini.
+    """
+    import aiomysql
+
+    restaurant_id = _resolve_restaurant_id_direct(body.sede, body.restaurant_id)
+    booking_date = date.fromisoformat(body.data)
+    booking_time = _parse_time_hhmm(body.orario)
+    service = _service_from_booking_time(booking_time)
+    if service is None:
+        raise HTTPException(
+            status_code=400,
+            detail="L'orario deve essere in fascia pranzo (12:00-16:00) o cena (17:00-23:59)",
+        )
+
+    pool = await _get_esercizi_pool()
+
+    # Fetch esercizio
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                (restaurant_id,),
+            )
+            esercizio_row = await cur.fetchone()
+    if not esercizio_row:
+        raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato")
+    esercizio = dict(esercizio_row)
+
+    # Verifica disponibilità residua
+    remaining = await _build_remaining_payload(pool, esercizio, booking_date, service)
+
+    if remaining["double_turn"]:
+        turno = _turn_from_booking_time(restaurant_id, service, booking_time)
+        if turno not in ("primo", "secondo"):
+            raise HTTPException(
+                status_code=400,
+                detail=_double_turn_error_msg(restaurant_id, service),
+            )
+        rem_key = "remaining_first_turn" if turno == "primo" else "remaining_second_turn"
+        available = remaining[rem_key]
+        if available < body.coperti:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ok": False,
+                    "status": "SOLD_OUT",
+                    "message": f"Posti insufficienti per il {turno} turno",
+                    "turno": turno,
+                    "remaining": available,
+                    "requested": body.coperti,
+                    "availability": remaining,
+                },
+            )
+    else:
+        turno = None
+        available = remaining["remaining_total"]
+        if available < body.coperti:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ok": False,
+                    "status": "SOLD_OUT",
+                    "message": "Posti insufficienti per il servizio richiesto",
+                    "remaining": available,
+                    "requested": body.coperti,
+                    "availability": remaining,
+                },
+            )
+
+    # Inserimento in Prenotazioni
+    code_id = _secrets.token_hex(8)  # 16 chars hex
+    orario_db = f"{body.orario}:00"  # HH:MM → HH:MM:SS
+
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO Prenotazioni (
+                        PRistorante, DataPren, OraPren, Nome, Cognome, Telefono, Email,
+                        Coperti, Seggiolini, Fonte, Stato, Nota, Prezzo, Tavolo,
+                        PCliente, CodeID, Voto, Commento
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        restaurant_id,
+                        body.data,
+                        orario_db,
+                        body.nome.strip(),
+                        body.cognome or "Cliente",
+                        body.telefono,
+                        body.email or "",
+                        body.coperti,
+                        body.seggiolini,
+                        _DIRECT_BOOK_SOURCE,
+                        _DIRECT_BOOK_STATUS,
+                        body.nota or "",
+                        "0.00",
+                        "",
+                        0,
+                        code_id,
+                        0,
+                        "",
+                    ),
+                )
+                booking_id = cur.lastrowid
+    except aiomysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"Errore MySQL: {e}")
+
+    return {
+        "ok": True,
+        "message": "Prenotazione inserita correttamente",
+        "booking_id": booking_id,
+        "code_id": code_id,
+        "restaurant_id": restaurant_id,
+        "restaurant_name": esercizio.get("NomeRapp"),
+        "date": body.data,
+        "time": body.orario,
+        "service": service,
+        "turno": turno,
+        "covers": body.coperti,
+        "nome": body.nome.strip(),
+        "cognome": body.cognome or "Cliente",
+        "telefono": body.telefono,
+        "status": _DIRECT_BOOK_STATUS,
+        "source": _DIRECT_BOOK_SOURCE,
+        "availability_at_booking": remaining,
+    }
