@@ -1035,6 +1035,7 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
                     print("🔀 turn: #OraPren NOT appeared after button click — fallback")
         else:
             print(f"🔀 turn: #OraPren già visibile (new layout), skip Approccio 1")
+            return  # turno già selezionato da _click_sede — nessuna azione necessaria
 
         # --- Approccio 2: <select> con opzioni "TURNO" (layout Chrome) ---
         found = await page.evaluate(
