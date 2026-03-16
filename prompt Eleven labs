@@ -29,6 +29,9 @@ Saluto iniziale obbligatorio:
 Riconosci sempre la sede anche se pronunciata in modo approssimato o con errori.
 
 Appia:
+- Tuscolana
+- furio Camillo
+- cesare baronio
 - appia
 - apia
 - apiia
@@ -699,7 +702,6 @@ Se il turno è stato determinato, il campo orario è chiuso definitivamente e no
 🧾 RIEPILOGO FINALE
 Formato obbligatorio:
 "Riepilogo: [Sede] [weekday_spoken] [day_number] [month_spoken] alle [orario finale], [persone] persone. Nome: [nome]. Confermi?"
-
 Regole:
 - attendi sempre sì
 - mai usare i due punti nell’orario parlato

@@ -4,12 +4,12 @@ import re
 import json
 import sqlite3
 import asyncio
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date, time
 from typing import Optional, Union, List, Dict, Any, Tuple
 
 import httpx
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, root_validator, validator
 from playwright.async_api import async_playwright
@@ -130,6 +130,15 @@ DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "default@prenotazioni.com")
 FIDY_API_BASE = os.getenv("FIDY_API_BASE", "https://api.fidy.app/api")
 FIDY_API_KEY = os.getenv("FIDY_API_KEY", "derione_api_2026_super_secret")
 FIDY_TIMEOUT_S = int(os.getenv("FIDY_TIMEOUT_S", "20"))
+
+# ============================================================
+# ESERCIZI DB — connessione MySQL al database dei ristoranti
+# ============================================================
+ESERCIZI_DB_HOST = os.getenv("ESERCIZI_DB_HOST", "")
+ESERCIZI_DB_PORT = int(os.getenv("ESERCIZI_DB_PORT", "3306"))
+ESERCIZI_DB_NAME = os.getenv("ESERCIZI_DB_NAME", "")
+ESERCIZI_DB_USER = os.getenv("ESERCIZI_DB_USER", "")
+ESERCIZI_DB_PASS = os.getenv("ESERCIZI_DB_PASS", "")
 
 SEDE_ID_MAP: Dict[str, int] = {
     "talenti": 1,
@@ -1035,6 +1044,7 @@ async def _maybe_select_turn(page, pasto: str, orario_req: str):
                     print("🔀 turn: #OraPren NOT appeared after button click — fallback")
         else:
             print(f"🔀 turn: #OraPren già visibile (new layout), skip Approccio 1")
+            return  # turno già selezionato da _click_sede — nessuna azione necessaria
 
         # --- Approccio 2: <select> con opzioni "TURNO" (layout Chrome) ---
         found = await page.evaluate(
@@ -2308,3 +2318,567 @@ async def add_note(body: AddNoteIn):
         return {"ok": False, "status": "TECH_ERROR", "message": "Timeout contattando il sistema di prenotazione."}
     except Exception as e:
         return {"ok": False, "status": "ERROR", "message": f"Errore Fidy API: {e}"}
+
+
+# ============================================================
+# ESERCIZI — parser calendario e disponibilità settimanale
+# ============================================================
+
+_GIORNI_SETTIMANA = ["lunedi", "martedi", "mercoledi", "giovedi", "venerdi", "sabato", "domenica"]
+_GIORNI_SETTIMANA_IT = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+
+_esercizi_pool = None
+
+
+async def _get_esercizi_pool():
+    """
+    Ritorna il pool di connessioni MySQL al database Esercizi (lazy init).
+    Lancia HTTPException 503 se le credenziali non sono configurate.
+    """
+    global _esercizi_pool
+    if _esercizi_pool is None:
+        if not ESERCIZI_DB_HOST:
+            raise HTTPException(
+                status_code=503,
+                detail="Database Esercizi non configurato. Impostare ESERCIZI_DB_HOST, "
+                       "ESERCIZI_DB_NAME, ESERCIZI_DB_USER, ESERCIZI_DB_PASS.",
+            )
+        import aiomysql
+        _esercizi_pool = await aiomysql.create_pool(
+            host=ESERCIZI_DB_HOST,
+            port=ESERCIZI_DB_PORT,
+            db=ESERCIZI_DB_NAME,
+            user=ESERCIZI_DB_USER,
+            password=ESERCIZI_DB_PASS,
+            charset="utf8mb4",
+            autocommit=True,
+            minsize=1,
+            maxsize=5,
+        )
+    return _esercizi_pool
+
+
+def _parse_calendario(calendario: Optional[str], coperti: int) -> List[Dict]:
+    """
+    Parsa il campo Calendario della tabella Esercizi.
+
+    Formato: 14 valori separati da virgola che rappresentano 7 giorni × 2 pasti.
+    Ordine: lun_pranzo, lun_cena, mar_pranzo, mar_cena, ... dom_pranzo, dom_cena.
+
+    Se un valore contiene '|' indica doppio turno:
+      es. "30|50" → primo turno 30 posti, secondo turno 50 posti.
+
+    Se Calendario è vuoto/None → usa coperti per tutti i 14 slot (no doppio turno).
+
+    Ogni elemento restituito:
+      - senza doppio turno: {giorno, giorno_it, pasto, doppio_turno: false, coperti}
+      - con doppio turno:   {giorno, giorno_it, pasto, doppio_turno: true,
+                             primo_turno_coperti, secondo_turno_coperti}
+    """
+    result = []
+    pasti = ["pranzo", "cena"]
+
+    if not calendario or not calendario.strip():
+        # Calendario vuoto → stesso valore coperti per tutti i 14 slot
+        for i, giorno in enumerate(_GIORNI_SETTIMANA):
+            for pasto in pasti:
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": False,
+                    "coperti": coperti,
+                })
+        return result
+
+    slots = [s.strip() for s in calendario.strip().split(",")]
+    idx = 0
+    for i, giorno in enumerate(_GIORNI_SETTIMANA):
+        for pasto in pasti:
+            slot = slots[idx] if idx < len(slots) else str(coperti)
+            if "|" in slot:
+                parts = slot.split("|", 1)
+                try:
+                    primo = int(parts[0].strip())
+                    secondo = int(parts[1].strip())
+                except ValueError:
+                    primo = coperti
+                    secondo = coperti
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": True,
+                    "primo_turno_coperti": primo,
+                    "secondo_turno_coperti": secondo,
+                })
+            else:
+                try:
+                    c = int(slot)
+                except ValueError:
+                    c = coperti
+                result.append({
+                    "giorno": giorno,
+                    "giorno_it": _GIORNI_SETTIMANA_IT[i],
+                    "pasto": pasto,
+                    "doppio_turno": False,
+                    "coperti": c,
+                })
+            idx += 1
+
+    return result
+
+
+@app.get("/esercizi")
+async def get_esercizi():
+    """Lista tutti gli esercizi con dati base (ID, nome, telefono, città, coperti, attivo)."""
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Telefono, Email, Citta, Coperti, Attivo "
+                    "FROM Esercizi ORDER BY ID"
+                )
+                rows = await cur.fetchall()
+        return {"ok": True, "esercizi": [dict(r) for r in rows]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
+
+
+@app.get("/esercizi/disponibilita")
+async def get_disponibilita_tutti():
+    """
+    Restituisce la disponibilità settimanale (pranzo/cena) per tutti gli esercizi attivi.
+
+    Per ogni esercizio e per ogni giorno/pasto indica:
+    - se c'è doppio turno (doppio_turno: true) con i posti disponibili per ciascun turno
+    - altrimenti il numero di coperti disponibili per quel giorno/pasto
+
+    Se il campo Calendario è vuoto, usa il valore Coperti come default per tutti i turni.
+    """
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario "
+                    "FROM Esercizi WHERE Attivo = 'SI' ORDER BY ID"
+                )
+                rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            row = dict(row)
+            disponibilita = _parse_calendario(row.get("Calendario"), int(row.get("Coperti") or 0))
+            result.append({
+                "esercizio_id": row["ID"],
+                "nome": row["NomeRapp"],
+                "coperti_default": row["Coperti"],
+                "disponibilita": disponibilita,
+            })
+        return {"ok": True, "esercizi": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
+
+
+@app.get("/esercizi/{esercizio_id}/disponibilita")
+async def get_disponibilita_esercizio(esercizio_id: int):
+    """
+    Restituisce la disponibilità settimanale (pranzo/cena) per un singolo esercizio.
+
+    Per ogni giorno/pasto indica:
+    - se c'è doppio turno (doppio_turno: true) con i posti disponibili per ciascun turno
+    - altrimenti il numero di coperti disponibili
+
+    Se il campo Calendario è vuoto, usa il valore Coperti come default per tutti i turni.
+    """
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                    (esercizio_id,),
+                )
+                row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Esercizio {esercizio_id} non trovato.")
+        row = dict(row)
+        disponibilita = _parse_calendario(row.get("Calendario"), int(row.get("Coperti") or 0))
+        return {
+            "ok": True,
+            "esercizio_id": row["ID"],
+            "nome": row["NomeRapp"],
+            "coperti_default": row["Coperti"],
+            "disponibilita": disponibilita,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB Esercizi: {e}")
+
+
+# ============================================================
+# DISPONIBILITÀ RESIDUA — capienza vs prenotazioni attive
+# ============================================================
+
+# Indice base nel calendario per ogni giorno della settimana
+# date.weekday() → 0=lun, 1=mar, ..., 6=dom
+# Calendario: lun_pranzo(0), lun_cena(1), mar_pranzo(2), mar_cena(3), ...
+_WEEKDAY_SLOT_BASE: Dict[int, int] = {0: 0, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12}
+
+# Finestre orarie per doppio turno — keyed by ID reale del DB Esercizi
+# (1=Talenti, 2=Reggio Calabria, 3=Ostia, 4=Appia, 5=Palermo, 6=Corso Trieste)
+_DOUBLE_TURN_WINDOWS: Dict[int, Dict[str, List[Tuple[time, time, str]]]] = {
+    1: {  # Talenti
+        "pranzo": [
+            (time(12, 0), time(13, 15), "primo"),
+            (time(13, 30), time(23, 59), "secondo"),
+        ],
+        "cena": [
+            (time(19, 0), time(20, 45), "primo"),
+            (time(21, 0), time(23, 59), "secondo"),
+        ],
+    },
+    2: {  # Reggio Calabria
+        "cena": [
+            (time(19, 30), time(21, 15), "primo"),
+            (time(21, 30), time(23, 59), "secondo"),
+        ],
+    },
+    4: {  # Appia
+        "pranzo": [
+            (time(12, 0), time(13, 20), "primo"),
+            (time(13, 30), time(23, 59), "secondo"),
+        ],
+        "cena": [
+            (time(19, 30), time(21, 15), "primo"),
+            (time(21, 30), time(23, 59), "secondo"),
+        ],
+    },
+    5: {  # Palermo
+        "pranzo": [
+            (time(12, 0), time(13, 20), "primo"),
+            (time(13, 30), time(23, 59), "secondo"),
+        ],
+        "cena": [
+            (time(19, 30), time(21, 15), "primo"),
+            (time(21, 30), time(23, 59), "secondo"),
+        ],
+    },
+    # 3 (Ostia) e 6 (Corso Trieste): nessun doppio turno
+}
+
+
+def _capacity_for_date_service(
+    calendario: Optional[str], coperti: int, target_date: date, service: str
+) -> Dict[str, Any]:
+    """
+    Estrae la capienza per una data e un servizio specifici dal campo Calendario.
+    Ritorna un dict con:
+      - senza doppio turno: {double_turn: False, capacity_total: N}
+      - con doppio turno:   {double_turn: True, capacity_first_turn: N, capacity_second_turn: M}
+    """
+    idx = _WEEKDAY_SLOT_BASE[target_date.weekday()] + (0 if service == "pranzo" else 1)
+
+    if not calendario or not calendario.strip():
+        return {"double_turn": False, "capacity_total": int(coperti or 0)}
+
+    slots = [s.strip() for s in calendario.strip().split(",")]
+    slot = slots[idx] if idx < len(slots) else str(coperti)
+
+    if "|" in slot:
+        parts = slot.split("|", 1)
+        try:
+            primo = int(parts[0].strip())
+            secondo = int(parts[1].strip())
+        except ValueError:
+            primo = secondo = int(coperti or 0)
+        return {"double_turn": True, "capacity_first_turn": primo, "capacity_second_turn": secondo}
+
+    try:
+        cap = int(slot)
+    except ValueError:
+        cap = int(coperti or 0)
+    if cap <= 0:
+        cap = int(coperti or 0)
+    return {"double_turn": False, "capacity_total": cap}
+
+
+def _service_from_booking_time(ora: Any) -> Optional[str]:
+    """Ricava il servizio (pranzo/cena) dall'orario di una prenotazione."""
+    if isinstance(ora, timedelta):
+        total_sec = int(ora.total_seconds())
+        hh = (total_sec // 3600) % 24
+        mm = (total_sec % 3600) // 60
+        ora = time(hh, mm)
+    elif isinstance(ora, str):
+        try:
+            ora = datetime.strptime(ora, "%H:%M:%S").time()
+        except ValueError:
+            try:
+                ora = datetime.strptime(ora, "%H:%M").time()
+            except ValueError:
+                return None
+    if not isinstance(ora, time):
+        return None
+    if time(12, 0) <= ora <= time(16, 0):
+        return "pranzo"
+    if time(17, 0) <= ora <= time(23, 59):
+        return "cena"
+    return None
+
+
+def _turn_from_booking_time(restaurant_id: int, service: str, ora: Any) -> Optional[str]:
+    """Ricava il turno (primo/secondo) dall'orario di una prenotazione con doppio turno."""
+    if isinstance(ora, timedelta):
+        total_sec = int(ora.total_seconds())
+        hh = (total_sec // 3600) % 24
+        mm = (total_sec % 3600) // 60
+        ora = time(hh, mm)
+    elif isinstance(ora, str):
+        try:
+            ora = datetime.strptime(ora, "%H:%M:%S").time()
+        except ValueError:
+            try:
+                ora = datetime.strptime(ora, "%H:%M").time()
+            except ValueError:
+                return None
+    if not isinstance(ora, time):
+        return None
+    for start, end, label in _DOUBLE_TURN_WINDOWS.get(restaurant_id, {}).get(service, []):
+        if start <= ora <= end:
+            return label
+    return None
+
+
+async def _reserved_for_service(
+    pool, restaurant_id: int, target_date: date, service: str
+) -> Dict[str, int]:
+    """
+    Somma i coperti delle prenotazioni attive (APERTA + CONFERMATA)
+    per un esercizio, una data e un servizio specifici.
+    Se il servizio ha doppio turno, suddivide il totale per turno.
+    """
+    import aiomysql
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT OraPren, Coperti
+                FROM Prenotazioni
+                WHERE PRistorante = %s
+                  AND DataPren = %s
+                  AND Stato IN ('APERTA', 'CONFERMATA')
+                """,
+                (restaurant_id, target_date),
+            )
+            rows = await cur.fetchall()
+
+    reserved_total = 0
+    reserved_first = 0
+    reserved_second = 0
+
+    for row in rows:
+        covers = int(row.get("Coperti") or 0)
+        ora = row.get("OraPren")
+        svc = _service_from_booking_time(ora)
+        if svc != service:
+            continue
+        reserved_total += covers
+        turn = _turn_from_booking_time(restaurant_id, service, ora)
+        if turn == "primo":
+            reserved_first += covers
+        elif turn == "secondo":
+            reserved_second += covers
+
+    return {
+        "reserved_total": reserved_total,
+        "reserved_first_turn": reserved_first,
+        "reserved_second_turn": reserved_second,
+    }
+
+
+async def _build_remaining_payload(
+    pool, esercizio: Dict[str, Any], target_date: date, service: str
+) -> Dict[str, Any]:
+    restaurant_id = int(esercizio["ID"])
+    cap = _capacity_for_date_service(
+        esercizio.get("Calendario"), int(esercizio.get("Coperti") or 0), target_date, service
+    )
+    res = await _reserved_for_service(pool, restaurant_id, target_date, service)
+
+    base: Dict[str, Any] = {
+        "restaurant_id": restaurant_id,
+        "restaurant_name": esercizio.get("NomeRapp"),
+        "date": target_date.isoformat(),
+        "service": service,
+    }
+
+    if cap["double_turn"]:
+        c1 = cap["capacity_first_turn"]
+        c2 = cap["capacity_second_turn"]
+        r1 = res["reserved_first_turn"]
+        r2 = res["reserved_second_turn"]
+        base.update({
+            "double_turn": True,
+            "capacity_first_turn": c1,
+            "capacity_second_turn": c2,
+            "reserved_first_turn": r1,
+            "reserved_second_turn": r2,
+            "remaining_first_turn": max(0, c1 - r1),
+            "remaining_second_turn": max(0, c2 - r2),
+            "capacity_total": c1 + c2,
+            "reserved_total": r1 + r2,
+            "remaining_total": max(0, c1 - r1) + max(0, c2 - r2),
+        })
+    else:
+        ct = cap["capacity_total"]
+        rt = res["reserved_total"]
+        base.update({
+            "double_turn": False,
+            "capacity_total": ct,
+            "reserved_total": rt,
+            "remaining_total": max(0, ct - rt),
+        })
+
+    return base
+
+
+@app.get("/_health/mysql")
+async def mysql_healthcheck():
+    """Health check connessione MySQL (database Esercizi)."""
+    pool = await _get_esercizi_pool()
+    import aiomysql
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute("SELECT 1 AS ok")
+            row = await cur.fetchone()
+    return {"ok": True, "mysql": dict(row)}
+
+
+@app.get("/availability/capacity")
+async def availability_capacity(
+    restaurant_id: int = Query(...),
+    target_date: str = Query(..., description="YYYY-MM-DD"),
+    service: str = Query(..., description="pranzo | cena"),
+):
+    """Capienza teorica per un esercizio, una data e un servizio (pranzo/cena)."""
+    try:
+        parsed_date = date.fromisoformat(target_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="target_date deve essere YYYY-MM-DD")
+    service = service.strip().lower()
+    if service not in ("pranzo", "cena"):
+        raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
+
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                    (restaurant_id,),
+                )
+                row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato.")
+        row = dict(row)
+        cap = _capacity_for_date_service(
+            row.get("Calendario"), int(row.get("Coperti") or 0), parsed_date, service
+        )
+        return {
+            "restaurant_id": int(row["ID"]),
+            "restaurant_name": row.get("NomeRapp"),
+            "date": parsed_date.isoformat(),
+            "service": service,
+            **cap,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB: {e}")
+
+
+@app.get("/availability/remaining")
+async def availability_remaining(
+    restaurant_id: int = Query(...),
+    target_date: str = Query(..., description="YYYY-MM-DD"),
+    service: str = Query(..., description="pranzo | cena"),
+):
+    """
+    Posti rimanenti = capienza teorica - prenotazioni attive (APERTA + CONFERMATA).
+    Se il servizio ha doppio turno restituisce i posti rimanenti per ciascun turno.
+    """
+    try:
+        parsed_date = date.fromisoformat(target_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="target_date deve essere YYYY-MM-DD")
+    service = service.strip().lower()
+    if service not in ("pranzo", "cena"):
+        raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
+
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                    (restaurant_id,),
+                )
+                row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato.")
+        return await _build_remaining_payload(pool, dict(row), parsed_date, service)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB: {e}")
+
+
+@app.get("/availability/remaining/all")
+async def availability_remaining_all(
+    target_date: str = Query(..., description="YYYY-MM-DD"),
+    service: str = Query(..., description="pranzo | cena"),
+    only_active: bool = Query(True, description="Se True, include solo esercizi con Attivo='SI'"),
+):
+    """
+    Posti rimanenti per tutti gli esercizi in una data e un servizio specifico.
+    Utile per un colpo d'occhio sulla disponibilità di tutte le sedi.
+    """
+    try:
+        parsed_date = date.fromisoformat(target_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="target_date deve essere YYYY-MM-DD")
+    service = service.strip().lower()
+    if service not in ("pranzo", "cena"):
+        raise HTTPException(status_code=400, detail="service deve essere 'pranzo' oppure 'cena'")
+
+    pool = await _get_esercizi_pool()
+    try:
+        import aiomysql
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                q = "SELECT ID, NomeRapp, Coperti, Calendario, Attivo FROM Esercizi"
+                if only_active:
+                    q += " WHERE Attivo = 'SI'"
+                q += " ORDER BY ID"
+                await cur.execute(q)
+                rows = await cur.fetchall()
+        items = []
+        for row in rows:
+            items.append(await _build_remaining_payload(pool, dict(row), parsed_date, service))
+        return {"date": parsed_date.isoformat(), "service": service, "items": items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore DB: {e}")
