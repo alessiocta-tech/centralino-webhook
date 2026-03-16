@@ -940,6 +940,49 @@ async def _click_sede(page, sede_target: str, pasto: str = "", orario_req: str =
         except Exception as e:
             print(f"⚠️ _click_sede new layout attempt failed: {e}")
 
+    # --- NEW LAYOUT (single turn): click sede card link/button within .ristoCont ---
+    # Handles non-double-turn days where no I/II TURNO buttons exist.
+    try:
+        card_clicked = await page.evaluate(
+            """([sedeName]) => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                const ristoCont = document.querySelector('.ristoCont');
+                if (!ristoCont) return null;
+                const sedeNorm = norm(sedeName);
+                const otherSedes = ['TALENTI','OSTIA LIDO','APPIA','PALERMO','REGGIO CALABRIA']
+                    .filter(s => s !== sedeNorm);
+                const allEls = Array.from(ristoCont.querySelectorAll('*'));
+                // Find the sede-specific card: contains sede name but not other sedes
+                const sedeEl = allEls.find(el => {
+                    const t = norm(el.innerText || '');
+                    return t.includes(sedeNorm) && !otherSedes.some(o => t.includes(o));
+                });
+                if (!sedeEl) return null;
+                // Prefer <a> links first (covers URL-navigation layouts)
+                const link = sedeEl.querySelector('a');
+                if (link) { link.click(); return 'link'; }
+                // Then non-TURNO buttons
+                const btns = Array.from(sedeEl.querySelectorAll('button')).filter(b => {
+                    const t = norm(b.innerText || '');
+                    return t !== 'I TURNO' && t !== 'II TURNO';
+                });
+                if (btns.length > 0) { btns[0].click(); return 'button'; }
+                // Last resort: click the card element directly (covers addEventListener-based navigation)
+                sedeEl.click();
+                return 'card';
+            }""",
+            [target],
+        )
+        if card_clicked:
+            try:
+                await page.wait_for_selector("#OraPren", state="visible", timeout=8000)
+                print(f"✅ _click_sede new layout (single-turn/{card_clicked}): clicked for {target}")
+                return True
+            except Exception:
+                print(f"⚠️ _click_sede new layout (single-turn/{card_clicked}): clicked but #OraPren not visible")
+    except Exception as e:
+        print(f"⚠️ _click_sede new layout (single-turn) attempt failed: {e}")
+
     # --- OLD LAYOUT: click on the sede name text / ancestor link ---
     for cand in [target, target.replace(" - Roma", ""), target.replace(" - roma", "")]:
         try:
