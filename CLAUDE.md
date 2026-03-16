@@ -463,7 +463,7 @@ Se `selected_time` è diverso da quello inviato: usa `selected_time` nel messagg
 
 **Tool:** `check_reservation`
 
-**Mapping `restaurant_id`:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+**Mapping `restaurant_id`:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
 
 **Esito positivo:** "Sì, la tua prenotazione risulta confermata."
 **Esito negativo:** "Non trovo una prenotazione con questi dati. Vuoi ricontrollare numero di telefono, data, orario o sede?"
@@ -487,7 +487,7 @@ Se `selected_time` è diverso da quello inviato: usa `selected_time` nel messagg
 
 **Parametri:** `phone` + `restaurant_id` obbligatori. `date`, `time`, `note` opzionali.
 
-**Mapping `restaurant_id`:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+**Mapping `restaurant_id`:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
 
 | Esito | Azione |
 |-------|--------|
@@ -522,7 +522,7 @@ Dopo il primo "non trovato", segui questo ordine esatto — UNA sola domanda per
 
 **Tool:** `update_covers`
 
-**Mapping `restaurant_id`:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+**Mapping `restaurant_id`:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
 
 | Esito | Azione |
 |-------|--------|
@@ -542,7 +542,7 @@ Dopo il primo "non trovato", segui questo ordine esatto — UNA sola domanda per
 
 **Tool:** `add_note` con `phone` + `date` + `note` (+ `restaurant_id`/`time` se disponibili)
 
-**Mapping `restaurant_id`:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+**Mapping `restaurant_id`:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
 
 **Esito positivo:** "Perfetto. Ho aggiunto la nota alla prenotazione[di [nome] se disponibile]."
 **Esito negativo:** "Non riesco a trovare la prenotazione con questi dati. Possiamo ricontrollare numero di telefono o data?"
@@ -691,6 +691,25 @@ Admin dashboard showing booking stats and customer history. Requires `Authorizat
 ### `GET /_admin/customer/{phone}`
 Returns stored customer profile for a given phone number. Requires admin token.
 
+### `GET /_admin/fidy_api_probe`
+Launches a headless Playwright session, navigates the booking form, and intercepts **all network calls** to `api.fidy.app` and `ajax.php`. Returns the full list of requests and responses captured during the session — useful for discovering the exact Fidy API endpoints for availability and reservation creation without Playwright.
+
+Query params: `date` (YYYY-MM-DD), `service` (pranzo|cena), `persone` (int), `sede` (string). Requires admin token.
+
+```json
+{
+  "ok": true,
+  "probe_params": { "date": "2026-03-17", "service": "cena", "persone": 2, "sede": "Talenti" },
+  "total_calls": 3,
+  "calls": [
+    {
+      "request": { "direction": "request", "method": "POST", "url": "https://api.fidy.app/api/...", "body": {...} },
+      "response": { "direction": "response", "status": 200, "url": "...", "body": {...} }
+    }
+  ]
+}
+```
+
 ---
 
 ## Fidy API Proxy Endpoints
@@ -699,7 +718,7 @@ These endpoints proxy requests to the Fidy REST API (`api.fidy.app`) with authen
 
 All Fidy proxy endpoints accept `restaurant_id` as either a numeric ID or a sede name string (auto-converted via `SEDE_ID_MAP`).
 
-**Sede ID mapping:** Talenti=1, Appia=2, Ostia Lido=3, Reggio Calabria=4, Palermo=5
+**Sede ID mapping:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
 
 ### `GET /check_reservation`
 Verifies if a reservation exists for the given sede, date, time, and phone.
@@ -868,13 +887,14 @@ CREATE TABLE customers (
 
 The booking system supports these restaurant locations:
 
-| Internal Name | Aliases |
-|--------------|---------|
-| Talenti | talenti, roma talenti, rione talenti |
-| Ostia Lido | ostia, lido, ostia lido |
-| Appia | appia, roma appia, rione appia |
-| Palermo | palermo |
-| Reggio Calabria | reggio, reggio calabria, rc |
+| ID | Internal Name | Aliases |
+|----|--------------|---------|
+| 1  | Talenti | talenti, roma talenti, rione talenti |
+| 2  | Reggio Calabria | reggio, reggio calabria, rc |
+| 3  | Ostia Lido | ostia, lido, ostia lido |
+| 4  | Appia | appia, roma appia, rione appia |
+| 5  | Palermo | palermo |
+| 6  | Corso Trieste | corso trieste, trieste |
 
 Normalization is handled by `_norm_sede()` and matching by `_click_sede()`.
 
