@@ -142,21 +142,26 @@ ESERCIZI_DB_PASS = os.getenv("DB_PASSWORD", os.getenv("DB_PASS", os.getenv("ESER
 
 SEDE_ID_MAP: Dict[str, int] = {
     "talenti": 1,
-    "appia": 2,
+    "reggio": 2,
+    "reggio calabria": 2,
+    "rc": 2,
     "ostia": 3,
     "ostia lido": 3,
-    "reggio": 4,
-    "reggio calabria": 4,
-    "rc": 4,
+    "lido": 3,
+    "appia": 4,
+    "roma appia": 4,
     "palermo": 5,
+    "corso trieste": 6,
+    "trieste": 6,
 }
 
 _ID_TO_SEDE_NAME: Dict[int, str] = {
     1: "Talenti",
-    2: "Appia",
+    2: "Reggio Calabria",
     3: "Ostia Lido",
-    4: "Reggio Calabria",
+    4: "Appia",
     5: "Palermo",
+    6: "Corso Trieste",
 }
 
 app = FastAPI()
