@@ -22,7 +22,7 @@
           "id": "restaurant_id",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "ID numerico del ristorante. Obbligatorio: Talenti=1, Appia=2, Ostia=3, Reggio Calabria=4, Palermo=5. Chiedere sempre la sede se non già nota.",
+          "description": "ID numerico del ristorante. Obbligatorio: Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6. Chiedere sempre la sede se non già nota.",
           "dynamic_variable": "",
           "constant_value": "",
           "enum": null,
