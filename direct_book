@@ -82,7 +82,7 @@
         },
         {
           "id": "coperti",
-          "type": "number",
+          "type": "string",
           "value_type": "llm_prompt",
           "description": "Numero di persone (1–9). Se l'utente indica più di 9 persone non chiamare questo tool: comunicare il numero 06 56556 263 e terminare il flusso.",
           "dynamic_variable": "",
@@ -115,7 +115,7 @@
         },
         {
           "id": "seggiolini",
-          "type": "number",
+          "type": "string",
           "value_type": "llm_prompt",
           "description": "Numero di seggiolini (0–2). Compilare SOLO se l'utente cita bambini (bambino, bambina, bimbo, neonato, passeggino). Altrimenti omettere o inviare 0.",
           "dynamic_variable": "",
