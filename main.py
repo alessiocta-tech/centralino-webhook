@@ -3061,13 +3061,18 @@ _DIRECT_BOOK_STATUS = os.getenv("DIRECT_BOOKING_STATUS", "APERTA")
 
 
 class DirectBookIn(BaseModel):
+    class Config:
+        allow_population_by_field_name = True  # accept both "coperti" and "persone"
+
+    fase: Optional[str] = None  # ignored, accepted for book_table compatibility
     nome: str = Field(..., min_length=1)
     telefono: str
     sede: Optional[str] = None
     restaurant_id: Optional[int] = None
     data: str = Field(..., description="YYYY-MM-DD")
     orario: str = Field(..., description="HH:MM")
-    coperti: int = Field(..., ge=1, le=50)
+    coperti: int = Field(..., ge=1, le=50, alias="persone")
+    # Accepts both "coperti" and "persone" from callers
     cognome: Optional[str] = None
     email: Optional[str] = None
     nota: Optional[str] = None
