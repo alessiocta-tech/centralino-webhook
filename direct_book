@@ -25,6 +25,7 @@
           "description": "Nome del cliente.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": true
         },
@@ -35,6 +36,7 @@
           "description": "Numero di cellulare del cliente (solo cifre, senza spazi o simboli).",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": true
         },
@@ -63,6 +65,7 @@
           "description": "Data prenotazione in formato YYYY-MM-DD. Deve essere già risolta tramite resolve_date e confermata dall'utente se relativa.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": true
         },
@@ -73,6 +76,7 @@
           "description": "Orario in formato HH:MM. In caso di doppio turno usare l'orario ufficiale di inizio turno, non l'orario detto dal cliente. Esempi: '20:00', '21:00', '19:30'.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": true
         },
@@ -80,9 +84,10 @@
           "id": "coperti",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Numero di persone (1–9). Se l'utente indica più di 9 persone non chiamare questo tool: comunicare il numero 06 56556 263 e terminare il flusso.",
+          "description": "Numero di persone (1-9). Se l'utente indica più di 9 persone non chiamare questo tool: comunicare il numero 06 56556 263 e terminare il flusso.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": true
         },
@@ -93,6 +98,7 @@
           "description": "Cognome del cliente. Non chiedere mai all'utente. Inviare sempre 'Cliente'.",
           "dynamic_variable": "",
           "constant_value": "Cliente",
+          "enum": null,
           "is_system_provided": false,
           "required": false
         },
@@ -103,6 +109,7 @@
           "description": "Indirizzo email del cliente. Inviare SOLO se l'utente l'ha fornita esplicitamente. Se l'utente non vuole ricevere conferme email, omettere completamente questo campo.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": false
         },
@@ -110,9 +117,10 @@
           "id": "seggiolini",
           "type": "string",
           "value_type": "llm_prompt",
-          "description": "Numero di seggiolini (0–2). Compilare SOLO se l'utente cita bambini (bambino, bambina, bimbo, neonato, passeggino). Altrimenti omettere o inviare 0.",
+          "description": "Numero di seggiolini (0-2). Compilare SOLO se l'utente cita bambini (bambino, bambina, bimbo, neonato, passeggino). Altrimenti omettere o inviare 0.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": false
         },
@@ -123,6 +131,7 @@
           "description": "Allergie, intolleranze o richieste speciali per il tavolo. Omettere se non presenti.",
           "dynamic_variable": "",
           "constant_value": "",
+          "enum": null,
           "is_system_provided": false,
           "required": false
         }
