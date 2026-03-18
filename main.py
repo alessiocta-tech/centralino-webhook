@@ -3453,3 +3453,301 @@ async def direct_book(body: DirectBookIn):
         "source": _DIRECT_BOOK_SOURCE,
         "availability_at_booking": remaining,
     }
+
+
+# ============================================================
+# CHANGE DATE — Modifica data/ora di una prenotazione esistente
+# ============================================================
+
+
+class ChangeDateIn(BaseModel):
+    telefono: str
+    nome: Optional[str] = None
+    data_attuale: Optional[str] = None       # YYYY-MM-DD della prenotazione esistente
+    sede: Optional[str] = None
+    restaurant_id: Optional[int] = None
+    nuova_data: str = Field(..., description="YYYY-MM-DD nuova data")
+    nuovo_orario: str = Field(..., description="HH:MM nuovo orario")
+
+    @validator("telefono")
+    @classmethod
+    def _clean_phone(cls, v: str) -> str:
+        return re.sub(r"[^\d+]", "", v)
+
+    @validator("nuova_data")
+    @classmethod
+    def _validate_nuova_data(cls, v):
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError("nuova_data deve essere in formato YYYY-MM-DD")
+        return v
+
+    @validator("nuovo_orario")
+    @classmethod
+    def _validate_nuovo_orario(cls, v):
+        if not re.fullmatch(r"\d{2}:\d{2}", (v or "").strip()):
+            raise ValueError("nuovo_orario deve essere in formato HH:MM")
+        return v.strip()
+
+
+@app.post("/change_date")
+async def change_date(body: ChangeDateIn):
+    """
+    Modifica data/ora di una prenotazione esistente.
+
+    1. Cerca la prenotazione APERTA per telefono + (nome OPPURE data_attuale)
+    2. Verifica disponibilità alla nuova data/ora
+    3. Se disponibile: annulla la vecchia e crea la nuova con gli stessi dati
+    4. Se non disponibile: restituisce SOLD_OUT con info disponibilità
+    """
+    import aiomysql
+
+    phone = body.telefono
+    if not phone:
+        raise HTTPException(status_code=400, detail="telefono è obbligatorio")
+
+    if not body.nome and not body.data_attuale:
+        raise HTTPException(
+            status_code=400,
+            detail="Serve almeno uno tra nome e data_attuale per identificare la prenotazione",
+        )
+
+    pool = await _get_esercizi_pool()
+
+    # ── 1. Cerca la prenotazione esistente ────────────────────────
+    conditions = ["Telefono = %s", "Stato = 'APERTA'"]
+    params: list = [phone]
+
+    if body.nome:
+        conditions.append("LOWER(Nome) = LOWER(%s)")
+        params.append(body.nome.strip())
+
+    if body.data_attuale:
+        conditions.append("DataPren = %s")
+        params.append(body.data_attuale)
+
+    rid = None
+    if body.sede or body.restaurant_id:
+        try:
+            rid = _resolve_restaurant_id_direct(body.sede, body.restaurant_id)
+            conditions.append("PRistorante = %s")
+            params.append(rid)
+        except HTTPException:
+            pass
+
+    where = " AND ".join(conditions)
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                f"""
+                SELECT ID, PRistorante, DataPren, OraPren, Nome, Cognome,
+                       Telefono, Email, Coperti, Seggiolini, Stato, Nota
+                FROM Prenotazioni
+                WHERE {where}
+                ORDER BY DataPren DESC, OraPren DESC
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+
+    if not rows:
+        return {
+            "ok": False,
+            "status": "NOT_FOUND",
+            "message": "Nessuna prenotazione aperta trovata con i dati forniti.",
+        }
+
+    if len(rows) > 1:
+        matches = []
+        for r in rows:
+            matches.append({
+                "id": r["ID"],
+                "restaurant_id": r["PRistorante"],
+                "date": str(r["DataPren"]),
+                "time": str(r["OraPren"]),
+                "nome": r["Nome"],
+                "covers": r["Coperti"],
+            })
+        return {
+            "ok": False,
+            "status": "MULTIPLE",
+            "message": f"Trovate {len(rows)} prenotazioni aperte. Servono più dettagli.",
+            "matches": matches,
+        }
+
+    # ── Prenotazione trovata ──────────────────────────────────────
+    old = rows[0]
+    old_id = old["ID"]
+    restaurant_id = old["PRistorante"]
+
+    # ── 2. Verifica disponibilità alla nuova data/ora ─────────────
+    new_date = date.fromisoformat(body.nuova_data)
+    new_time = _parse_time_hhmm(body.nuovo_orario)
+    service = _service_from_booking_time(new_time)
+    if service is None:
+        raise HTTPException(
+            status_code=400,
+            detail="L'orario deve essere in fascia pranzo (12:00-16:00) o cena (17:00-23:59)",
+        )
+
+    # Fetch esercizio
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                (restaurant_id,),
+            )
+            esercizio_row = await cur.fetchone()
+    if not esercizio_row:
+        raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato")
+    esercizio = dict(esercizio_row)
+
+    coperti = old["Coperti"]
+    remaining = await _build_remaining_payload(pool, esercizio, new_date, service)
+
+    # Dato che la vecchia prenotazione verrà annullata, aggiungiamo i suoi coperti
+    # alla disponibilità residua (solo se stessa sede + stessa data + stesso servizio)
+    old_date = old["DataPren"] if isinstance(old["DataPren"], date) else date.fromisoformat(str(old["DataPren"]))
+    old_time_str = str(old["OraPren"])
+    if len(old_time_str) > 5:
+        old_time_str = old_time_str[:5]
+    old_time_obj = _parse_time_hhmm(old_time_str)
+    old_service = _service_from_booking_time(old_time_obj)
+    same_slot = (old_date == new_date and old_service == service and restaurant_id == old["PRistorante"])
+
+    extra_seats = coperti if same_slot else 0
+
+    if remaining["double_turn"]:
+        turno = _turn_from_booking_time(restaurant_id, service, new_time)
+        if turno not in ("primo", "secondo"):
+            raise HTTPException(
+                status_code=400,
+                detail=_double_turn_error_msg(restaurant_id, service),
+            )
+        rem_key = "remaining_first_turn" if turno == "primo" else "remaining_second_turn"
+
+        # If same slot + same turn, the old booking's seats will be freed
+        if same_slot:
+            old_turno = _turn_from_booking_time(restaurant_id, old_service, old_time_obj)
+            if old_turno == turno:
+                extra_seats = coperti
+            else:
+                extra_seats = 0
+
+        available = remaining[rem_key] + extra_seats
+        if available < coperti:
+            return {
+                "ok": False,
+                "status": "SOLD_OUT",
+                "message": f"Posti insufficienti per il {turno} turno alla nuova data/ora",
+                "turno": turno,
+                "remaining": remaining[rem_key],
+                "requested": coperti,
+                "availability": remaining,
+            }
+    else:
+        turno = None
+        available = remaining["remaining_total"] + extra_seats
+        if available < coperti:
+            return {
+                "ok": False,
+                "status": "SOLD_OUT",
+                "message": "Posti insufficienti per il servizio richiesto alla nuova data/ora",
+                "remaining": remaining["remaining_total"],
+                "requested": coperti,
+                "availability": remaining,
+            }
+
+    # ── 3. Annulla la vecchia prenotazione ────────────────────────
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE Prenotazioni SET Stato = 'ANNULLATA' WHERE ID = %s AND Stato = 'APERTA'",
+                (old_id,),
+            )
+            affected = cur.rowcount
+
+    if affected == 0:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "La prenotazione non è più aperta (potrebbe essere già stata modificata).",
+        }
+
+    # ── 4. Crea la nuova prenotazione con i dati della vecchia ────
+    code_id = _secrets.token_hex(8)
+    orario_db = f"{body.nuovo_orario}:00"
+
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO Prenotazioni (
+                        PRistorante, DataPren, OraPren, Nome, Cognome, Telefono, Email,
+                        Coperti, Seggiolini, Fonte, Stato, Nota, Prezzo, Tavolo,
+                        PCliente, CodeID, Voto, Commento
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        restaurant_id,
+                        body.nuova_data,
+                        orario_db,
+                        old["Nome"],
+                        old["Cognome"] or "Cliente",
+                        old["Telefono"],
+                        old.get("Email") or "",
+                        coperti,
+                        old.get("Seggiolini") or 0,
+                        _DIRECT_BOOK_SOURCE,
+                        _DIRECT_BOOK_STATUS,
+                        old.get("Nota") or "",
+                        "0.00",
+                        "",
+                        0,
+                        code_id,
+                        0,
+                        "",
+                    ),
+                )
+                new_booking_id = cur.lastrowid
+    except aiomysql.MySQLError as e:
+        # Rollback: riapri la vecchia prenotazione
+        try:
+            async with pool.acquire() as conn2:
+                async with conn2.cursor() as cur2:
+                    await cur2.execute(
+                        "UPDATE Prenotazioni SET Stato = 'APERTA' WHERE ID = %s",
+                        (old_id,),
+                    )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Errore MySQL durante inserimento: {e}")
+
+    restaurant_name = _ID_TO_SEDE_NAME.get(restaurant_id)
+
+    return {
+        "ok": True,
+        "message": "Prenotazione spostata correttamente",
+        "old_booking_id": old_id,
+        "new_booking_id": new_booking_id,
+        "code_id": code_id,
+        "restaurant_id": restaurant_id,
+        "restaurant_name": restaurant_name,
+        "old_date": str(old["DataPren"]),
+        "old_time": old_time_str,
+        "new_date": body.nuova_data,
+        "new_time": body.nuovo_orario,
+        "service": service,
+        "turno": turno,
+        "covers": coperti,
+        "nome": old["Nome"],
+        "telefono": old["Telefono"],
+        "status": _DIRECT_BOOK_STATUS,
+    }

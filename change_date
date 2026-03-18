@@ -1,0 +1,99 @@
+{
+  "type": "webhook",
+  "name": "change_date",
+  "description": "Modifica la data e/o l'orario di una prenotazione esistente. Cerca la prenotazione per telefono + nome (o data attuale), verifica la disponibilità alla nuova data/ora richiesta, e se disponibile annulla la vecchia e crea la nuova automaticamente. Se non disponibile restituisce SOLD_OUT. IMPORTANTE: non usare resolve_date per le date — convertire internamente (es. 'sabato 21 marzo' → '2026-03-21'). In caso di errore tecnico (502, 504) riprovare una volta in silenzio.",
+  "disable_interruptions": false,
+  "force_pre_tool_speech": "auto",
+  "tool_call_sound": null,
+  "tool_call_sound_behavior": "auto",
+  "tool_error_handling_mode": "auto",
+  "execution_mode": "immediate",
+  "api_schema": {
+    "url": "https://centralino-webhook-production.up.railway.app/change_date",
+    "method": "POST",
+    "path_params_schema": [],
+    "query_params_schema": [],
+    "request_body_schema": {
+      "id": "body",
+      "type": "object",
+      "description": "Body modifica data prenotazione",
+      "properties": [
+        {
+          "id": "telefono",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Numero di telefono del cliente (obbligatorio)",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "nome",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nome sulla prenotazione (obbligatorio se data_attuale non fornita). NON chiedere il cognome.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "data_attuale",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Data attuale della prenotazione in formato YYYY-MM-DD (obbligatorio se nome non fornito). Convertire internamente, NON usare resolve_date.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "sede",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nome della sede (opzionale). Inviare SOLO se il cliente l'ha menzionata spontaneamente.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
+        },
+        {
+          "id": "nuova_data",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nuova data desiderata in formato YYYY-MM-DD (obbligatorio). Convertire internamente, NON usare resolve_date.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        },
+        {
+          "id": "nuovo_orario",
+          "type": "string",
+          "value_type": "llm_prompt",
+          "description": "Nuovo orario desiderato in formato HH:MM (obbligatorio). Normalizzare allo slot standard più vicino.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": true
+        }
+      ],
+      "required": false,
+      "value_type": "llm_prompt"
+    },
+    "request_headers": [],
+    "auth_connection": null
+  },
+  "assignments": [],
+  "response_timeout_secs": 30,
+  "dynamic_variables": {
+    "dynamic_variable_placeholders": {}
+  }
+}
