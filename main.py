@@ -11,7 +11,7 @@ import httpx
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, root_validator, validator
+from pydantic import BaseModel, Field, model_validator, root_validator, validator
 from playwright.async_api import async_playwright
 try:
     from playwright_stealth import stealth_async as _stealth_async
@@ -3061,9 +3061,6 @@ _DIRECT_BOOK_STATUS = os.getenv("DIRECT_BOOKING_STATUS", "APERTA")
 
 
 class DirectBookIn(BaseModel):
-    class Config:
-        allow_population_by_field_name = True  # accept both "coperti" and "persone"
-
     fase: Optional[str] = None  # ignored, accepted for book_table compatibility
     nome: str = Field(..., min_length=1)
     telefono: str
@@ -3071,12 +3068,32 @@ class DirectBookIn(BaseModel):
     restaurant_id: Optional[int] = None
     data: str = Field(..., description="YYYY-MM-DD")
     orario: str = Field(..., description="HH:MM")
-    coperti: int = Field(..., ge=1, le=50, alias="persone")
-    # Accepts both "coperti" and "persone" from callers
+    coperti: Optional[int] = Field(None, ge=1, le=50)
+    persone: Optional[str] = None  # alias from book_table, converted to coperti
     cognome: Optional[str] = None
     email: Optional[str] = None
     nota: Optional[str] = None
     seggiolini: int = Field(0, ge=0, le=3)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _book_table_compat(cls, values):
+        """Accept book_table field names: persone→coperti, string→int coercion."""
+        if isinstance(values, dict):
+            # persone → coperti
+            if values.get("coperti") is None and values.get("persone") is not None:
+                try:
+                    values["coperti"] = int(values["persone"])
+                except (ValueError, TypeError):
+                    pass
+            # string → int coercion for seggiolini
+            seg = values.get("seggiolini")
+            if isinstance(seg, str):
+                try:
+                    values["seggiolini"] = int(seg)
+                except (ValueError, TypeError):
+                    values["seggiolini"] = 0
+        return values
 
     @validator("data")
     @classmethod
