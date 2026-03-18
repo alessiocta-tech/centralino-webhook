@@ -18,8 +18,7 @@ The entire application lives in a single file: `main.py` (≈1550 lines).
     ├── POST /resolve_date          (date parsing)
     ├── POST /book_table            (availability + booking via Playwright)
     ├── GET  /check_reservation     (verify existing booking)
-    ├── POST /find_reservation_for_cancel  (search booking to cancel)
-    ├── POST /cancel_reservation    (cancel booking)
+    ├── POST /direct_cancel          (cancel booking via MySQL)
     ├── POST /update_covers         (change party size)
     └── POST /add_note              (add note to booking)
          ↓
@@ -472,41 +471,45 @@ Se `selected_time` è diverso da quello inviato: usa `selected_time` nel messagg
 
 ### 17. CANCELLAZIONE PRENOTAZIONE
 
-**Dati minimi obbligatori:** telefono + sede. Data e orario: opzionali, includi SOLO se già noti spontaneamente dal cliente.
+**Dati minimi obbligatori:** telefono + (nome OPPURE data). Sede è opzionale, includila solo se già nota.
 
 **🚫 ESATTAMENTE 3 PASSI, NESSUNO IN PIÙ:**
 1. Ottieni `telefono` (se non già noto)
-2. Ottieni `sede` (se non già nota)
-3. **Chiama immediatamente `cancel_reservation`** con phone + restaurant_id (+ date/time se già noti)
+2. Ottieni `nome` della prenotazione (se non già noto) — in alternativa accetta la `data` se il cliente la fornisce spontaneamente
+3. **Chiama immediatamente `direct_cancel`** con telefono + nome (+ data/sede se già noti)
 
+**NON chiedere MAI la sede come dato obbligatorio** — è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente.
 **NON chiedere MAI "Che data era?" o "A che ora era?"** — la data è opzionale, includila SOLO se già menzionata spontaneamente.
 
 **🚫 NON chiamare mai `find_reservation_for_cancel`** — il webhook lo gestisce internamente.
+**🚫 NON chiamare mai `cancel_reservation`** (vecchio endpoint) — usa sempre `direct_cancel`.
 
-**Tool:** `cancel_reservation`
+**Tool:** `direct_cancel`
 
-**Parametri:** `phone` + `restaurant_id` obbligatori. `date`, `time`, `note` opzionali.
-
-**Mapping `restaurant_id`:** Talenti=1, Reggio Calabria=2, Ostia Lido=3, Appia=4, Palermo=5, Corso Trieste=6
+**Parametri:**
+- `telefono` (obbligatorio)
+- `nome` (obbligatorio se data non fornita) — il nome sulla prenotazione
+- `data` (obbligatorio se nome non fornito) — formato YYYY-MM-DD
+- `sede` / `restaurant_id` (opzionali) — per restringere la ricerca
 
 | Esito | Azione |
 |-------|--------|
 | Positivo (`ok=true`) | "Perfetto. La prenotazione è stata cancellata correttamente." |
-| Non trovata (`status=NOT_FOUND` o `status=404` o `404`) | vedi 🔒 PROCEDURA DOPO ESITO NON TROVATO qui sotto |
+| Non trovata (`status=NOT_FOUND`) | vedi 🔒 PROCEDURA DOPO ESITO NON TROVATO qui sotto |
+| Multipli risultati (`status=MULTIPLE`) | Il webhook restituisce la lista delle prenotazioni trovate. Chiedi al cliente di specificare quale: "Ho trovato più prenotazioni aperte a tuo nome. Per quale data vuoi annullare?" — poi richiama `direct_cancel` con anche la `data`. |
 | Errore tecnico (`status=TECH_ERROR`, 502, 504) | Retry immediato in silenzio. Se fallisce ancora: "C'è stato un problema tecnico. Puoi annullare direttamente su rione.fidy.app oppure richiamarci al 06 56556 263." |
 
 🔒 CANCELLAZIONE — PROCEDURA DOPO ESITO NON TROVATO
 Dopo il primo "non trovato", segui questo ordine esatto — UNA sola domanda per volta:
-1. Se la data non è ancora nota → chiedi: "Dimmi la data precisa della prenotazione, per esempio 15 marzo."
-2. Se la data è nota ma l'orario no → chiedi: "Se lo ricordi, dimmi anche l'orario."
-3. Se data e orario sono già noti → riprova `cancel_reservation` con i nuovi dati
+1. Se il nome non è ancora noto → chiedi: "A che nome è la prenotazione?"
+2. Se la data non è ancora nota → chiedi: "Dimmi la data precisa della prenotazione, per esempio 15 marzo."
+3. Se nome e data sono già noti → riprova `direct_cancel` con i nuovi dati
 4. Se fallisce ancora → "Non riesco a trovarla con questi dati."
 
 🚫 VIETATO dopo qualsiasi esito non trovato:
 - "Vuoi ricontrollare numero di telefono, data, orario o sede?" ← FRASE VIETATA, non usarla mai
 - Offrire un menu di scelta su cosa ricontrollare
 - Fare più di una domanda alla volta
-- Chiedere "Che data era?" o "A che ora era?" come prima reazione — la data va chiesta solo se non già nota, secondo l'ordine sopra
 
 🚫 Vietato dopo errore tecnico: qualsiasi frase prima di aver riprovato almeno una volta.
 
@@ -741,28 +744,36 @@ Searches for a reservation to cancel. Returns the associated phone number for co
 ```
 All fields optional — provide as many as available. `reservation_code` takes priority.
 
-### `POST /cancel_reservation`
-Cancels an existing reservation. **`phone` and `restaurant_id` are the primary required fields** — the webhook internally calls `find-reservation-for-cancel` first to locate the reservation, then proceeds with cancellation. `date` and `time` are optional and only sent if already known.
+### `POST /direct_cancel`
+Cancels an existing reservation by setting its status to `ANNULLATA` directly in MySQL. Searches for reservations with `Stato='APERTA'` matching the provided criteria.
+
+**Required:** `telefono` + at least one of `nome` or `data`.
 
 ```json
-{ "phone": "3331234567", "restaurant_id": 2 }
+{ "telefono": "3331234567", "nome": "Alessio" }
 ```
 With optional fields:
 ```json
-{ "phone": "3331234567", "restaurant_id": 2, "date": "2026-03-14", "time": "13:30", "note": "annullato dal cliente" }
+{ "telefono": "3331234567", "nome": "Alessio", "data": "2026-03-14", "sede": "Talenti" }
 ```
+
+**Response scenarios:**
+- **1 match** → cancels it, returns `ok: true`
+- **0 matches** → returns `status: "NOT_FOUND"`
+- **>1 matches** → returns `status: "MULTIPLE"` with a `matches` array listing the open reservations for disambiguation
 
 **⚠️ Giulia's cancellation flow — ESATTAMENTE 3 passi, nessuno in più:**
 1. Ottieni `telefono` (se non già noto)
-2. Ottieni `sede` (se non già nota) — converti in `restaurant_id` usando la mappa standard
-3. **Chiama immediatamente `POST /cancel_reservation`** con phone + restaurant_id (+ date/time se già noti)
+2. Ottieni `nome` della prenotazione (se non già noto) — in alternativa accetta la `data` se il cliente la fornisce spontaneamente
+3. **Chiama immediatamente `POST /direct_cancel`** con telefono + nome (+ data/sede se già noti)
 
 **NON fare domande aggiuntive tra il passo 2 e il passo 3.** In particolare:
+- **NON chiedere MAI la sede** — è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente
 - **NON chiedere MAI "Che data era?"** — la data è opzionale, includila SOLO se il cliente l'ha già menzionata spontaneamente
-- **NON chiedere MAI "A che ora era?"** — l'orario è opzionale, includilo SOLO se già noto
-- **NON chiamare `find_reservation_for_cancel`** — il webhook lo gestisce internamente
+- **NON chiamare `find_reservation_for_cancel`** o `cancel_reservation` (vecchi endpoint)
 - **NON dire l'anno** quando ripeti la data al cliente — dire "il 10 marzo" non "il 10 marzo 2026"
 - **NON chiamare `resolve_date`** — le date passate sono valide per le cancellazioni. Converti manualmente (es. "primo marzo" → "2026-03-01")
+- Se il webhook restituisce `status: "MULTIPLE"`, chiedi al cliente di specificare la data per disambiguare, poi richiama `direct_cancel` con il dato aggiuntivo
 
 > **Note on date conversion for cancellations:** If the customer mentions a date, convert it manually (e.g., "primo marzo" → "2026-03-01") without calling `resolve_date`. Past dates are valid for cancellations; `resolve_date` would wrongly move them to the following year.
 
