@@ -834,9 +834,9 @@ Changes the date and/or time of an existing reservation. Finds the reservation, 
 ```json
 { "telefono": "3331234567", "nome": "Alessio", "nuova_data": "2026-03-21", "nuovo_orario": "20:30" }
 ```
-With optional fields:
+With optional fields (including party size change):
 ```json
-{ "telefono": "3331234567", "nome": "Alessio", "data_attuale": "2026-03-18", "sede": "Talenti", "nuova_data": "2026-03-21", "nuovo_orario": "20:30" }
+{ "telefono": "3331234567", "nome": "Alessio", "data_attuale": "2026-03-18", "sede": "Talenti", "nuova_data": "2026-03-21", "nuovo_orario": "20:30", "nuovi_coperti": 4 }
 ```
 
 **Response scenarios:**

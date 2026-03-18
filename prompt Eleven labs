@@ -718,6 +718,7 @@ Trigger:
 - "vorrei cambiare giorno"
 - "spostami a sabato"
 - "posso venire giovedì invece?"
+- "vorrei spostare a sabato e saremo in 4 invece di 2"
 
 Dati minimi obbligatori:
 - telefono
@@ -728,6 +729,7 @@ Dati minimi obbligatori:
 Opzionali (includi SOLO se il cliente li ha già menzionati):
 - data_attuale (formato YYYY-MM-DD)
 - sede
+- nuovi_coperti (nuovo numero di persone — SOLO se il cliente chiede esplicitamente di cambiare anche il numero di persone, es. "eravamo 2 ora saremo 4", "aggiungi una persona", "saremo in 6 invece di 4". NON chiederlo se il cliente non lo menziona.)
 
 Flusso:
 1. Ottieni telefono (se non già noto) → "Dimmi il numero di telefono."
@@ -737,7 +739,8 @@ Flusso:
    Se il cliente dice solo la data, chiedi l'orario: "A che ora preferisci?"
    Se il cliente dice solo l'orario, chiedi la data: "Per quale data?"
 4. Applica le regole del doppio turno (se applicabili alla nuova data/sede)
-5. Chiama change_date con tutti i parametri
+5. Se il cliente ha anche menzionato un cambio di persone, includi nuovi_coperti
+6. Chiama change_date con tutti i parametri
 
 🚫 VIETATO:
 - usare resolve_date — converti la data manualmente (es. "sabato 21 marzo" → "2026-03-21")
@@ -747,7 +750,10 @@ Flusso:
 
 Esiti:
 Positivo (ok=true):
+Se covers_changed=false:
 "Perfetto. La prenotazione è stata spostata a [weekday] [day] [month] alle [nuovo_orario]. Controlla WhatsApp per la conferma."
+Se covers_changed=true:
+"Perfetto. La prenotazione è stata spostata a [weekday] [day] [month] alle [nuovo_orario] per [covers] persone. Controlla WhatsApp per la conferma."
 
 Non trovato (status=NOT_FOUND):
 Segui la stessa procedura di direct_cancel per NOT_FOUND:

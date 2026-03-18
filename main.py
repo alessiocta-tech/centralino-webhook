@@ -3468,6 +3468,7 @@ class ChangeDateIn(BaseModel):
     restaurant_id: Optional[int] = None
     nuova_data: str = Field(..., description="YYYY-MM-DD nuova data")
     nuovo_orario: str = Field(..., description="HH:MM nuovo orario")
+    nuovi_coperti: Optional[int] = Field(None, ge=1, le=50, description="Nuovo numero di persone (opzionale)")
 
     @validator("telefono")
     @classmethod
@@ -3604,7 +3605,7 @@ async def change_date(body: ChangeDateIn):
         raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato")
     esercizio = dict(esercizio_row)
 
-    coperti = old["Coperti"]
+    coperti = body.nuovi_coperti if body.nuovi_coperti is not None else old["Coperti"]
     remaining = await _build_remaining_payload(pool, esercizio, new_date, service)
 
     # Dato che la vecchia prenotazione verrà annullata, aggiungiamo i suoi coperti
@@ -3747,6 +3748,8 @@ async def change_date(body: ChangeDateIn):
         "service": service,
         "turno": turno,
         "covers": coperti,
+        "old_covers": old["Coperti"],
+        "covers_changed": body.nuovi_coperti is not None and body.nuovi_coperti != old["Coperti"],
         "nome": old["Nome"],
         "telefono": old["Telefono"],
         "status": _DIRECT_BOOK_STATUS,
