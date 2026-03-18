@@ -2878,7 +2878,7 @@ async def _build_remaining_payload(
 
     base: Dict[str, Any] = {
         "restaurant_id": restaurant_id,
-        "restaurant_name": esercizio.get("NomeRapp"),
+        "restaurant_name": esercizio.get("Nome"),
         "date": target_date.isoformat(),
         "service": service,
     }
@@ -2963,7 +2963,7 @@ async def availability_capacity(
         )
         return {
             "restaurant_id": int(row["ID"]),
-            "restaurant_name": row.get("NomeRapp"),
+            "restaurant_name": row.get("Nome"),
             "date": parsed_date.isoformat(),
             "service": service,
             **cap,
@@ -3295,7 +3295,7 @@ async def direct_book(body: DirectBookIn):
         "booking_id": booking_id,
         "code_id": code_id,
         "restaurant_id": restaurant_id,
-        "restaurant_name": esercizio.get("NomeRapp"),
+        "restaurant_name": esercizio.get("Nome"),
         "date": body.data,
         "time": body.orario,
         "service": service,
