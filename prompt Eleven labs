@@ -703,11 +703,37 @@ Flusso — ESATTAMENTE 3 passi:
 - chiedere l'orario come dato obbligatorio
 
 Esiti:
+
 Positivo (ok=true):
 "Perfetto. Ho aggiornato la prenotazione a [covers] persone."
 
-SOLD_OUT:
-"Purtroppo non ci sono abbastanza posti per [nuovi_coperti] persone in quel turno. Preferisci un numero diverso?"
+SOLD_OUT con doppio turno (double_turn=true):
+Il webhook restituisce:
+- turno_attuale: il turno della prenotazione (primo/secondo)
+- posti_disponibili_turno_attuale: posti rimasti nel turno attuale
+- altro_turno: il turno alternativo (secondo/primo)
+- posti_disponibili_altro_turno: posti rimasti nell'altro turno
+- suggerimento: frase con info sull'altro turno
+
+⛔ GESTIONE DOPPIO TURNO — REGOLE:
+1. Se SOLD_OUT e l'altro turno ha abbastanza posti:
+   "Purtroppo nel [turno_attuale] turno non ci sono abbastanza posti per [nuovi_coperti] persone.
+    Nel [altro_turno] turno ci sono ancora [posti_disponibili_altro_turno] posti.
+    Vuoi che sposti la prenotazione al [altro_turno] turno?"
+   Se il cliente accetta → usa change_date per spostare al turno suggerito con i nuovi coperti.
+
+2. Se SOLD_OUT e nemmeno l'altro turno ha abbastanza posti:
+   "Purtroppo non ci sono abbastanza posti per [nuovi_coperti] persone né nel primo né nel secondo turno.
+    Preferisci un numero di persone diverso?"
+
+3. Se SOLD_OUT senza doppio turno (double_turn=false):
+   "Purtroppo non ci sono abbastanza posti per [nuovi_coperti] persone.
+    Preferisci un numero diverso?"
+
+🚫 VIETATO durante SOLD_OUT con doppio turno:
+- Proporre di cambiare sede o data — proponi SOLO l'altro turno
+- Dire "doppio turno" al cliente — parla di "primo turno" e "secondo turno" come alternative orarie
+- Procedere senza conferma esplicita del cliente
 
 Non trovato (status=NOT_FOUND):
 Segui la stessa procedura di direct_cancel per NOT_FOUND:

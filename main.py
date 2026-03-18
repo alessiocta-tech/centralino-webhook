@@ -3909,38 +3909,77 @@ async def direct_update_covers(body: DirectUpdateCoversIn):
         return {"ok": False, "status": "ERROR", "message": f"Esercizio {restaurant_id} non trovato"}
 
     remaining = await _build_remaining_payload(pool, dict(esercizio_row), booking_date, service)
+    restaurant_name = _ID_TO_SEDE_NAME.get(restaurant_id)
 
     # I coperti attuali della prenotazione verranno "liberati", quindi aggiungiamoli
     extra_seats = old_covers
+
+    turno = None  # None = no doppio turno
 
     if remaining["double_turn"]:
         turno = _turn_from_booking_time(restaurant_id, service, booking_time)
         if turno not in ("primo", "secondo"):
             return {"ok": False, "status": "ERROR", "message": "Impossibile determinare il turno."}
+
+        # Disponibilità nel turno attuale (con i posti liberati)
         rem_key = "remaining_first_turn" if turno == "primo" else "remaining_second_turn"
-        available = remaining[rem_key] + extra_seats
-        if available < body.nuovi_coperti:
-            return {
+        available_current = remaining[rem_key] + extra_seats
+
+        # Disponibilità nell'altro turno (senza posti liberati — la prenotazione resta nel suo turno)
+        other_turno = "secondo" if turno == "primo" else "primo"
+        other_rem_key = "remaining_first_turn" if other_turno == "primo" else "remaining_second_turn"
+        available_other = remaining[other_rem_key]
+
+        if available_current < body.nuovi_coperti:
+            # SOLD_OUT nel turno attuale — comunica info su entrambi i turni
+            result: Dict[str, Any] = {
                 "ok": False,
                 "status": "SOLD_OUT",
-                "message": f"Posti insufficienti per il {turno} turno con {body.nuovi_coperti} persone",
-                "turno": turno,
-                "remaining": remaining[rem_key] + extra_seats,
+                "message": f"Posti insufficienti nel {turno} turno per {body.nuovi_coperti} persone.",
+                "double_turn": True,
+                "service": service,
+                "turno_attuale": turno,
+                "posti_disponibili_turno_attuale": available_current,
+                "altro_turno": other_turno,
+                "posti_disponibili_altro_turno": available_other,
                 "requested": body.nuovi_coperti,
                 "current_covers": old_covers,
-                "availability": remaining,
+                "booking_id": old_id,
+                "restaurant_id": restaurant_id,
+                "restaurant_name": restaurant_name,
+                "date": str(old["DataPren"]),
+                "time": old_time_str,
+                "nome": old["Nome"],
             }
+            # Suggerisci l'altro turno solo se ha abbastanza posti
+            if available_other >= body.nuovi_coperti:
+                result["suggerimento"] = (
+                    f"Il {other_turno} turno ha {available_other} posti disponibili."
+                )
+            else:
+                result["suggerimento"] = (
+                    f"Anche il {other_turno} turno non ha abbastanza posti "
+                    f"({available_other} disponibili su {body.nuovi_coperti} richiesti)."
+                )
+            return result
     else:
         available = remaining["remaining_total"] + extra_seats
         if available < body.nuovi_coperti:
             return {
                 "ok": False,
                 "status": "SOLD_OUT",
-                "message": f"Posti insufficienti per {body.nuovi_coperti} persone",
-                "remaining": remaining["remaining_total"] + extra_seats,
+                "message": f"Posti insufficienti per {body.nuovi_coperti} persone.",
+                "double_turn": False,
+                "service": service,
+                "remaining": available,
                 "requested": body.nuovi_coperti,
                 "current_covers": old_covers,
-                "availability": remaining,
+                "booking_id": old_id,
+                "restaurant_id": restaurant_id,
+                "restaurant_name": restaurant_name,
+                "date": str(old["DataPren"]),
+                "time": old_time_str,
+                "nome": old["Nome"],
             }
 
     # ── 3. Aggiorna i coperti ─────────────────────────────────────
@@ -3959,8 +3998,6 @@ async def direct_update_covers(body: DirectUpdateCoversIn):
             "message": "La prenotazione non è più aperta.",
         }
 
-    restaurant_name = _ID_TO_SEDE_NAME.get(restaurant_id)
-
     return {
         "ok": True,
         "message": f"Coperti aggiornati da {old_covers} a {body.nuovi_coperti}",
@@ -3972,6 +4009,9 @@ async def direct_update_covers(body: DirectUpdateCoversIn):
         "old_covers": old_covers,
         "covers": body.nuovi_coperti,
         "nome": old["Nome"],
+        "double_turn": remaining["double_turn"],
+        "turno": turno,
+        "service": service,
     }
 
 
