@@ -3170,6 +3170,151 @@ def _double_turn_error_msg(restaurant_id: int, service: str) -> str:
     return "Orario ambiguo in un servizio con doppio turno"
 
 
+class DirectCancelIn(BaseModel):
+    telefono: str
+    nome: Optional[str] = None
+    data: Optional[str] = None          # YYYY-MM-DD
+    sede: Optional[str] = None
+    restaurant_id: Optional[int] = None
+
+    @validator("telefono")
+    @classmethod
+    def _clean_phone(cls, v: str) -> str:
+        return re.sub(r"[^\d+]", "", v)
+
+
+@app.post("/direct_cancel")
+async def direct_cancel(body: DirectCancelIn):
+    """
+    Annulla una prenotazione APERTA su MySQL.
+
+    Ricerca per telefono + (nome OPPURE data). Se trova esattamente 1 risultato
+    con Stato='APERTA', lo aggiorna a 'ANNULLATA'. Se ne trova >1, restituisce
+    la lista per disambiguare.
+    """
+    import aiomysql
+
+    phone = body.telefono
+    if not phone:
+        raise HTTPException(status_code=400, detail="telefono è obbligatorio")
+
+    if not body.nome and not body.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Serve almeno uno tra nome e data per identificare la prenotazione",
+        )
+
+    pool = await _get_esercizi_pool()
+
+    # ── Build WHERE clause ──────────────────────────────────────────────
+    conditions = ["Telefono = %s", "Stato = 'APERTA'"]
+    params: list = [phone]
+
+    if body.nome:
+        conditions.append("LOWER(Nome) = LOWER(%s)")
+        params.append(body.nome.strip())
+
+    if body.data:
+        conditions.append("DataPren = %s")
+        params.append(body.data)
+
+    rid = None
+    if body.sede or body.restaurant_id:
+        try:
+            rid = _resolve_restaurant_id_direct(body.sede, body.restaurant_id)
+            conditions.append("PRistorante = %s")
+            params.append(rid)
+        except HTTPException:
+            pass  # sede not critical for search
+
+    where = " AND ".join(conditions)
+
+    # ── Search ──────────────────────────────────────────────────────────
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                f"""
+                SELECT ID, PRistorante, DataPren, OraPren, Nome, Cognome,
+                       Telefono, Coperti, Stato, Nota
+                FROM Prenotazioni
+                WHERE {where}
+                ORDER BY DataPren DESC, OraPren DESC
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+
+    if not rows:
+        return {
+            "ok": False,
+            "status": "NOT_FOUND",
+            "message": "Nessuna prenotazione aperta trovata con i dati forniti.",
+        }
+
+    if len(rows) > 1:
+        # Multiple matches — return list for disambiguation
+        matches = []
+        for r in rows:
+            matches.append({
+                "id": r["ID"],
+                "restaurant_id": r["PRistorante"],
+                "date": str(r["DataPren"]),
+                "time": str(r["OraPren"]),
+                "nome": r["Nome"],
+                "covers": r["Coperti"],
+            })
+        return {
+            "ok": False,
+            "status": "MULTIPLE",
+            "message": f"Trovate {len(rows)} prenotazioni aperte. Servono più dettagli per identificare quella giusta.",
+            "matches": matches,
+        }
+
+    # ── Exactly 1 match → cancel it ────────────────────────────────────
+    row = rows[0]
+    booking_id = row["ID"]
+
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE Prenotazioni SET Stato = 'ANNULLATA' WHERE ID = %s AND Stato = 'APERTA'",
+                (booking_id,),
+            )
+            affected = cur.rowcount
+
+    if affected == 0:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "La prenotazione non è più aperta (potrebbe essere già stata annullata).",
+        }
+
+    # Fetch restaurant name
+    restaurant_name = None
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute("SELECT Nome FROM Esercizi WHERE ID = %s", (row["PRistorante"],))
+                erow = await cur.fetchone()
+                if erow:
+                    restaurant_name = erow["Nome"]
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "message": "Prenotazione annullata correttamente",
+        "booking_id": booking_id,
+        "restaurant_id": row["PRistorante"],
+        "restaurant_name": restaurant_name,
+        "date": str(row["DataPren"]),
+        "time": str(row["OraPren"]),
+        "nome": row["Nome"],
+        "covers": row["Coperti"],
+        "status": "ANNULLATA",
+    }
+
+
 @app.post("/direct_book")
 async def direct_book(body: DirectBookIn):
     """
