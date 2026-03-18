@@ -83,6 +83,17 @@
           "enum": null,
           "is_system_provided": false,
           "required": true
+        },
+        {
+          "id": "nuovi_coperti",
+          "type": "number",
+          "value_type": "llm_prompt",
+          "description": "Nuovo numero di persone (opzionale). Inviare SOLO se il cliente ha chiesto esplicitamente di cambiare anche il numero di persone. NON chiederlo se il cliente non lo menziona.",
+          "dynamic_variable": "",
+          "constant_value": "",
+          "enum": null,
+          "is_system_provided": false,
+          "required": false
         }
       ],
       "required": false,
