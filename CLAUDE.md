@@ -826,6 +826,38 @@ Adds a note (allergy, special request, etc.) to an existing reservation.
 4. **Do NOT ask for sede or time** — optional, only send if already known
 5. **Do NOT call `resolve_date`** — convert dates manually
 
+### `POST /change_date`
+Changes the date and/or time of an existing reservation. Finds the reservation, checks availability at the new date/time, and if available cancels the old one and creates a new one with the same customer data.
+
+**Required:** `telefono` + at least one of `nome` or `data_attuale` + `nuova_data` + `nuovo_orario`.
+
+```json
+{ "telefono": "3331234567", "nome": "Alessio", "nuova_data": "2026-03-21", "nuovo_orario": "20:30" }
+```
+With optional fields:
+```json
+{ "telefono": "3331234567", "nome": "Alessio", "data_attuale": "2026-03-18", "sede": "Talenti", "nuova_data": "2026-03-21", "nuovo_orario": "20:30" }
+```
+
+**Response scenarios:**
+- **Success (`ok: true`)** → old reservation cancelled, new one created with same data (nome, cognome, email, coperti, seggiolini, nota)
+- **Not found (`status: "NOT_FOUND"`)** → no open reservation matches the criteria
+- **Multiple matches (`status: "MULTIPLE"`)** → returns list for disambiguation
+- **Sold out (`status: "SOLD_OUT"`)** → not enough seats at the new date/time, returns availability info
+- **Error** → if insert fails after cancelling old, the old reservation is automatically restored
+
+**Giulia's change_date flow:**
+1. Recognize intent: "spostare", "cambiare data", "cambiare giorno", etc.
+2. Ask for `telefono` (if not already given)
+3. Ask for `nome` (if not already given) — or accept `data_attuale` if spontaneously provided
+4. Ask for new date and time — apply double turn rules if applicable
+5. **Do NOT call `resolve_date`** — convert dates manually
+6. **Do NOT say the year** when repeating dates
+7. Call `POST /change_date`
+8. On `ok: true`: "Perfetto. La prenotazione è stata spostata a [weekday] [day] [month] alle [orario]."
+9. On `SOLD_OUT`: "Purtroppo la data/ora richiesta non è disponibile. Preferisci un altro orario o un'altra data?"
+10. On `TECH_ERROR`: retry once silently, then "Il sistema è momentaneamente non raggiungibile."
+
 ---
 
 ## Environment Variables
