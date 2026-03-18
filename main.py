@@ -3754,3 +3754,371 @@ async def change_date(body: ChangeDateIn):
         "telefono": old["Telefono"],
         "status": _DIRECT_BOOK_STATUS,
     }
+
+
+# ============================================================
+# DIRECT UPDATE COVERS — Modifica coperti con controllo disponibilità
+# ============================================================
+
+
+class DirectUpdateCoversIn(BaseModel):
+    telefono: str
+    nome: Optional[str] = None
+    data: Optional[str] = None          # YYYY-MM-DD
+    sede: Optional[str] = None
+    restaurant_id: Optional[int] = None
+    orario: Optional[str] = None        # HH:MM — opzionale, per disambiguare
+    nuovi_coperti: int = Field(..., ge=1, le=50)
+
+    @validator("telefono")
+    @classmethod
+    def _clean_phone(cls, v: str) -> str:
+        return re.sub(r"[^\d+]", "", v)
+
+
+@app.post("/direct_update_covers")
+async def direct_update_covers(body: DirectUpdateCoversIn):
+    """
+    Aggiorna il numero di coperti di una prenotazione APERTA su MySQL.
+
+    1. Cerca la prenotazione per telefono + (nome OPPURE data)
+    2. Verifica disponibilità residua per il nuovo numero di coperti
+    3. Se disponibile: aggiorna direttamente il campo Coperti
+    4. Se non disponibile: restituisce SOLD_OUT
+    """
+    import aiomysql
+
+    phone = body.telefono
+    if not phone:
+        raise HTTPException(status_code=400, detail="telefono è obbligatorio")
+
+    if not body.nome and not body.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Serve almeno uno tra nome e data per identificare la prenotazione",
+        )
+
+    pool = await _get_esercizi_pool()
+
+    # ── 1. Cerca la prenotazione ──────────────────────────────────
+    conditions = ["Telefono = %s", "Stato = 'APERTA'"]
+    params: list = [phone]
+
+    if body.nome:
+        conditions.append("LOWER(Nome) = LOWER(%s)")
+        params.append(body.nome.strip())
+
+    if body.data:
+        conditions.append("DataPren = %s")
+        params.append(body.data)
+
+    if body.orario:
+        conditions.append("OraPren LIKE %s")
+        params.append(f"{body.orario}%")
+
+    rid = None
+    if body.sede or body.restaurant_id:
+        try:
+            rid = _resolve_restaurant_id_direct(body.sede, body.restaurant_id)
+            conditions.append("PRistorante = %s")
+            params.append(rid)
+        except HTTPException:
+            pass
+
+    where = " AND ".join(conditions)
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                f"""
+                SELECT ID, PRistorante, DataPren, OraPren, Nome, Cognome,
+                       Telefono, Coperti, Stato, Nota
+                FROM Prenotazioni
+                WHERE {where}
+                ORDER BY DataPren DESC, OraPren DESC
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+
+    if not rows:
+        return {
+            "ok": False,
+            "status": "NOT_FOUND",
+            "message": "Nessuna prenotazione aperta trovata con i dati forniti.",
+        }
+
+    if len(rows) > 1:
+        matches = []
+        for r in rows:
+            matches.append({
+                "id": r["ID"],
+                "restaurant_id": r["PRistorante"],
+                "date": str(r["DataPren"]),
+                "time": str(r["OraPren"]),
+                "nome": r["Nome"],
+                "covers": r["Coperti"],
+            })
+        return {
+            "ok": False,
+            "status": "MULTIPLE",
+            "message": f"Trovate {len(rows)} prenotazioni aperte. Servono più dettagli.",
+            "matches": matches,
+        }
+
+    # ── Prenotazione trovata ──────────────────────────────────────
+    old = rows[0]
+    old_id = old["ID"]
+    old_covers = old["Coperti"]
+    restaurant_id = old["PRistorante"]
+
+    # Se il numero è lo stesso, niente da fare
+    if body.nuovi_coperti == old_covers:
+        return {
+            "ok": True,
+            "message": "Il numero di coperti è già quello richiesto.",
+            "booking_id": old_id,
+            "covers": old_covers,
+            "nome": old["Nome"],
+        }
+
+    # ── 2. Verifica disponibilità ─────────────────────────────────
+    booking_date = old["DataPren"] if isinstance(old["DataPren"], date) else date.fromisoformat(str(old["DataPren"]))
+    old_time_str = str(old["OraPren"])
+    if len(old_time_str) > 5:
+        old_time_str = old_time_str[:5]
+    booking_time = _parse_time_hhmm(old_time_str)
+    service = _service_from_booking_time(booking_time)
+
+    if service is None:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "Impossibile determinare il servizio dall'orario della prenotazione.",
+        }
+
+    # Fetch esercizio
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT ID, NomeRapp, Coperti, Calendario FROM Esercizi WHERE ID = %s",
+                (restaurant_id,),
+            )
+            esercizio_row = await cur.fetchone()
+    if not esercizio_row:
+        return {"ok": False, "status": "ERROR", "message": f"Esercizio {restaurant_id} non trovato"}
+
+    remaining = await _build_remaining_payload(pool, dict(esercizio_row), booking_date, service)
+
+    # I coperti attuali della prenotazione verranno "liberati", quindi aggiungiamoli
+    extra_seats = old_covers
+
+    if remaining["double_turn"]:
+        turno = _turn_from_booking_time(restaurant_id, service, booking_time)
+        if turno not in ("primo", "secondo"):
+            return {"ok": False, "status": "ERROR", "message": "Impossibile determinare il turno."}
+        rem_key = "remaining_first_turn" if turno == "primo" else "remaining_second_turn"
+        available = remaining[rem_key] + extra_seats
+        if available < body.nuovi_coperti:
+            return {
+                "ok": False,
+                "status": "SOLD_OUT",
+                "message": f"Posti insufficienti per il {turno} turno con {body.nuovi_coperti} persone",
+                "turno": turno,
+                "remaining": remaining[rem_key] + extra_seats,
+                "requested": body.nuovi_coperti,
+                "current_covers": old_covers,
+                "availability": remaining,
+            }
+    else:
+        available = remaining["remaining_total"] + extra_seats
+        if available < body.nuovi_coperti:
+            return {
+                "ok": False,
+                "status": "SOLD_OUT",
+                "message": f"Posti insufficienti per {body.nuovi_coperti} persone",
+                "remaining": remaining["remaining_total"] + extra_seats,
+                "requested": body.nuovi_coperti,
+                "current_covers": old_covers,
+                "availability": remaining,
+            }
+
+    # ── 3. Aggiorna i coperti ─────────────────────────────────────
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE Prenotazioni SET Coperti = %s WHERE ID = %s AND Stato = 'APERTA'",
+                (body.nuovi_coperti, old_id),
+            )
+            affected = cur.rowcount
+
+    if affected == 0:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "La prenotazione non è più aperta.",
+        }
+
+    restaurant_name = _ID_TO_SEDE_NAME.get(restaurant_id)
+
+    return {
+        "ok": True,
+        "message": f"Coperti aggiornati da {old_covers} a {body.nuovi_coperti}",
+        "booking_id": old_id,
+        "restaurant_id": restaurant_id,
+        "restaurant_name": restaurant_name,
+        "date": str(old["DataPren"]),
+        "time": old_time_str,
+        "old_covers": old_covers,
+        "covers": body.nuovi_coperti,
+        "nome": old["Nome"],
+    }
+
+
+# ============================================================
+# DIRECT ADD NOTE — Aggiunta nota a prenotazione esistente
+# ============================================================
+
+
+class DirectAddNoteIn(BaseModel):
+    telefono: str
+    nome: Optional[str] = None
+    data: Optional[str] = None          # YYYY-MM-DD
+    sede: Optional[str] = None
+    restaurant_id: Optional[int] = None
+    orario: Optional[str] = None        # HH:MM — opzionale
+    nota: str = Field(..., min_length=1, max_length=500)
+
+    @validator("telefono")
+    @classmethod
+    def _clean_phone(cls, v: str) -> str:
+        return re.sub(r"[^\d+]", "", v)
+
+
+@app.post("/direct_add_note")
+async def direct_add_note(body: DirectAddNoteIn):
+    """
+    Aggiunge una nota a una prenotazione APERTA su MySQL.
+
+    Cerca la prenotazione per telefono + (nome OPPURE data).
+    Se la prenotazione ha già una nota, la nuova viene aggiunta in coda.
+    """
+    import aiomysql
+
+    phone = body.telefono
+    if not phone:
+        raise HTTPException(status_code=400, detail="telefono è obbligatorio")
+
+    if not body.nome and not body.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Serve almeno uno tra nome e data per identificare la prenotazione",
+        )
+
+    pool = await _get_esercizi_pool()
+
+    # ── 1. Cerca la prenotazione ──────────────────────────────────
+    conditions = ["Telefono = %s", "Stato = 'APERTA'"]
+    params: list = [phone]
+
+    if body.nome:
+        conditions.append("LOWER(Nome) = LOWER(%s)")
+        params.append(body.nome.strip())
+
+    if body.data:
+        conditions.append("DataPren = %s")
+        params.append(body.data)
+
+    if body.orario:
+        conditions.append("OraPren LIKE %s")
+        params.append(f"{body.orario}%")
+
+    if body.sede or body.restaurant_id:
+        try:
+            rid = _resolve_restaurant_id_direct(body.sede, body.restaurant_id)
+            conditions.append("PRistorante = %s")
+            params.append(rid)
+        except HTTPException:
+            pass
+
+    where = " AND ".join(conditions)
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                f"""
+                SELECT ID, PRistorante, DataPren, OraPren, Nome, Nota
+                FROM Prenotazioni
+                WHERE {where}
+                ORDER BY DataPren DESC, OraPren DESC
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+
+    if not rows:
+        return {
+            "ok": False,
+            "status": "NOT_FOUND",
+            "message": "Nessuna prenotazione aperta trovata con i dati forniti.",
+        }
+
+    if len(rows) > 1:
+        matches = []
+        for r in rows:
+            matches.append({
+                "id": r["ID"],
+                "restaurant_id": r["PRistorante"],
+                "date": str(r["DataPren"]),
+                "time": str(r["OraPren"]),
+                "nome": r["Nome"],
+            })
+        return {
+            "ok": False,
+            "status": "MULTIPLE",
+            "message": f"Trovate {len(rows)} prenotazioni aperte. Servono più dettagli.",
+            "matches": matches,
+        }
+
+    # ── Prenotazione trovata ──────────────────────────────────────
+    row = rows[0]
+    booking_id = row["ID"]
+    existing_note = (row.get("Nota") or "").strip()
+
+    # Appendi la nuova nota a quella esistente
+    if existing_note:
+        new_note = f"{existing_note} | {body.nota.strip()}"
+    else:
+        new_note = body.nota.strip()
+
+    # Limita a 500 caratteri
+    new_note = new_note[:500]
+
+    # ── 2. Aggiorna la nota ───────────────────────────────────────
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE Prenotazioni SET Nota = %s WHERE ID = %s AND Stato = 'APERTA'",
+                (new_note, booking_id),
+            )
+            affected = cur.rowcount
+
+    if affected == 0:
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "message": "La prenotazione non è più aperta.",
+        }
+
+    restaurant_name = _ID_TO_SEDE_NAME.get(row["PRistorante"])
+
+    return {
+        "ok": True,
+        "message": "Nota aggiunta correttamente",
+        "booking_id": booking_id,
+        "restaurant_id": row["PRistorante"],
+        "restaurant_name": restaurant_name,
+        "date": str(row["DataPren"]),
+        "nome": row["Nome"],
+        "nota": new_note,
+    }
