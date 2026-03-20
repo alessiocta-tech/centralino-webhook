@@ -2711,38 +2711,38 @@ _DOUBLE_TURN_ACTIVE_DAYS: Dict[int, set] = {
 _DOUBLE_TURN_WINDOWS: Dict[int, Dict[str, List[Tuple[time, time, str]]]] = {
     1: {  # Talenti
         "pranzo": [
-            (time(12, 0), time(13, 15), "primo"),
-            (time(13, 30), time(23, 59), "secondo"),
+            (time(12, 0), time(13, 14), "primo"),
+            (time(13, 15), time(23, 59), "secondo"),
         ],
         "cena": [
-            (time(19, 0), time(20, 45), "primo"),
-            (time(21, 0), time(23, 59), "secondo"),
+            (time(19, 0), time(20, 44), "primo"),
+            (time(20, 45), time(23, 59), "secondo"),
         ],
     },
     2: {  # Reggio Calabria
         "cena": [
-            (time(19, 30), time(21, 15), "primo"),
-            (time(21, 30), time(23, 59), "secondo"),
+            (time(19, 30), time(21, 14), "primo"),
+            (time(21, 15), time(23, 59), "secondo"),
         ],
     },
     4: {  # Appia
         "pranzo": [
-            (time(12, 0), time(13, 20), "primo"),
-            (time(13, 30), time(23, 59), "secondo"),
+            (time(12, 0), time(13, 19), "primo"),
+            (time(13, 20), time(23, 59), "secondo"),
         ],
         "cena": [
-            (time(19, 30), time(21, 15), "primo"),
-            (time(21, 30), time(23, 59), "secondo"),
+            (time(19, 30), time(21, 14), "primo"),
+            (time(21, 15), time(23, 59), "secondo"),
         ],
     },
     5: {  # Palermo
         "pranzo": [
-            (time(12, 0), time(13, 20), "primo"),
-            (time(13, 30), time(23, 59), "secondo"),
+            (time(12, 0), time(13, 19), "primo"),
+            (time(13, 20), time(23, 59), "secondo"),
         ],
         "cena": [
-            (time(19, 30), time(21, 15), "primo"),
-            (time(21, 30), time(23, 59), "secondo"),
+            (time(19, 30), time(21, 14), "primo"),
+            (time(21, 15), time(23, 59), "secondo"),
         ],
     },
     # 3 (Ostia) e 6 (Corso Trieste): nessun doppio turno
