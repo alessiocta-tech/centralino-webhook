@@ -2695,6 +2695,17 @@ async def get_disponibilita_esercizio(esercizio_id: int):
 # Calendario: lun_pranzo(0), lun_cena(1), mar_pranzo(2), mar_cena(3), ...
 _WEEKDAY_SLOT_BASE: Dict[int, int] = {0: 0, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12}
 
+# Giorni in cui il doppio turno è effettivamente attivo per sede.
+# Chiave: restaurant_id → set di (weekday, service).
+# weekday: 4=venerdì, 5=sabato, 6=domenica.
+_DOUBLE_TURN_ACTIVE_DAYS: Dict[int, set] = {
+    1: {(5, "pranzo"), (6, "pranzo"), (5, "cena")},                        # Talenti
+    2: {(5, "cena")},                                                       # Reggio Calabria
+    4: {(5, "pranzo"), (6, "pranzo"), (4, "cena"), (5, "cena")},           # Appia (ven+sab cena)
+    5: {(5, "pranzo"), (6, "pranzo"), (4, "cena"), (5, "cena")},           # Palermo (ven+sab cena)
+    # 3 (Ostia) e 6 (Corso Trieste): mai doppio turno
+}
+
 # Finestre orarie per doppio turno — keyed by ID reale del DB Esercizi
 # (1=Talenti, 2=Reggio Calabria, 3=Ostia, 4=Appia, 5=Palermo, 6=Corso Trieste)
 _DOUBLE_TURN_WINDOWS: Dict[int, Dict[str, List[Tuple[time, time, str]]]] = {
@@ -2883,6 +2894,21 @@ async def _build_remaining_payload(
         "service": service,
     }
 
+    # Il DB potrebbe avere '|' nel Calendario anche per giorni senza doppio turno.
+    # Verifichiamo che il giorno+servizio sia effettivamente in _DOUBLE_TURN_ACTIVE_DAYS.
+    weekday = target_date.weekday()
+    is_double_turn_active = (
+        cap["double_turn"]
+        and (weekday, service) in _DOUBLE_TURN_ACTIVE_DAYS.get(restaurant_id, set())
+    )
+
+    if cap["double_turn"] and not is_double_turn_active:
+        # Collassa la capacità dei due turni in un unico pool
+        cap = {
+            "double_turn": False,
+            "capacity_total": cap["capacity_first_turn"] + cap["capacity_second_turn"],
+        }
+
     if cap["double_turn"]:
         c1 = cap["capacity_first_turn"]
         c2 = cap["capacity_second_turn"]
@@ -2958,11 +2984,19 @@ async def availability_capacity(
         if not row:
             raise HTTPException(status_code=404, detail=f"Esercizio {restaurant_id} non trovato.")
         row = dict(row)
+        rid = int(row["ID"])
         cap = _capacity_for_date_service(
             row.get("Calendario"), int(row.get("Coperti") or 0), parsed_date, service
         )
+        # Collassa doppio turno se non attivo per questo giorno
+        weekday = parsed_date.weekday()
+        if cap["double_turn"] and (weekday, service) not in _DOUBLE_TURN_ACTIVE_DAYS.get(rid, set()):
+            cap = {
+                "double_turn": False,
+                "capacity_total": cap["capacity_first_turn"] + cap["capacity_second_turn"],
+            }
         return {
-            "restaurant_id": int(row["ID"]),
+            "restaurant_id": rid,
             "restaurant_name": row.get("Nome"),
             "date": parsed_date.isoformat(),
             "service": service,
