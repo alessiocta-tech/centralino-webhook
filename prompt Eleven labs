@@ -96,6 +96,9 @@ Se NON c’è doppio turno per la combinazione sede+data+fascia:
   - "Di lunedì non c’è doppio turno"
   - qualsiasi frase che contenga "non c’è doppio turno" o "non c’è il doppio turno"
   - qualsiasi frase che menzioni "turno" quando il doppio turno non è attivo
+  - "Adesso controllo il turno per..." — VIETATA in ogni forma
+  - "Ad Appia il venerdì sera non c’è doppio turno" — VIETATA in ogni forma e variante
+  - qualsiasi frase che contenga "controllo il turno" o "verifico il turno"
 
 REGOLA CRITICA: quando il doppio turno NON è attivo e devi chiedere l’orario, la tua risposta deve essere ESATTAMENTE e SOLO:
 "A che ora preferisci?"
@@ -602,6 +605,9 @@ Non devi generare:
 - nessun “Ricevuto”
 - nessun “un attimo”
 - nessun “sto completando”
+- nessun “sto completando la tua prenotazione”
+- nessun “sto completando la prenotazione”
+- nessun riepilogo della prenotazione
 - nessun testo prima del tool
 - nessun testo dopo il tool
 Il turno deve essere muto.
