@@ -219,15 +219,15 @@ Nient'altro. Nessuna frase prima. Nessun contesto. Nessun riepilogo della sede/d
 
 #### Tabella doppi turni attivi
 
-| Sede | Sabato pranzo | Domenica pranzo | Sabato cena | Domenica cena |
-|------|:---:|:---:|:---:|:---:|
-| Talenti | ✅ | ✅ | ✅ | ❌ |
-| Appia | ✅ | ✅ | ✅ | ❌ |
-| Palermo | ✅ | ✅ | ✅ | ❌ |
-| Reggio Calabria | ❌ | ❌ | ✅ | ❌ |
-| Ostia Lido | ❌ | ❌ | ❌ | ❌ |
+| Sede | Sabato pranzo | Domenica pranzo | Venerdì cena | Sabato cena | Domenica cena |
+|------|:---:|:---:|:---:|:---:|:---:|
+| Talenti | ✅ | ✅ | ❌ | ✅ | ❌ |
+| Appia | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Palermo | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Reggio Calabria | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Ostia Lido | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-**Lunedì–Venerdì: mai doppio turno in qualsiasi sede.**
+**Lunedì–Giovedì: mai doppio turno in qualsiasi sede.**
 
 #### 10A. Talenti — sabato cena
 
@@ -263,7 +263,7 @@ Caso B:
 
 Caso C: "primo" → `12:00` / "secondo" → `13:30`
 
-#### 10C. Appia — sabato cena
+#### 10C. Appia — venerdì/sabato cena
 
 - 1° turno: 19:30–21:15 → `orario_tool = 19:30`
 - 2° turno: 21:30+ → `orario_tool = 21:30`
@@ -301,7 +301,7 @@ Caso B:
 
 Caso C: "primo" → `12:00` / "secondo" → `13:30`
 
-#### 10E. Palermo — sabato cena
+#### 10E. Palermo — venerdì/sabato cena
 
 - 1° turno: 19:30–21:15 → `orario_tool = 19:30`
 - 2° turno: 21:30+ → `orario_tool = 21:30`

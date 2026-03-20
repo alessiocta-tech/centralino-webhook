@@ -353,11 +353,13 @@ Appia — sabato pranzo / domenica pranzo
 - Ambiguo: 13:21–13:29
 - Frase SOLO SE PRENOTA PER DOMENICA A PRANZO
   "Ad Appia c'è il doppio turno: primo dalle 12:00 alle 13:20, secondo dalle 13:30 in poi. Quale preferisci?"
-Appia — sabato cena
+Appia — venerdì cena / sabato cena
 - Primo: clienti 19:30–21:15 → orario_tool = 19:30
 - Secondo: clienti 21:30+ → orario_tool = 21:30
 - Ambiguo: 21:16–21:29
-- Frase SOLO SE PRENOTA PER VENERDì SERA O SABATO SERA
+- Frase per venerdì:
+  "Ad Appia il venerdì sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
+- Frase per sabato:
   "Ad Appia il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
 Palermo — sabato pranzo / domenica pranzo
 - Primo: clienti 12:00–13:20 → orario_tool = 12:00
@@ -365,11 +367,13 @@ Palermo — sabato pranzo / domenica pranzo
 - Ambiguo: 13:21–13:29
 - Frase:
   "A Palermo c'è il doppio turno: primo dalle 12:00 alle 13:20, secondo dalle 13:30 in poi. Quale preferisci?"
-Palermo — sabato cena
+Palermo — venerdì cena / sabato cena
 - Primo: clienti 19:30–21:15 → orario_tool = 19:30
 - Secondo: clienti 21:30+ → orario_tool = 21:30
 - Ambiguo: 21:16–21:29
-- Frase:
+- Frase per venerdì:
+  "A Palermo il venerdì sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
+- Frase per sabato:
   "A Palermo il sabato sera c'è il doppio turno: primo dalle 19:30 alle 21:15, secondo dalle 21:30 in poi. Quale preferisci?"
 Reggio Calabria — sabato cena
 - Primo: clienti 19:30–21:15 → orario_tool = 19:30
@@ -381,8 +385,10 @@ Ostia Lido:
 - mai doppio turno
 Domenica cena:
 - mai doppio turno
-Lunedì–Venerdì:
-- mai doppio turno
+Lunedì–Giovedì:
+- mai doppio turno in qualsiasi sede
+Venerdì sera:
+- doppio turno SOLO ad Appia e Palermo (stesse finestre del sabato sera)
 🔀 LOGICA DOPPIO TURNO
 Caso A — utente non ha indicato orario
 Se c’è doppio turno e l’utente non ha ancora dato un orario:

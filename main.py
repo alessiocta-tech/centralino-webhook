@@ -2697,12 +2697,12 @@ _WEEKDAY_SLOT_BASE: Dict[int, int] = {0: 0, 1: 2, 2: 4, 3: 6, 4: 8, 5: 10, 6: 12
 
 # Giorni in cui il doppio turno è effettivamente attivo per sede.
 # Chiave: restaurant_id → set di (weekday, service).
-# weekday: 5=sabato, 6=domenica.  Lun–Ven (0–4): mai doppio turno.
+# weekday: 4=venerdì, 5=sabato, 6=domenica.
 _DOUBLE_TURN_ACTIVE_DAYS: Dict[int, set] = {
-    1: {(5, "pranzo"), (6, "pranzo"), (5, "cena")},            # Talenti
-    2: {(5, "cena")},                                           # Reggio Calabria
-    4: {(5, "pranzo"), (6, "pranzo"), (5, "cena")},            # Appia
-    5: {(5, "pranzo"), (6, "pranzo"), (5, "cena")},            # Palermo
+    1: {(5, "pranzo"), (6, "pranzo"), (5, "cena")},                        # Talenti
+    2: {(5, "cena")},                                                       # Reggio Calabria
+    4: {(5, "pranzo"), (6, "pranzo"), (4, "cena"), (5, "cena")},           # Appia (ven+sab cena)
+    5: {(5, "pranzo"), (6, "pranzo"), (4, "cena"), (5, "cena")},           # Palermo (ven+sab cena)
     # 3 (Ostia) e 6 (Corso Trieste): mai doppio turno
 }
 
