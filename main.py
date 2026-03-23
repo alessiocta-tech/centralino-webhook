@@ -4560,6 +4560,73 @@ def _run_analysis_pipeline(record: dict):
     print(f"[AI] Proposta creata e inviata per approvazione!")
 
 
+
+
+# ── Invia trascrizione a Fidy come nota sulla prenotazione ────
+def _send_transcript_to_fidy(record: dict):
+    """
+    Invia la trascrizione della chiamata a Fidy tramite POST /add-note.
+    Eseguita in background dopo ogni chiamata ricevuta dal webhook.
+    """
+    try:
+        import requests as _req
+
+        telefono = (record.get("prenotazione") or {}).get("telefono") or ""
+        telefono = telefono.strip().replace(" ", "")
+        if not telefono:
+            print("[FIDY] Nessun telefono — skip nota")
+            return
+
+        data_pren = (record.get("prenotazione") or {}).get("data") or ""
+        if not data_pren:
+            from datetime import date as _date
+            data_pren = _date.today().strftime("%Y-%m-%d")
+
+        transcript_lines = []
+        for t in record.get("transcript", []):
+            role = "Giulia" if t.get("role") == "agent" else "Cliente"
+            transcript_lines.append(f"[{role}] {t.get('message', '')}")
+        transcript_text = "\n".join(transcript_lines) if transcript_lines else "(nessuna trascrizione)"
+
+        valutazione = record.get("valutazione", {})
+        esito_parts = [f"{k}: {v}" for k, v in valutazione.items() if v]
+        esito_str = " | ".join(esito_parts) if esito_parts else "n/d"
+
+        durata = record.get("duration_secs") or 0
+        durata_str = f"{int(durata)//60}m {int(durata)%60}s" if durata else "n/d"
+        received = record.get("received_at", "")[:16].replace("T", " ")
+
+        nota = (
+            f"📞 Chiamata Giulia — {received}\n"
+            f"⏱ Durata: {durata_str}\n"
+            f"✅ Esito: {esito_str}\n"
+            f"\n--- Trascrizione ---\n"
+            f"{transcript_text}"
+        )
+
+        payload = {"phone": telefono, "date": data_pren, "note": nota}
+        sede = (record.get("prenotazione") or {}).get("sede")
+        if sede:
+            payload["restaurant_id"] = sede
+
+        fidy_base = os.getenv("FIDY_API_BASE", "https://api.fidy.app/api")
+        fidy_key  = os.getenv("FIDY_API_KEY",  "derione_api_2026_super_secret")
+        headers = {
+            "X-API-Key": fidy_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://rione.fidy.app",
+            "Referer": "https://rione.fidy.app/",
+        }
+
+        r = _req.post(f"{fidy_base}/add-note", json=payload, headers=headers, timeout=20)
+        if r.status_code == 200:
+            print(f"[FIDY] Nota inviata per {telefono} — {data_pren} ✅")
+        else:
+            print(f"[FIDY] Errore add-note: {r.status_code} — {r.text[:200]}")
+    except Exception as e:
+        print(f"[FIDY] Eccezione: {e}")
+
 # ============================================================
 # ENDPOINT: /elevenlabs-webhook
 # ============================================================
@@ -4590,6 +4657,7 @@ async def elevenlabs_webhook(
     if event_type == "post_call_transcription":
         record = _save_call(data)
         asyncio.create_task(asyncio.to_thread(_run_analysis_pipeline, record))
+        asyncio.create_task(asyncio.to_thread(_send_transcript_to_fidy, record))
         return {"status": "ok", "conversation_id": record.get("conversation_id")}
 
     elif event_type == "call_initiation_failure":
