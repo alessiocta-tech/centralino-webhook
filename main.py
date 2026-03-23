@@ -4496,8 +4496,10 @@ def _send_approval_email(proposal: dict, token: str, cid: str = ""):
     msg["To"]   = _NOTIF_EMAIL
     msg.attach(MIMEText(html, "html"))
     try:
-        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT) as s:
-            s.starttls(); s.login(_SMTP_USER, _SMTP_PASS); s.send_message(msg)
+        _smtp_cls = smtplib.SMTP_SSL if _SMTP_PORT == 465 else smtplib.SMTP
+        with _smtp_cls(_SMTP_HOST, _SMTP_PORT) as s:
+            if _SMTP_PORT != 465: s.starttls()
+            s.login(_SMTP_USER, _SMTP_PASS); s.send_message(msg)
         print(f"[EMAIL] Inviata a {_NOTIF_EMAIL}")
     except Exception as e:
         print(f"[EMAIL] Errore: {e}")

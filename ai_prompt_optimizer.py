@@ -414,8 +414,9 @@ def send_approval_email(proposal: dict, token: str, conversation_id: str = ""):
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
+        _smtp_cls = smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP
+        with _smtp_cls(SMTP_HOST, SMTP_PORT) as server:
+            if SMTP_PORT != 465: server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.send_message(msg)
         print(f"📧 Email inviata a {NOTIFICATION_EMAIL}")
@@ -439,8 +440,9 @@ def send_confirmation_email(proposal: dict):
     msg["To"]   = NOTIFICATION_EMAIL
     msg.attach(MIMEText(html, "html"))
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
+        _smtp_cls = smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP
+        with _smtp_cls(SMTP_HOST, SMTP_PORT) as s:
+            if SMTP_PORT != 465: s.starttls()
             s.login(SMTP_USER, SMTP_PASSWORD)
             s.send_message(msg)
     except Exception as e:
