@@ -4196,3 +4196,472 @@ async def direct_add_note(body: DirectAddNoteIn):
         "nome": row["Nome"],
         "nota": new_note,
     }
+
+
+# ============================================================
+# ELEVENLABS POST-CALL WEBHOOK + AI PROMPT OPTIMIZER
+# ============================================================
+# Riceve le trascrizioni post-chiamata da ElevenLabs,
+# le analizza con Claude API e propone miglioramenti al prompt
+# dell'agente Giulia via email con link approva/rifiuta.
+#
+# Variabili d'ambiente necessarie su Railway:
+#   ELEVENLABS_WEBHOOK_SECRET  = wsec_f553e9c...
+#   CLAUDE_API_KEY             = sk-ant-...
+#   NOTIFICATION_EMAIL         = alessiocta@gmail.com
+#   SMTP_USER                  = mittente@gmail.com
+#   SMTP_PASSWORD              = app-password-gmail
+#   APPROVAL_BASE_URL          = https://centralino-webhook-production.up.railway.app
+# ============================================================
+
+import hashlib
+import hmac as _hmac
+import secrets
+import smtplib
+import time as _time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from fastapi.responses import HTMLResponse
+from typing import Optional as _Optional
+
+# ── Configurazione ────────────────────────────────────────────
+_WEBHOOK_SECRET    = os.getenv("ELEVENLABS_WEBHOOK_SECRET", "")
+_CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY", "")
+_NOTIF_EMAIL       = os.getenv("NOTIFICATION_EMAIL", "alessiocta@gmail.com")
+_SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
+_SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
+_SMTP_USER         = os.getenv("SMTP_USER", "")
+_SMTP_PASS         = os.getenv("SMTP_PASSWORD", "")
+_APPROVAL_BASE_URL = os.getenv("APPROVAL_BASE_URL", "https://centralino-webhook-production.up.railway.app")
+_ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", FIDY_API_KEY)
+_ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_2701kgrsp2gzec6rraa6bfgtrwfw")
+
+_CALLS_DIR       = Path(os.getenv("STORAGE_DIR", "/tmp/centralino_calls"))
+_CALLS_DIR.mkdir(parents=True, exist_ok=True)
+_CALLS_LOG       = _CALLS_DIR / "calls_log.jsonl"
+_ANALYSES_LOG    = _CALLS_DIR / "analyses_log.jsonl"
+_PROPOSALS_FILE  = _CALLS_DIR / "pending_proposals.json"
+_PROMPT_HISTORY  = _CALLS_DIR / "prompt_history.json"
+
+_CONFIDENCE_MIN  = 65
+_PATTERN_WINDOW  = 10
+
+
+# ── Verifica firma HMAC ───────────────────────────────────────
+def _verify_el_signature(payload: bytes, header: str) -> bool:
+    if not header or not _WEBHOOK_SECRET:
+        return not _WEBHOOK_SECRET
+    try:
+        parts = dict(p.split("=", 1) for p in header.split(","))
+        ts, sig = parts.get("t"), parts.get("v0")
+        if not ts or not sig:
+            return False
+        if abs(int(_time.time()) - int(ts)) > 300:
+            return False
+        msg = f"{ts},{payload.decode('utf-8')}"
+        exp = _hmac.new(_WEBHOOK_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(exp, sig)
+    except Exception:
+        return False
+
+
+# ── Salva trascrizione ────────────────────────────────────────
+def _save_call(data: dict) -> dict:
+    conv = data.get("data", {})
+    cid  = conv.get("conversation_id", "unknown")
+    analysis   = conv.get("analysis", {})
+    data_coll  = analysis.get("data_collection_results", {})
+
+    record = {
+        "received_at":    datetime.now(timezone.utc).isoformat(),
+        "conversation_id": cid,
+        "agent_id":       conv.get("agent_id"),
+        "status":         conv.get("status"),
+        "duration_secs":  conv.get("call_duration_secs"),
+        "transcript":     conv.get("transcript", []),
+        "analysis":       analysis,
+        "metadata":       conv.get("metadata", {}),
+        "prenotazione": {
+            "nome":     data_coll.get("nome_cliente",    {}).get("value"),
+            "telefono": data_coll.get("telefono_cliente",{}).get("value"),
+            "persone":  data_coll.get("numero_persone",  {}).get("value"),
+            "data":     data_coll.get("data_prenotazione",{}).get("value"),
+            "sede":     data_coll.get("sede",            {}).get("value"),
+        },
+        "valutazione": {
+            k: v.get("result")
+            for k, v in analysis.get("evaluation_criteria_results", {}).items()
+        },
+    }
+
+    with open(_CALLS_LOG, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    call_file = _CALLS_DIR / f"{cid}.json"
+    call_file.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+    return record
+
+
+# ── Analisi singola con Claude ────────────────────────────────
+def _analyze_call(record: dict, current_prompt: str) -> dict:
+    if not _CLAUDE_API_KEY:
+        return {"problems": [], "confidence": 0, "richiede_modifica_prompt": False}
+
+    import requests as _req
+
+    transcript_text = "\n".join(
+        f"[{t.get('role','?').upper()}] {t.get('message','')}"
+        for t in record.get("transcript", [])
+    )
+    evaluation = record.get("analysis", {}).get("evaluation_criteria_results", {})
+    data_coll  = record.get("analysis", {}).get("data_collection_results", {})
+
+    prompt = f"""Sei un esperto di agenti vocali AI per ristoranti italiani. Analizza questa trascrizione e rispondi SOLO con JSON valido.
+
+TRASCRIZIONE:
+{transcript_text}
+
+VALUTAZIONE: {json.dumps(evaluation, ensure_ascii=False)}
+DATI RACCOLTI: {json.dumps(data_coll, ensure_ascii=False)}
+PROMPT CORRENTE (prime 1500 char): {current_prompt[:1500]}
+
+Restituisci questo JSON:
+{{
+  "problems": [{{"tipo":"string","descrizione":"string","gravita":"alta|media|bassa"}}],
+  "punti_positivi": ["string"],
+  "suggerimenti_prompt": [{{"modifica_suggerita":"string","posizione":"string","ragione":"string"}}],
+  "confidence": 0,
+  "richiede_modifica_prompt": false
+}}"""
+
+    try:
+        r = _req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": _CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-opus-4-6", "max_tokens": 2000,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return json.loads(r.json()["content"][0]["text"])
+    except Exception as e:
+        print(f"[AI] Errore analisi: {e}")
+        return {"problems": [], "confidence": 0, "richiede_modifica_prompt": False}
+
+
+# ── Genera proposta prompt da pattern ─────────────────────────
+def _generate_proposal(analyses: list, current_prompt: str) -> _Optional[dict]:
+    if not _CLAUDE_API_KEY or len(analyses) < 3:
+        return None
+
+    import requests as _req
+
+    problems = "\n".join(
+        f"- [{a.get('gravita','?')}] {a.get('tipo','?')}: {a.get('descrizione','')}"
+        for a in analyses for a in a.get("problems", [])
+    )[:3000]
+
+    try:
+        r = _req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": _CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-opus-4-6", "max_tokens": 6000,
+                  "messages": [{"role": "user", "content": f"""Sei un esperto di prompt engineering per agenti vocali.
+Basandoti sui problemi ricorrenti rilevati in {len(analyses)} chiamate, genera una proposta di miglioramento al prompt.
+Rispondi SOLO con JSON valido.
+
+PROBLEMI RICORRENTI:
+{problems}
+
+PROMPT CORRENTE:
+{current_prompt}
+
+JSON richiesto:
+{{
+  "titolo": "string (max 60 char)",
+  "descrizione": "string",
+  "problemi_risolti": ["string"],
+  "prompt_aggiornato": "string (prompt completo)",
+  "diff_summary": "string",
+  "confidence": 0,
+  "impatto_stimato": "alto|medio|basso",
+  "rischio": "alto|medio|basso",
+  "note_per_revisione": "string"
+}}"""}]},
+            timeout=120,
+        )
+        r.raise_for_status()
+        return json.loads(r.json()["content"][0]["text"])
+    except Exception as e:
+        print(f"[AI] Errore proposta: {e}")
+        return None
+
+
+# ── Gestione proposte ─────────────────────────────────────────
+def _load_proposals() -> dict:
+    try:
+        return json.loads(_PROPOSALS_FILE.read_text()) if _PROPOSALS_FILE.exists() else {}
+    except Exception:
+        return {}
+
+def _save_proposals(p: dict):
+    _PROPOSALS_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+
+def _mark_proposal(token: str, status: str):
+    p = _load_proposals()
+    if token in p:
+        p[token]["status"] = status
+        p[token]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_proposals(p)
+
+
+# ── Legge prompt corrente da ElevenLabs ──────────────────────
+def _get_current_prompt() -> str:
+    try:
+        import requests as _req
+        r = _req.get(
+            f"https://api.elevenlabs.io/v1/convai/agents/{_ELEVENLABS_AGENT_ID}",
+            headers={"xi-api-key": _ELEVENLABS_API_KEY},
+            timeout=15,
+        )
+        return r.json().get("conversation_config",{}).get("agent",{}).get("prompt",{}).get("prompt","")
+    except Exception:
+        return ""
+
+
+# ── Aggiorna prompt su ElevenLabs ────────────────────────────
+def _update_el_prompt(new_prompt: str) -> bool:
+    try:
+        import requests as _req
+        hist = json.loads(_PROMPT_HISTORY.read_text()) if _PROMPT_HISTORY.exists() else []
+        hist.append({"ts": datetime.now(timezone.utc).isoformat(), "prompt": _get_current_prompt()})
+        _PROMPT_HISTORY.write_text(json.dumps(hist[-20:], ensure_ascii=False, indent=2))
+        r = _req.patch(
+            f"https://api.elevenlabs.io/v1/convai/agents/{_ELEVENLABS_AGENT_ID}",
+            headers={"xi-api-key": _ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json={"conversation_config": {"agent": {"prompt": {"prompt": new_prompt}}}},
+            timeout=30,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[EL] Errore update prompt: {e}")
+        return False
+
+
+# ── Invia email di approvazione ───────────────────────────────
+def _send_approval_email(proposal: dict, token: str, cid: str = ""):
+    if not _SMTP_USER or not _SMTP_PASS:
+        print(f"[EMAIL] SMTP non configurato. Approva: {_APPROVAL_BASE_URL}/approve/{token}")
+        return
+
+    approve_url = f"{_APPROVAL_BASE_URL}/approve/{token}"
+    reject_url  = f"{_APPROVAL_BASE_URL}/reject/{token}"
+    conf  = proposal.get("confidence", 0)
+    title = proposal.get("titolo", "Modifica prompt")
+    desc  = proposal.get("descrizione", "")
+    diff  = proposal.get("diff_summary", "")
+    note  = proposal.get("note_per_revisione", "")
+    probs = "\n".join(f"• {p}" for p in proposal.get("problemi_risolti", []))
+    c_conf = "#27ae60" if conf >= 75 else "#f39c12" if conf >= 50 else "#e74c3c"
+
+    html = f"""<html><body style="font-family:Arial;background:#f5f5f5;padding:20px">
+<div style="max-width:640px;margin:0 auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+  <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);padding:28px;color:white">
+    <div style="font-size:11px;opacity:.7">🤖 Centralino AI Optimizer — DERIONE</div>
+    <h2 style="margin:8px 0 0;font-size:19px">💡 {title}</h2>
+  </div>
+  <div style="padding:8px 0;background:#f9f9f9;text-align:center;border-bottom:1px solid #eee">
+    <span style="font-size:26px;font-weight:bold;color:{c_conf}">{conf}%</span>
+    <span style="font-size:11px;color:#666;display:block">Fiducia AI</span>
+  </div>
+  <div style="padding:24px">
+    <h3 style="color:#333;margin-top:0">Cosa cambia</h3><p style="color:#555">{desc}</p>
+    <h3 style="color:#333">Problemi risolti</h3><p style="white-space:pre-line;color:#555">{probs}</p>
+    <h3 style="color:#333">Modifiche al prompt</h3>
+    <div style="background:#f4f4f4;border-left:4px solid #3498db;padding:14px;font-size:13px;white-space:pre-wrap">{diff}</div>
+    {"<h3 style='color:#e67e22'>⚠️ Note revisione</h3><div style='background:#fff8e1;border-left:4px solid #f39c12;padding:14px;font-size:13px'>" + note + "</div>" if note else ""}
+    {"<p style='font-size:11px;color:#aaa'>📞 Conversazione: " + cid + "</p>" if cid else ""}
+    <div style="display:flex;gap:14px;margin-top:28px">
+      <a href="{approve_url}" style="flex:1;text-align:center;background:#27ae60;color:white;padding:15px;border-radius:8px;text-decoration:none;font-weight:bold">✅ Approva e Applica</a>
+      <a href="{reject_url}"  style="flex:1;text-align:center;background:#e74c3c;color:white;padding:15px;border-radius:8px;text-decoration:none;font-weight:bold">❌ Rifiuta</a>
+    </div>
+    <p style="font-size:11px;color:#aaa;text-align:center;margin-top:10px">Token: {token[:12]}... · Scade in 48h</p>
+  </div>
+</div></body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"🤖 Proposta Giulia: {title} ({conf}% confidence)"
+    msg["From"] = _SMTP_USER
+    msg["To"]   = _NOTIF_EMAIL
+    msg.attach(MIMEText(html, "html"))
+    try:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT) as s:
+            s.starttls(); s.login(_SMTP_USER, _SMTP_PASS); s.send_message(msg)
+        print(f"[EMAIL] Inviata a {_NOTIF_EMAIL}")
+    except Exception as e:
+        print(f"[EMAIL] Errore: {e}")
+
+
+# ── Pipeline analisi (background task) ───────────────────────
+def _run_analysis_pipeline(record: dict):
+    """Eseguito in background dopo ogni chiamata ricevuta."""
+    cid = record.get("conversation_id", "?")
+    print(f"[AI] Avvio analisi per {cid}...")
+
+    current_prompt = _get_current_prompt()
+    analysis = _analyze_call(record, current_prompt)
+    analysis["conversation_id"] = cid
+    analysis["analyzed_at"]     = datetime.now(timezone.utc).isoformat()
+
+    with open(_ANALYSES_LOG, "a") as f:
+        f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
+
+    proposals = _load_proposals()
+    pending = sum(1 for p in proposals.values() if p["status"] == "pending")
+    if pending >= 2:
+        print(f"[AI] {pending} proposte già in attesa — skip generazione")
+        return
+
+    recent = []
+    if _ANALYSES_LOG.exists():
+        for line in _ANALYSES_LOG.read_text().strip().split("\n")[-_PATTERN_WINDOW:]:
+            try:
+                a = json.loads(line)
+                if a.get("richiede_modifica_prompt") and a.get("confidence", 0) >= 50:
+                    recent.append(a)
+            except Exception:
+                pass
+
+    if len(recent) < 3:
+        print(f"[AI] Solo {len(recent)} segnali — attendo più dati")
+        return
+
+    if analysis.get("confidence", 0) < _CONFIDENCE_MIN and len(recent) < 5:
+        print(f"[AI] Confidence {analysis.get('confidence')}% troppo bassa")
+        return
+
+    proposal = _generate_proposal(recent, current_prompt)
+    if not proposal or proposal.get("confidence", 0) < _CONFIDENCE_MIN:
+        return
+
+    token = secrets.token_urlsafe(32)
+    proposals[token] = {
+        "token": token,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+        "proposal": proposal,
+        "conversation_ids": [a.get("conversation_id","") for a in recent],
+    }
+    _save_proposals(proposals)
+    _send_approval_email(proposal, token, cid)
+    print(f"[AI] Proposta creata e inviata per approvazione!")
+
+
+# ============================================================
+# ENDPOINT: /elevenlabs-webhook
+# ============================================================
+
+@app.post("/elevenlabs-webhook")
+async def elevenlabs_webhook(
+    request: Request,
+    elevenlabs_signature: _Optional[str] = None,
+):
+    """
+    Riceve i webhook post-chiamata da ElevenLabs.
+    Verifica firma HMAC, salva trascrizione, avvia analisi AI in background.
+    """
+    payload_bytes = await request.body()
+    sig_header    = request.headers.get("ElevenLabs-Signature", "")
+
+    if not _verify_el_signature(payload_bytes, sig_header):
+        raise HTTPException(status_code=401, detail="Firma webhook non valida")
+
+    try:
+        data = json.loads(payload_bytes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload JSON non valido")
+
+    event_type = data.get("type")
+    print(f"[WEBHOOK] Evento: {event_type}")
+
+    if event_type == "post_call_transcription":
+        record = _save_call(data)
+        asyncio.create_task(asyncio.to_thread(_run_analysis_pipeline, record))
+        return {"status": "ok", "conversation_id": record.get("conversation_id")}
+
+    elif event_type == "call_initiation_failure":
+        err = {"received_at": datetime.now(timezone.utc).isoformat(),
+               "type": "call_initiation_failure", "data": data.get("data", {})}
+        with open(_CALLS_LOG, "a") as f:
+            f.write(json.dumps(err, ensure_ascii=False) + "\n")
+        return {"status": "ok", "type": "failure_logged"}
+
+    return {"status": "ok", "type": "ignored"}
+
+
+# ============================================================
+# ENDPOINT: /approve/{token} e /reject/{token}
+# ============================================================
+
+@app.get("/approve/{token}", response_class=HTMLResponse)
+async def approve_prompt(token: str):
+    """Approva e applica la modifica al prompt di Giulia su ElevenLabs."""
+    props = _load_proposals()
+    rec   = props.get(token)
+    if not rec:
+        return "<html><body style='font-family:Arial;text-align:center;padding:60px'><h1 style='color:#e74c3c'>❌ Token non trovato</h1></body></html>"
+    if rec["status"] != "pending":
+        return f"<html><body style='font-family:Arial;text-align:center;padding:60px'><h1>Proposta già {rec['status']}</h1></body></html>"
+
+    created = datetime.fromisoformat(rec["created_at"])
+    if datetime.now(timezone.utc) - created > timedelta(hours=48):
+        _mark_proposal(token, "expired")
+        return "<html><body style='font-family:Arial;text-align:center;padding:60px'><h1 style='color:#e74c3c'>⏰ Proposta scaduta (48h)</h1></body></html>"
+
+    new_prompt = rec["proposal"].get("prompt_aggiornato", "")
+    if not new_prompt:
+        return "<html><body style='font-family:Arial;text-align:center;padding:60px'><h1 style='color:#e74c3c'>❌ Prompt mancante nella proposta</h1></body></html>"
+
+    ok = _update_el_prompt(new_prompt)
+    if ok:
+        _mark_proposal(token, "approved")
+        return """<html><body style="font-family:Arial;text-align:center;padding:60px;background:#f0fff4">
+        <div style="max-width:480px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+          <div style="font-size:56px">✅</div>
+          <h1 style="color:#27ae60">Prompt Approvato!</h1>
+          <p>Il prompt di Giulia è stato aggiornato in produzione.<br>
+          Le prossime chiamate useranno il nuovo comportamento ottimizzato.</p>
+        </div></body></html>"""
+    return "<html><body style='font-family:Arial;text-align:center;padding:60px'><h1 style='color:#e74c3c'>❌ Errore aggiornamento ElevenLabs</h1><p>Controlla i log Railway.</p></body></html>"
+
+
+@app.get("/reject/{token}", response_class=HTMLResponse)
+async def reject_prompt(token: str):
+    """Rifiuta la proposta di modifica al prompt."""
+    _mark_proposal(token, "rejected")
+    return """<html><body style="font-family:Arial;text-align:center;padding:60px;background:#f9f9f9">
+    <div style="max-width:480px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+      <div style="font-size:56px">🚫</div>
+      <h1 style="color:#666">Proposta Rifiutata</h1>
+      <p>Il prompt rimane invariato. La proposta è stata scartata.</p>
+    </div></body></html>"""
+
+
+@app.get("/proposals")
+async def list_proposals():
+    """Lista proposte pendenti/approvate/rifiutate (debug/admin)."""
+    return _load_proposals()
+
+
+@app.get("/calls/recent")
+async def recent_calls(limit: int = 50):
+    """Ultime N chiamate ricevute via webhook ElevenLabs."""
+    calls = []
+    if _CALLS_LOG.exists():
+        for line in _CALLS_LOG.read_text().strip().split("\n")[-limit:]:
+            try:
+                calls.append(json.loads(line))
+            except Exception:
+                pass
+    return {"calls": list(reversed(calls)), "total": len(calls)}
